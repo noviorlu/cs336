@@ -3,12 +3,37 @@ import regex as re
 from typing import BinaryIO
 from multiprocessing import Pool
 import time
+import heapq
 from tqdm import tqdm
 
 from collections import Counter, defaultdict
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
+def neg_bytes(b: bytes) -> tuple:
+    return tuple(-x for x in b) + (1,)
+class PairHeap:
+    def __init__(self, vocab):
+        self.vocab = vocab
+        self.heap = []
+
+    def _key(self, pair, count):
+        id_a, id_b = pair
+        bytes_a = self.vocab[id_a]
+        bytes_b = self.vocab[id_b]
+        return (-count, neg_bytes(bytes_a), neg_bytes(bytes_b), pair)
+
+    def push(self, pair, count):
+        heapq.heappush(self.heap, self._key(pair, count))
+
+    
+    def pop_best(self, pair_counts):
+        while self.heap:
+            neg_count, _, _, pair = heapq.heappop(self.heap)
+            count = -neg_count
+            if count == pair_counts.get(pair, 0) and count > 0:
+                return pair
+        return None
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -141,18 +166,14 @@ def train_bpe(
             global_pair_counts[pair] += count
             global_pair_to_words[pair].add(idx)
 
-    def rank(x):
-        pair = x[0]
-        count = x[1]
-        id_a = pair[0]
-        id_b = pair[1]
-        bytes_a = result_bpe_vocab[id_a]
-        bytes_b = result_bpe_vocab[id_b]
-        return (count, (bytes_a, bytes_b))
+    pair_heap = PairHeap(result_bpe_vocab)
+    for pair, count in global_pair_counts.items():
+        pair_heap.push(pair, count)
+
 
     while len(result_bpe_vocab) < vocab_size - len(special_tokens):
-        if not global_pair_counts: break
-        best_pair, _ = max(global_pair_counts.items(), key=rank)
+        best_pair = pair_heap.pop_best(global_pair_counts)
+        if best_pair is None: break
         id_a, id_b = best_pair
         new_id = len(result_bpe_vocab)
         result_bpe_vocab[new_id] = result_bpe_vocab[id_a] + result_bpe_vocab[id_b]
@@ -170,6 +191,8 @@ def train_bpe(
                 global_pair_counts[pair] -= seq_count
                 if global_pair_counts[pair] <= 0:
                     del global_pair_counts[pair]
+                else:
+                    pair_heap.push(pair, global_pair_counts[pair])
                 global_pair_to_words[pair].discard(word_idx)
 
             # Update the word's sequence by merging the best pair
@@ -189,6 +212,7 @@ def train_bpe(
             for i in range(len(new_seq) - 1):
                 pair = (new_seq[i], new_seq[i+1])
                 global_pair_counts[pair] += seq_count
+                pair_heap.push(pair, global_pair_counts[pair]) 
                 global_pair_to_words[pair].add(word_idx)
 
         global_pair_counts.pop(best_pair, None)

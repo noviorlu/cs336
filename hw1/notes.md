@@ -402,6 +402,14 @@ GPT-4o = `o200k_base`（20万）：更精细，范式不变。
 | +并行预分词 +原地改 +跳过不含词 | ~5s | Pool 并行、优化1/2 |
 | +增量更新合并 loop | **0.87s** | pair_counts/pair_to_words 持久增量，只碰含 best_pair 的词 |
 
+*合并 loop 单项耗时（valid + vocab=10000，最能体现优化的场景）：*
+| 版本 | BPE Merge 耗时 |
+|---|---|
+| 增量更新（无堆，每轮全量 max） | 14.3s |
+| **+懒删除堆（min-heap + neg_bytes 哨兵）** | **1.49s**（~10×） |
+
+- ⚠️ **小数据看不出堆的优势**：corpus.en/vocab500 上堆版合并才 0.3s，和无堆差不多（堆维护开销 ≈ 省下的），甚至略慢。堆是给**大数据（pair 多、轮数多）**用的——valid/vocab10000 才拉开 14.3→1.49。**对比优化效果要在目标规模上测，别用小测试。**
+
 *增量更新踩过的坑（务必记牢，都是「计数不同步」类）：*
 - **`i`/`j` 变量冲突**：外层 `for j,(count,seq) in enumerate(...)`（词下标），内层扫描 while 用了 `i`——一开始内外都用 `i`，内层 `i=0` 覆盖了外层词下标 → `word_freq[i]` 写错位置。**内外循环变量必须不同名**。
 - **`ord(c)` vs `encode`**：`[ord(c) for c in token]` 是**码点**不是 UTF-8 字节！byte-level 必须 `list(token.encode("utf-8"))`（非 ASCII 会错）。
@@ -412,6 +420,19 @@ GPT-4o = `o200k_base`（20万）：更精细，范式不变。
 - **`affected = list(pair_to_words[best_pair])` 必须拷贝**：循环体里 `.discard()` 会改这个 set，遍历时改会出错。
 - **`.discard()` 不用 `.remove()`**：同词对同 pair 可能贡献多次（`A B A B`），discard 不存在不报错更安全。
 - **唯一验证方法**：静态查不出计数漂移，必须跑 `test_train_bpe` 和朴素版**逐字节对拍**。
+
+*进一步优化：懒删除最大堆替代每轮全量 max（增量版 profile 后）：*
+- **profile 增量版**（valid+vocab10000）：`max` 7.3s + `rank` 6.6s（被调 **1亿次**）= 几乎全部时间。根因：`max(pair_counts.items(), key=rank)` **每轮全扫所有对**（几万对 × 9778 轮），`rank` 里 2 次 `vocab[id]` dict 查找 → 2亿次查找。a/c 增量操作才 0.05s（很干净）。
+- **优化：用 `heapq` 懒删除堆**，每轮 O(log n) 弹出而非 O(n) 全扫。
+  - **难点：tie-break 反转（min-heap 模拟 max）**。规则=频率高+字节字典序大优先。
+    - 频率：存 `-count`（大→小→堆顶）。
+    - 字节：`heapq` 是 min-heap，要「字典序大的排前」，反转每个字节。
+  - **`neg_bytes` 的长度陷阱**（大坑）：`tuple(-x for x in b)` 单看反转了字节值，但 **tuple 比较里「前缀相同时短的天然更小」这个长度规则没被反转** → `b'b'` vs `b'bc'` 会选错（`max` 选 `b'bc'`，naive neg 选 `b'b'`）。
+    - **修复：加正数哨兵** `def neg_bytes(b): return tuple(-x for x in b) + (1,)`。哨兵 `1`（正）> 任何 `0~-255`（字节 neg 后），让「更长的」在对应位补负数 → min 里更小 → 复现「长的更大」。哨兵必须用**正数**（`0` 会和 `neg_bytes(b'\x00')` 撞）。
+    - 验证：`min(pairs, key=lambda p:(neg_bytes(p[0]),neg_bytes(p[1])))` 须和 `max(pairs)` 选同一 pair，用「bytes_a 相同、bytes_b 前缀关系」的用例才测得出（如 `[(b'a',b'b'),(b'a',b'bc')]`）。
+  - **懒删除**：改 pair 计数时不改堆里旧值（heapq 不支持高效改），而是 push 新值；旧值留着，pop 时验证 `-neg_count == pair_counts.get(pair,0) and >0`，不一致=stale 丢弃继续弹。
+  - **整合纪律**：`pair_counts` 值一变（a 减/c 加）**立刻 push 新值**，漏一处→堆里旧值 stale→那 pair 消失→选错。
+  - 备选方案（未用）：堆只存 `-count`，pop 时收集所有并列最高 count 的候选，在候选间用正常 `max(候选, key=lambda p:(vocab[a],vocab[b]))`——避开 neg_bytes 反转，但 pop_best 复杂。哨兵方案更简洁。
 
 **实现要点/踩过的坑（备忘）：**
 - 序列用 **int(token ID) list** 表示（非 bytes），word_freq = `list[tuple[int, list[int]]]`（次数, ID序列）。`list(word.encode())` 直接得 int list。
