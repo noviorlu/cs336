@@ -1,8 +1,8 @@
 """Train and serialize the two tokenizers the assignment needs.
 
-    python cs336_basics/main_bpe_merge.py            # both
-    python cs336_basics/main_bpe_merge.py tinystories
-    python cs336_basics/main_bpe_merge.py owt
+    python cs336_basics/main_bpe_train.py            # both
+    python cs336_basics/main_bpe_train.py tinystories
+    python cs336_basics/main_bpe_train.py owt
 
 Outputs land in data/ as <name>_vocab.json + <name>_merges.json, readable back with
 `load_tokenizer` / `Tokenizer.from_files`.

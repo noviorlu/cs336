@@ -422,7 +422,55 @@ pstats.Stats('prof').sort_stats('tottime').print_stats(20)
 | `re.split("", chunk)` | `special_tokens=[]` | pattern 为空串，**在每个字符之间都切一刀**，pre-token 全被打成单字符 | `re.split(pat, chunk) if pat else [chunk]` |
 | 分块硬编码 `b"<\|endoftext\|>"` | 特殊 token 不叫这个名字 | 找不到切点 → 边界全退化到 EOF → **32 进程变 1 个**，并行全失效（实测 `<\|sep\|>` 语料：修前 1 块 / 修后 32 块） | 用 `special_tokens[0].encode()`；无特殊 token 时单块 |
 
-### 3.9 下一步
+### 3.9 训练产物：两个 tokenizer（2026-07-25）
+
+跑法：`python cs336_basics/main_bpe_train.py [tinystories|owt]`，产物落在 `data/<name>_{vocab,merges}.json`。
+
+| | **TinyStories** | **OpenWebText** |
+|---|---|---|
+| 语料 | `TinyStoriesV2-GPT4-train.txt` 2.23 GB | `owt_train.txt` 11.92 GB |
+| `vocab_size` / merges | 10,000 / 9,743 | 32,000 / 31,743 |
+| 分块边界 | 0.0003 s | 0.0006 s |
+| 预分词 | 6.99 s | 41.37 s |
+| **merge loop** | **1.07 s** | **213.72 s** |
+| **总耗时** | **8.3 s** | **295.6 s（4.9 min）** |
+| 峰值内存 | 0.2 GB | 14.0 GB |
+| handout 限制 | ≤30 min / ≤30 GB ✅ | ≤12 h / ≤100 GB ✅ |
+| unique pre-token | 6 万 | **660 万** |
+| **compression ratio**（训练语料） | **4.071 bytes/token** | **4.363 bytes/token** |
+| 平均 token 长度 | 5.79 B（中位 6） | 6.34 B（中位 6） |
+| **最长 token** | `b' accomplishment'`（15 B） | 64 B 的**乱码**（见下） |
+| 落盘大小 | 0.2 + 0.2 MB | 0.6 + 0.5 MB |
+
+**读数**：owt 的 4.363 比 TinyStories 的 4.071 高 7%——词表大 3.2 倍只换来这点压缩率。原因有两层：① 边际收益递减，BPE 先合并的都是最高频模式，后面 2.2 万个格子吃的是长尾；② owt 的长尾里有相当比例是乱码和分隔线（见下），这些 token 覆盖的文本占比极低，对整体压缩率几乎没贡献。**词表翻倍 ≠ 压缩率翻倍**，这是 leaderboard 上选 vocab_size 时要记住的。
+
+> ⚠️ 这个 compression ratio 是**训练语料全量**的，不是 §2.7(a) 要交的那个（那个是各采样 10 篇文档，且 (b) 还要交叉编码），也不含被 split 掉的 `<|endoftext|>` 分隔符字节。
+> **但它是 `encode` 的现成验收标准**：写完 `encode` 后在训练语料上跑，bytes/token 应该和这个数很接近，对不上就是 `encode` 有 bug。免费的对拍手段，不用另写 brute force。
+
+**它为什么是免费的**：`_merge_loop` 结束时，`word_ids[i]` 是 pre-token i 依次施加 merge 1..N 之后的序列——而 `Tokenizer.encode` 的 Step 2 做的也是依次施加 merge 1..N。**训练结束时整个语料已经被编码过一遍了**，只需在建索引时额外记下每词的原始字节数（`word_nbytes`，一个 int）。注意要用 `count` 加权：频率表里 `the` 只存一份但语料里出现上百万次。
+
+#### §2.5 的「最长 token 合理吗」——答案是不合理
+
+owt 最长的 10 个 token **一个真词都没有**：
+
+```
+ 64B  'ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ'
+ 64B  '----------------------------------------------------------------'
+ 48B  '————————————————'
+ 32B  '________________________________'   '================================'
+ 32B  '................................'   '********************************'
+```
+
+那个 64 字节的是 `b'\xc3\x83\xc3\x82'` 重复 16 次，即 **double-encoded UTF-8 mojibake**（重复编码乱码）：一段 UTF-8 字节被误当 latin-1 解码、再按 UTF-8 编回去，每错一轮就多一层 `ÃÂ`。比如不换行空格 U+00A0 的 UTF-8 是 `\xc2\xa0` → 误读成 latin-1 得 `'Â '` → 再编码成 `\xc3\x82\xc2\xa0`。64 字节说明同一段文本在爬取管线里被**错误转码了很多轮**。
+
+对照 TinyStories 最长的 10 个，全是规矩英文词：` accomplishment` / ` disappointment` / ` responsibility` / ` uncomfortable` / ` compassionate` …
+
+**结论**：
+- TinyStories 最长 token **合理**——GPT-4 生成的干净儿童故事，最长 token 自然是最长的常用词。
+- OWT 最长 token **不合理**——它反映的是网页语料的编码损坏和排版分隔线，不是语言结构。**算法没错，是数据脏**：这些字节序列确实高频，BPE 忠实地学了。
+- 这就是 §2.5(b)「对比两个 tokenizer」的答案：干净合成语料 vs 脏爬取语料。延伸问题——**词表里有多少格子被垃圾占掉了？**这直接吃掉 compression ratio 和 leaderboard 的 token 预算。真实管线会先做数据清洗（去重、编码修复、过滤），正是后面 data 那个 assignment 的主题。
+
+### 3.10 下一步
 
 - **性能已经够用**：tokenizer **只训练一次**，owt 全量 5 分钟跑完就存盘。继续优化 merge loop 对完成作业的边际价值接近零。
 - **真正该优化的是 `Tokenizer.encode`**（§2.6）：§2.7(c) 专门让你估吞吐并推算「tokenize 825GB 的 Pile 要多久」，(d) 要把 OWT train/valid **全部编码落盘成 uint16 数组**——这才是你会实际等的时间，而且是纯数据并行（文档间独立），比 merge loop 友好得多。
