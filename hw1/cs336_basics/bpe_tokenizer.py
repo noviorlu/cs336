@@ -100,7 +100,7 @@ def train_bpe(
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
     t1 = time.perf_counter()
-    print(f"Finding chunk boundaries took {t1 - t0:.5f} seconds")
+    print(f"\nFinding chunk boundaries took {t1 - t0:.5f} seconds")
 # endregion
 
 # region 2. pre-tokenization
@@ -124,6 +124,8 @@ def train_bpe(
 # endregion
 
 # region 3. BPE training
+    t0 = time.perf_counter()
+
     global_vocab_ids :list[list[int]] = []                                      # 每个词的 id 序列（原地改）—— 注意去掉 count 单独存
     global_vocab_counts : list[int] = []                                        # 每个词的出现次数（和 word_freq 下标对齐）
     global_pair_counts: dict[tuple[int,int], int] = Counter()                   # 每个对的全局加权计数
@@ -192,6 +194,8 @@ def train_bpe(
         global_pair_counts.pop(best_pair, None)
         global_pair_to_words.pop(best_pair, None)
 
+    t1 = time.perf_counter()
+    print(f"BPE Merge tooks {t1 - t0:.5f} seconds")
 # endregion
 
 
