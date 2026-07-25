@@ -9,6 +9,7 @@ from tqdm import tqdm
 from collections import Counter
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+COMPILED_PAT = re.compile(PAT)
 
 def neg_bytes(b: bytes) -> tuple:
     """Order-reversing key for bytes. The trailing sentinel (> any -x) reverses prefix order too."""
@@ -115,9 +116,11 @@ def pretokenize_chunk(
         # An empty pattern would make re.split cut between every character
         parts = re.split(macro_special_pattern, chunk) if macro_special_pattern else [chunk]
 
+        # findall + Counter.update counts in C; finditer + `+= 1` pays a Python
+        # loop and a Match object per token. Documents are small, so the
+        # intermediate list is cheap.
         for part in parts:
-            for m in re.finditer(PAT, part):
-                local_vocab[m.group()] += 1
+            local_vocab.update(COMPILED_PAT.findall(part))
 
     return local_vocab
 
@@ -140,10 +143,13 @@ def train_bpe(
     t0 = time.perf_counter()
 
     num_processes = os.cpu_count() or 1
+    # More chunks than workers: documents are unevenly sized, so oversubscribing
+    # lets fast workers pick up more tasks instead of idling on the slowest chunk
+    desired_chunks = num_processes * 4
     if special_tokens:
         # Split on a real special token so no chunk boundary can cut a pre-token in half
         with open(input_path, "rb") as f:
-            boundaries = find_chunk_boundaries(f, num_processes, special_tokens[0].encode("utf-8"))
+            boundaries = find_chunk_boundaries(f, desired_chunks, special_tokens[0].encode("utf-8"))
     else:
         boundaries = [0, os.path.getsize(input_path)]
 
