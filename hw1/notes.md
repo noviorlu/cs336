@@ -368,91 +368,173 @@ GPT-4o = `o200k_base`（20万）：更精细，范式不变。
 - **判据**：并行只在"任务粒度大 + 同步次数少"时划算。合并 = 粒度小 + 同步上万次 = 最差场景。极致加速靠换 **Rust/C++**（消除解释器开销），非并行/GPU。
 - Profiling：`cProfile` / `py-spy` 先测瓶颈再优化。
 
-### 3.4 遇到的问题 & 解决
+### 3.4 优化历程
 
 **✅ 里程碑：train_bpe 全 3 测试通过（2026-07-24）— 这题 15 分完整拿下**
-- `cs336_basics/bpe_tokenizer.py` 实现完成，接到 `adapters.run_train_bpe`。
-- `uv run pytest tests/test_train_bpe.py`：**3/3 全 PASS**（test_train_bpe + special_tokens + speed）。
-- 实测 valid+vocab1000 的 merges 前几个：`(b' ',b't')`, `(b'h',b'e')`, `(b' ',b'a')`, `(b' t',b'he')`(→` the`), `(b' a',b'nd')`(→` and`)——渐进合并正确，符合 §3.3.2。
+- `cs336_basics/bpe_tokenizer.py` 实现完成，接到 `adapters.run_train_bpe`；`uv run pytest tests/test_train_bpe.py` **3/3 PASS**。
+- 实测 valid+vocab1000 的前几个 merge：`(b' ',b't')`, `(b'h',b'e')`, `(b' ',b'a')`, `(b' t',b'he')`(→` the`), `(b' a',b'nd')`(→` and`)——渐进合并正确，符合 §3.3.2。
 
-**优化历程（test 全套 5.01s → 0.87s；speed 项 1.67s → 1.14s → 更快）：**
+#### 3.4.1 总表：merge loop 耗时（valid 22.5MB + vocab_size=10000）
 
-*第一阶段（朴素版微优化，过 speed 线）：*
-- **优化1 缓存 len**：内层 while 的 `len(token_id)` 提到循环外存变量（profile 显示 len 被调 1亿次，3.6s）。
-- **优化2 替换时跳过不含该对的词**：重建循环**之前**加 `if id_a not in token_id: 原样保留+continue`（C级快速检查）。⚠️ 坑：这个 `if` 必须放在重建循环**前**，放后面等于白重建（"先干完才发现白干"，无效）。
-- **`if __name__ == "__main__":`** 包住底部测试调用，避免 import 时在 valid 上乱跑十几秒。
+跑法：`python cs336_basics/train_tinystories.py`，每版跑 3 次取中位数。**每一步的 merge 序列都逐条比对过，9743 条完全一致**（见 §3.4.4）。
 
-*第二阶段（为 tinystories 全量，做真正的大改造）：*
-- **并行预分词**（`multiprocessing.Pool` + `apply_async`）：`find_chunk_boundaries(f, cpu_count, b"<|endoftext|>")` 切 N 块（实测 32 块），各进程跑 `pretokenize_chunk`（传 `input_path,start,end,pattern`，各自 open/seek/read），`result.get()` 汇总。**实测全量 2.2G 预分词仅 12.3 秒**，验证 hint「并行预分词」是关键。
-  - 坑：小数据（speed 测试的 corpus.en）也走 Pool 没被拖垮，仍 PASS——进程启动开销可接受。
-  - `apply_async` 两段式：先全部提交（不阻塞→并行开跑），再逐个 `get()` 收割。
-- **增量更新合并 loop**（治本，消除「每轮全量重数 pairs」）：把 5.01s→0.87s。四个持久结构协同：
-  - `global_vocab_ids: list[list[int]]`（每词 id 序列，**原地改**，下标=词标识）
-  - `global_vocab_counts: list[int]`（次数，下标对齐）
-  - `global_pair_counts: Counter`（对→全局加权计数，**持久**）
-  - `global_pair_to_words: defaultdict(set)`（对→含它的词下标集合）**← 增量的关键索引**
-  - 初始化：遍历所有词一次，建满 4 个结构。
-  - 每轮：从 `pair_counts` 选 best_pair（不重数）→ 只遍历 `pair_to_words[best_pair]` 的词（**不是所有词**）→ 对每词「整词 remove-then-add」：a.减该词当前所有对 b.原地合并序列 c.加新序列所有对。
-- **原地改 vs 重建**：增量更新要求下标稳定，所以合并从「重建 new_word_freq」改成「`global_vocab_ids[word_idx]=new_seq` 原地替换」。
+| # | 版本 | Merge 耗时 | vs 上一步 | vs 起点 |
+|---|---|---|---|---|
+| 0 | 增量更新，每轮 `max` 全扫 pair_counts | 14.3s※ | — | 1× |
+| 1 | + 懒删除堆（min-heap + `neg_bytes` 哨兵） | 1.46s | **9.8×** | 9.8× |
+| 2 | + `neg_bytes` 按 token id 缓存 | 0.89s | **1.64×** | 16× |
+| 3 | + 只更新计数真正变化的 pair（delta 更新） | 0.54s | **1.66×** | 27× |
+| 4 | + 堆定期重建，清掉 stale 条目 | **0.42s** | **1.28×** | **34×** |
 
-*test 全套耗时时间线（`uv run pytest tests/test_train_bpe.py`）：*
-| 版本 | 耗时 | 关键改动 |
+※ #0 是早期记录的值，未在本轮重测；#1~#4 是同一天同一台机器连续测的。
+
+**分阶段的定性收益**（更早期，pytest 全套 `uv run pytest tests/test_train_bpe.py`）：
+
+| 版本 | 全套耗时 | 关键改动 |
 |---|---|---|
 | 朴素串行 | ~16s | 每轮全量重数 pairs + 重建所有词 |
-| +并行预分词 +原地改 +跳过不含词 | ~5s | Pool 并行、优化1/2 |
-| +增量更新合并 loop | **0.87s** | pair_counts/pair_to_words 持久增量，只碰含 best_pair 的词 |
+| + 并行预分词、原地改、跳过不含该 pair 的词 | ~5s | `Pool` 多进程；`len` 缓存；`if id_a not in token_id: continue` |
+| + 增量更新合并 loop | **0.87s** | `pair_counts` / `pair_to_words` 持久增量 |
 
-*合并 loop 单项耗时（valid + vocab=10000，最能体现优化的场景）：*
-| 版本 | BPE Merge 耗时 |
-|---|---|
-| 增量更新（无堆，每轮全量 max） | 14.3s |
-| **+懒删除堆（min-heap + neg_bytes 哨兵）** | **1.49s**（~10×） |
+⚠️ **小数据看不出堆的优势**：corpus.en/vocab500 上堆版才 0.3s，和无堆差不多甚至略慢（堆维护开销 ≈ 省下的扫描）。**对比优化效果必须在目标规模上测。**
 
-- ⚠️ **小数据看不出堆的优势**：corpus.en/vocab500 上堆版合并才 0.3s，和无堆差不多（堆维护开销 ≈ 省下的），甚至略慢。堆是给**大数据（pair 多、轮数多）**用的——valid/vocab10000 才拉开 14.3→1.49。**对比优化效果要在目标规模上测，别用小测试。**
+#### 3.4.2 第 2~4 步：每条优化为什么快
 
-*增量更新踩过的坑（务必记牢，都是「计数不同步」类）：*
-- **`i`/`j` 变量冲突**：外层 `for j,(count,seq) in enumerate(...)`（词下标），内层扫描 while 用了 `i`——一开始内外都用 `i`，内层 `i=0` 覆盖了外层词下标 → `word_freq[i]` 写错位置。**内外循环变量必须不同名**。
-- **`ord(c)` vs `encode`**：`[ord(c) for c in token]` 是**码点**不是 UTF-8 字节！byte-level 必须 `list(token.encode("utf-8"))`（非 ASCII 会错）。
-- **`pair_to_words` 用 `defaultdict(set)`**：普通 dict 对新 key `.add()` 会 KeyError；`pair_counts` 用 `Counter`（`+=` 新 key 自动 0）。
-- **a 减 / c 加 必须严格对称**：a 减「旧序列所有对」、c 加「新序列所有对」，任何不对称 → 计数漂移 → tie-break 选错 → 测试挂。**整词 remove-then-add** 比「只改 best_pair 周围对」更不易错（因为合并 `A B` 会连带改变 `(前,A)→(前,X)`、`(B,后)→(X,后)`，不只是 `(A,B)` 消失）。
-- **清理 0 计数对**：a 减完 `if pair_counts[pair] <= 0: del`，否则 `max` 会选到 count=0 的僵尸对。
-- **循环外清 best_pair**：`pair_counts.pop(best_pair, None)` + `pair_to_words.pop(best_pair, None)`（防残留导致死循环）。用 `pop(.,None)` 不用 `del`（可能已在 a 里删过）。
-- **`affected = list(pair_to_words[best_pair])` 必须拷贝**：循环体里 `.discard()` 会改这个 set，遍历时改会出错。
-- **`.discard()` 不用 `.remove()`**：同词对同 pair 可能贡献多次（`A B A B`），discard 不存在不报错更安全。
-- **唯一验证方法**：静态查不出计数漂移，必须跑 `test_train_bpe` 和朴素版**逐字节对拍**。
+**#2 `neg_bytes` 按 token id 缓存**
 
-*进一步优化：懒删除最大堆替代每轮全量 max（增量版 profile 后）：*
-- **profile 增量版**（valid+vocab10000）：`max` 7.3s + `rank` 6.6s（被调 **1亿次**）= 几乎全部时间。根因：`max(pair_counts.items(), key=rank)` **每轮全扫所有对**（几万对 × 9778 轮），`rank` 里 2 次 `vocab[id]` dict 查找 → 2亿次查找。a/c 增量操作才 0.05s（很干净）。
-- **优化：用 `heapq` 懒删除堆**，每轮 O(log n) 弹出而非 O(n) 全扫。
-  - **难点：tie-break 反转（min-heap 模拟 max）**。规则=频率高+字节字典序大优先。
-    - 频率：存 `-count`（大→小→堆顶）。
-    - 字节：`heapq` 是 min-heap，要「字典序大的排前」，反转每个字节。
-  - **`neg_bytes` 的长度陷阱**（大坑）：`tuple(-x for x in b)` 单看反转了字节值，但 **tuple 比较里「前缀相同时短的天然更小」这个长度规则没被反转** → `b'b'` vs `b'bc'` 会选错（`max` 选 `b'bc'`，naive neg 选 `b'b'`）。
-    - **修复：加正数哨兵** `def neg_bytes(b): return tuple(-x for x in b) + (1,)`。哨兵 `1`（正）> 任何 `0~-255`（字节 neg 后），让「更长的」在对应位补负数 → min 里更小 → 复现「长的更大」。哨兵必须用**正数**（`0` 会和 `neg_bytes(b'\x00')` 撞）。
-    - 验证：`min(pairs, key=lambda p:(neg_bytes(p[0]),neg_bytes(p[1])))` 须和 `max(pairs)` 选同一 pair，用「bytes_a 相同、bytes_b 前缀关系」的用例才测得出（如 `[(b'a',b'b'),(b'a',b'bc')]`）。
-  - **懒删除**：改 pair 计数时不改堆里旧值（heapq 不支持高效改），而是 push 新值；旧值留着，pop 时验证 `-neg_count == pair_counts.get(pair,0) and >0`，不一致=stale 丢弃继续弹。
-  - **整合纪律**：`pair_counts` 值一变（a 减/c 加）**立刻 push 新值**，漏一处→堆里旧值 stale→那 pair 消失→选错。
-  - 备选方案（未用）：堆只存 `-count`，pop 时收集所有并列最高 count 的候选，在候选间用正常 `max(候选, key=lambda p:(vocab[a],vocab[b]))`——避开 neg_bytes 反转，但 pop_best 复杂。哨兵方案更简洁。
+```python
+def _neg(self, token_id):                      # PairHeap 里加一层缓存
+    key = self._neg_cache.get(token_id)
+    if key is None:
+        key = self._neg_cache[token_id] = neg_bytes(self.vocab[token_id])
+    return key
+```
+- 原来每次 `push` 都对两个 id 各跑一遍 `tuple(-x for x in b) + (1,)`——生成器 + 建元组，纯分配开销。
+- merge 到后期 token 越来越长（十几字节），而 push 次数是万级 × 每次多个 pair → 这是白给的重复计算。
+- id→bytes 只增不改，所以缓存**永不失效**，最多算 `vocab_size` 次。
 
-**实现要点/踩过的坑（备忘）：**
-- 序列用 **int(token ID) list** 表示（非 bytes），word_freq = `list[tuple[int, list[int]]]`（次数, ID序列）。`list(word.encode())` 直接得 int list。
-- **int 版 tie-break 坑**：不能比 ID 数值！`rank` 的 key 返回 `(count, (bpe_vocab[id_a], bpe_vocab[id_b]))`——转回 bytes 比字典序，`max` 选最大=字典序更大（handout 规则）。
-- **merges 存 bytes 对**：`bpe_merges.append((bpe_vocab[id_a], bpe_vocab[id_b]))`，不是 id 对。
-- 替换用"扫描重建新 list"（`i+2`/`i+1`），非原地 pop（避下标错位）；`new_id=len(bpe_vocab)` 别用 `len-1`。
-- 边界：`if not pairs: break`（全合并完没对了）。
-- 特殊 token 最后加（放末尾 ID），合并终止条件留余量 `vocab_size - len(special_tokens)`。
-- `bytes([i])`（方括号!）造单字节；`bytes(65)`=65个0，`bytes('A')` 报错。
-- split 特殊 token 的 pattern：`"|".join(re.escape(t) for t in special_tokens)`（不是把 list 塞 f-string）。
+**#3 只更新计数真正变化的 pair**
 
-**如何 profile（cProfile）：**
+原写法是「整词 remove-then-add」：先把该词**所有**相邻对减掉、再把新序列**所有**相邻对加回。问题是一个词里大部分 pair 根本没变，却白白经历「减→push→加→push」。
+
+**具体例子**：词 `[a, b, c, d, e]`（count=5），合并 `(c,d) → X`：
+```
+旧序列: [a, b, c, d, e]   相邻对: (a,b) (b,c) (c,d) (d,e)
+新序列: [a, b, X, e]      相邻对: (a,b) (b,X) (X,e)
+```
+| 对 | 旧出现 | 新出现 | delta | 要动吗 |
+|---|---|---|---|---|
+| `(a,b)` | 1 | 1 | **0** | ❌ 跳过（远离合并点，没受影响） |
+| `(b,c)` | 1 | 0 | −1 | ✅ 计数 −5、push |
+| `(c,d)` | 1 | 0 | −1 | ✅ 计数 −5、push（就是 best_pair） |
+| `(d,e)` | 1 | 0 | −1 | ✅ 计数 −5、push |
+| `(b,X)` | 0 | 1 | +1 | ✅ 计数 +5、push |
+| `(X,e)` | 0 | 1 | +1 | ✅ 计数 +5、push |
+
+关键：`(a,b)` 旧新都出现 1 次 → delta=0。**整词 remove-then-add 会对它「−5 再 +5」（净 0）+ push 两次，纯白干**；delta 法直接跳过。词越长，合并点两侧不变的对越多，省得越狠——合并一个对只影响它**左右相邻**的 3~5 个对，与词长无关。
+
+```python
+old_pairs = Counter(zip(seq, seq[1:]))          # zip(seq,seq[1:]) 得所有相邻对；Counter 数重数
+new_pairs = Counter(zip(new_seq, new_seq[1:]))
+for pair in old_pairs.keys() | new_pairs.keys():
+    delta = new_pairs[pair] - old_pairs[pair]
+    if delta:                                   # 只有真变了才动 counts + push
+        ...global_pair_counts[pair] += delta * count; push...
+```
+- **为什么 delta 一定对**：一个对的全局计数 = 各词贡献之和。这个词合并前贡献 `old*count`、合并后 `new*count` → 净变化 `(new−old)*count = delta*count`。只加这个 delta，全局就对。没变的对 delta=0 不影响。
+- `delta == 0` 的 pair：计数没变 ⇒ 堆里那条旧条目**依然有效** ⇒ 不用 push。不变量不破。
+- 验证 `A B A B` 合并 `(A,B)`：old=`{(A,B):2,(B,A):1}`, new=`{(X,X):1}` → `(A,B)`−2、`(B,A)`−1、`(X,X)`+1，全对上。
+- 实测（tinystories_sample）：总 push 次数 **4549 → 2274**，直接砍半。push 是 `O(log n)` 且比较的是长元组，是热点中的热点。
+- 附带好处：`pair_to_words` 的 `discard`/`add` churn 也一起没了。
+- **通用性**：这是「局部改动、大部分不变」类增量维护的通法——算 delta 只更新变化部分。以后 Rust 重写、别的增量算法都能复用。
+
+**#4 堆定期重建**
+
+```python
+def maybe_rebuild(self, pair_counts):
+    if len(self.heap) > 2 * len(pair_counts) + 1024:
+        self.heap = [self._key(p, c) for p, c in pair_counts.items() if c > 0]
+        heapq.heapify(self.heap)
+```
+- 懒删除的代价是堆**只增不减**，stale 条目越堆越多 → `push`/`pop` 的 `log n` 里那个 n 是**堆长度**而不是存活 pair 数。
+- 实测（tinystories_sample）：峰值堆长 **2505 → 1272**。
+- 重建后每个存活 pair 都带当前 count，**不变量天然成立**，所以这步不影响正确性。
+- 阈值 `2×存活 + 1024`：重建是 O(n)，摊还下来可忽略；`+1024` 避免小规模下反复重建。
+
+#### 3.4.3 顺手修的两个正确性 bug
+
+| bug | 触发条件 | 后果 | 修法 |
+|---|---|---|---|
+| `re.split("", chunk)` | `special_tokens=[]` | pattern 为空串，**在每个字符之间都切一刀**，pre-token 全被打成单字符 | `re.split(pat, chunk) if pat else [chunk]` |
+| 分块硬编码 `b"<\|endoftext\|>"` | 特殊 token 不叫这个名字 | 找不到切点 → 所有边界退化到 EOF → **32 进程变 1 个**，并行全失效 | 用 `special_tokens[0].encode()`；无特殊 token 时直接 `[0, filesize]` 单块 |
+
+实测第二条：0.7MB、特殊 token 为 `<|sep|>` 的语料，**修前 1 块 / 修后 32 块**。
+
+另外清理了 `global_pair_to_words` 的空 set 泄漏（`defaultdict` 改普通 dict + `setdefault`，空了就 `del`），只是内存问题，不影响结果。
+
+#### 3.4.4 怎么验证「优化没改坏结果」（方法论，比结论更重要）
+
+计数漂移这类 bug **静态看不出来**，唯一可靠办法是对拍。这次用了三层：
+
+1. **差分测试（对拍朴素实现）**：写一个每轮全量重算 `pair_counts`、用 `max(..., key=(count,(bytes_a,bytes_b)))` 挑选的 brute-force 版，和优化版逐条比 merges + vocab。
+   - 语料要**专门造刁钻的**：高度撞车的 tie 语料（大量 pair 同频，专测 tie-break）、`aaaa` 重叠串（测贪心从左到右 + 重叠对记账）、中文/带音标拉丁（测多字节）、随机串。
+   - 覆盖：5 组语料 × 3 个 vocab_size 全 match；tinystories_sample 582 条 merge 全 match；5MB 语料 2743 条 merge 全 match。
+2. **不变量断言**：把 merge loop 抄一份出来，**每步 merge 后**从 `global_vocab_ids` 从零重算真值，校验三件事——
+   - `global_pair_counts` 没漂移；
+   - `global_pair_to_words` 和真值完全相等（且没有空 set 残留）；
+   - **每个存活 pair 都有一条携带当前 count 的堆条目**（这条是懒删除正确性的命根子）。
+   - 582 步全部通过、零漂移。
+3. **官方测试**：`pytest tests/test_train_bpe.py` 3/3。
+
+#### 3.4.5 懒删除堆：为什么是对的（两条不变量）
+
+| 不变量 | 内容 | 靠什么保证 |
+|---|---|---|
+| 1 无遗漏 | 任何 count>0 的 pair，堆里至少有一条**携带它当前 count** 的条目 | 每次 count 变动都紧跟一次 `push`；重建也是按当前 counts 建的 |
+| 2 可鉴别 | `pop` 出来的条目能判断是否过期 | key 是 `(pair, count)` 的纯函数，`count != pair_counts.get(pair,0)` 就是 stale |
+
+推论：设真正最优 pair 是 `p*`，由不变量 1，`(p*, C*)` 在堆里；比它先弹出的要么过期被丢，要么**更优或等价**（而更优不可能，因为 p\* 已最优）⇒ 第一个通过校验的弹出结果就是真正最优。✅
+
+**merge 不会凭空造出 `(id_a, id_b)`**：`new_id` 永远是全新 id，所以 best_pair 处理完必然归零并被删除，循环外的 `pop(best_pair, None)` 只是保险。
+
+#### 3.4.6 踩过的坑清单
+
+*A. 计数不同步类（增量更新）*
+- **`i`/`j` 变量冲突**：外层词下标用 `j`、内层扫描用 `i`，一开始都用 `i` → 内层 `i=0` 覆盖外层下标 → 写错位置。**内外循环变量必须不同名。**
+- **`ord(c)` vs `encode`**：`[ord(c) for c in token]` 是**码点**不是 UTF-8 字节！byte-level 必须 `list(token.encode("utf-8"))`。
+- **减 / 加 必须严格对称**：任何不对称 → 计数漂移 → tie-break 选错 → 测试挂。合并 `A B` 会连带改变 `(前,A)→(前,X)`、`(B,后)→(X,后)`，不只是 `(A,B)` 消失。
+- **清理 0 计数对**：`if pair_counts[pair] <= 0: del`，否则会选到 count=0 的僵尸对。
+- **`affected` 必须拷贝**：`list(pair_to_words[best_pair])`，循环体里会改这个 set。
+- **`.discard()` 不用 `.remove()`**：同词可能多次贡献同一 pair（`A B A B`）。
+- **`pop(k, None)` 不用 `del`**：可能已在减计数时删过。
+
+*B. tie-break 类（堆）*
+- **`neg_bytes` 的长度陷阱**（最大的坑）：`tuple(-x for x in b)` 反转了字节值，但**元组比较里「前缀相同时短的更小」这条长度规则没被反转** → `b'b'` vs `b'bc'` 选错。
+  - 修复：**加正数哨兵** `tuple(-x for x in b) + (1,)`。哨兵 `1` > 任何 `0~-255`，让更长的串在对应位补负数 → min 里更小 → 复现「长的更大」。
+  - 哨兵必须是**正数**：`0` 会和 `neg_bytes(b'\x00')` 撞；`b"\xff"` 补码方案也会撞（`\x00` 的补码就是 `\xff`）。
+  - 穷举验证（含 `\x00`/`\xff` 的 1~3 字节串，66306 组比较）：naive 版 **936 组违反**反序，哨兵版 **0 违反**。
+- **int 版 tie-break**：不能比 ID 数值！必须 `(count, (vocab[id_a], vocab[id_b]))` 转回 bytes 比字典序。
+- 备选方案（未用）：堆只存 `-count`，pop 时收集所有并列最高 count 的候选再正常 `max`——避开反转，但 `pop_best` 更复杂。
+
+*C. 一般实现类*
+- 序列用 **int(token ID) list** 表示（非 bytes）；`list(word.encode())` 直接得 int list。
+- **merges 存 bytes 对**：`(vocab[id_a], vocab[id_b])`，不是 id 对。
+- 替换用「扫描重建新 list」（`i+2`/`i+1`），非原地 pop（避下标错位）；`new_id = len(vocab)` 别用 `len-1`。
+- 特殊 token 最后加，终止条件留余量 `vocab_size - len(special_tokens)`。
+- `bytes([i])`（方括号！）造单字节；`bytes(65)` 是 65 个 0，`bytes('A')` 报错。
+- `if __name__ == "__main__":` 包住底部测试调用，避免 import 时乱跑十几秒。
+- **优化2 的位置坑**：`if id_a not in token_id: continue` 必须放在重建循环**前**，放后面等于白重建。
+
+#### 3.4.7 如何 profile
+
 ```python
 import cProfile, pstats
 cProfile.run('train_bpe("tests/fixtures/corpus.en", 500, ["<|endoftext|>"])', 'prof')
 pstats.Stats('prof').sort_stats('cumulative').print_stats(20)
 ```
-- 看 **tottime**（函数自身耗时，找瓶颈看它）、**cumtime**（含子调用）、**ncalls**（调用次数，几百万次=热点）。
+- 看 **tottime**（函数自身耗时，找瓶颈看它）、**cumtime**（含子调用）、**ncalls**（几百万次=热点）。
 - 命令行版：`python -m cProfile -s cumtime <script>`；可视化：`snakeviz`。
-- 预判瓶颈：合并 loop 每轮全量重数 pairs（§3.3.3 朴素版）→ 优化方向是增量更新 or 并行预分词。
+- 实战战果：profile 增量版（valid+vocab10000）显示 `max` 7.3s + `rank` 6.6s（被调 **1 亿次**）= 几乎全部时间 → 直接指向「用堆替代每轮全扫」。而 a/c 增量操作才 0.05s。**先 profile 再优化，别猜。**
 
 ### 3.5 优化 TODO（先 Python 跑通再做）
 - **顺序铁律**：Python 写对 → 过 `test_train_bpe` → profile 找瓶颈 → 先试 `multiprocessing`（handout 说并行后 TinyStories BPE 可压到 2 分钟内，可能纯 Python 就达标）→ 还不够才上 C/Rust。
