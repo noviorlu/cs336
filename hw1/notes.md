@@ -398,6 +398,35 @@ GPT-4o = `o200k_base`（20万）：更精细，范式不变。
 
 ⚠️ **小数据看不出堆的优势**：corpus.en/vocab500 上堆版才 0.3s，和无堆差不多甚至略慢（堆维护开销 ≈ 省下的扫描）。**对比优化效果必须在目标规模上测。**
 
+#### 3.4.1b 懒删除堆（lazy-deletion heap）—— 通用技巧，值得单独记
+
+**问题**：`heapq` 只保证「堆顶最小」，**不支持「高效修改/删除堆里某个已存在元素」**——要找到它得 O(n) 扫描。但 BPE 里 pair 的计数**频繁变化**，天然需要「改堆里某个 pair 的优先级」。
+
+**懒删除的解法（核心思想）**：**不改旧的，只 push 新的；旧的留着变 stale，弹出时验证 + 丢弃。**
+
+```python
+# 计数变化时：不去堆里找旧条目改，直接 push 新值（O(log n)，不扫描）
+def push(self, pair, count):
+    heapq.heappush(self.heap, (-count, tie_break_key, pair))
+
+# 取最优时：弹出，和「真相源」pair_counts 核对，不一致就是 stale，丢弃继续弹
+def pop_best(self, pair_counts):
+    while self.heap:
+        neg_count, _, _, pair = heapq.heappop(self.heap)
+        if -neg_count == pair_counts.get(pair, 0) and -neg_count > 0:
+            return pair            # 堆里的值 == 真值 → 有效
+        # 否则过时，丢弃，继续
+    return None
+```
+
+**关键理解（为什么这样反而快）**：
+- **push 从不扫描堆**——它只做上浮（sift-up），O(log n)。push 一个已存在的 pair 会留下**重复条目**（旧的 stale + 新的有效），这是**故意的**，不是 bug。
+- **真相源在别处**：`pair_counts`（dict）才是「某 pair 当前计数」的权威。堆只是个「大概按优先级排」的加速结构，靠 pop 时和 `pair_counts` 核对来纠正。
+- **权衡**：用「允许 stale 垃圾 + pop 时验证」换掉了「O(n) 堆内查找修改」。每个操作都 O(log n)，代价是堆膨胀。
+- **膨胀治理**：见 #4 `maybe_rebuild`——堆长 > 2×存活+1024 时重建，清 stale。
+
+**这个模式的适用场景（记住它）**：任何「需要优先队列 + 元素优先级频繁变化」的场合（Dijkstra 变体、事件调度、任务队列……）。标准库堆不支持 decrease-key，懒删除是最常用的绕过法。判据：**修改频繁、且有一个独立的「真相源」能在 pop 时验证有效性**。
+
 #### 3.4.2 第 2~4 步：每条优化为什么快
 
 **#2 `neg_bytes` 按 token id 缓存**
