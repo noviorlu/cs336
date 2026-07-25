@@ -5,7 +5,7 @@ from multiprocessing import Pool
 import time
 from tqdm import tqdm
 
-from collections import Counter
+from collections import Counter, defaultdict
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -56,11 +56,11 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def pretokenize(
+def pretokenize_chunk(
     input_path: str | os.PathLike,
     start: int,
     end: int,
-    special_pattern: str,
+    macro_special_pattern: str,
 ) -> dict[str, int]:
     
     local_vocab: dict[str, int] = Counter()
@@ -68,7 +68,7 @@ def pretokenize(
     with open(input_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        parts = re.split(special_pattern, chunk)
+        parts = re.split(macro_special_pattern, chunk)
         
         for part in parts:
             for m in re.finditer(PAT, part):
@@ -83,15 +83,15 @@ def train_bpe(
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
 
-    special_pattern = "|".join(re.escape(t) for t in special_tokens)
+    macro_special_pattern = "|".join(re.escape(t) for t in special_tokens)
 
-    bpe_vocab : dict[int, bytes] = {}
+    result_bpe_vocab : dict[int, bytes] = {}
     for i in range(256):
-        bpe_vocab[i] = bytes([i])
-    bpe_merges : list[tuple[bytes, bytes]] = []
+        result_bpe_vocab[i] = bytes([i])
+    result_bpe_merges : list[tuple[bytes, bytes]] = []
 
+# region 1. chunk boundaries
     global_vocab: dict[str, int] = Counter()
-    
     t0 = time.perf_counter()
 
     boundaries = []
@@ -101,14 +101,17 @@ def train_bpe(
 
     t1 = time.perf_counter()
     print(f"Finding chunk boundaries took {t1 - t0:.5f} seconds")
+# endregion
 
+# region 2. pre-tokenization
+    t0 = time.perf_counter()
     with Pool(num_processes, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),)) as pool:
         results = []
         for i, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
             results.append(
                 pool.apply_async(
-                    pretokenize, 
-                    (input_path, start, end, special_pattern)
+                    pretokenize_chunk, 
+                    (input_path, start, end, macro_special_pattern)
                 )
             )
 
@@ -116,60 +119,85 @@ def train_bpe(
             local_vocab = result.get()
             global_vocab.update(local_vocab)
 
-    t2 = time.perf_counter()
-    print(f"Pre-tokenization took {t2 - t1:.5f} seconds")
+    t1 = time.perf_counter()
+    print(f"Pre-tokenization took {t1 - t0:.5f} seconds")
+# endregion
 
-    word_freq : list[tuple[int, list[int]]] = []
-    for token, count in global_vocab.items():
-        word_freq.append((count, list(token.encode("utf-8"))))
+# region 3. BPE training
+    global_vocab_ids :list[list[int]] = []                                      # 每个词的 id 序列（原地改）—— 注意去掉 count 单独存
+    global_vocab_counts : list[int] = []                                        # 每个词的出现次数（和 word_freq 下标对齐）
+    global_pair_counts: dict[tuple[int,int], int] = Counter()                   # 每个对的全局加权计数
+    global_pair_to_words: dict[tuple[int,int], set[int]] = defaultdict(set)     # 每个对 → 含它的词下标集合
+    for idx, (token, count) in enumerate(global_vocab.items()):
+        global_vocab_ids.append(list(token.encode("utf-8"))) 
+        global_vocab_counts.append(count)
+
+        ids_list = global_vocab_ids[-1]
+        ids_length1 = len(ids_list) - 1
+        for i in range(ids_length1):
+            pair = (ids_list[i], ids_list[i + 1])
+            global_pair_counts[pair] += count
+            global_pair_to_words[pair].add(idx)
 
     def rank(x):
         pair = x[0]
         count = x[1]
         id_a = pair[0]
         id_b = pair[1]
-        bytes_a = bpe_vocab[id_a]
-        bytes_b = bpe_vocab[id_b]
+        bytes_a = result_bpe_vocab[id_a]
+        bytes_b = result_bpe_vocab[id_b]
         return (count, (bytes_a, bytes_b))
 
-
-    while len(bpe_vocab) < vocab_size - len(special_tokens):
-        pairs: dict[tuple[int, int], int] = Counter()
-        for count, token_id in word_freq:
-            for i in range(len(token_id) - 1):
-                pairs[(token_id[i], token_id[i + 1])] += count
-
-        if not pairs:
-            break  # No more pairs to merge
-
-        # best_pair = Find pair in counts with MAX frequency (if tie, choose by lexicographically)
-        best_pair, _ = max(pairs.items(), key=rank)
+    while len(result_bpe_vocab) < vocab_size - len(special_tokens):
+        if not global_pair_counts: break
+        best_pair, _ = max(global_pair_counts.items(), key=rank)
         id_a, id_b = best_pair
-        new_id = len(bpe_vocab)
-        bpe_vocab[new_id] = bpe_vocab[id_a] + bpe_vocab[id_b]
-        bpe_merges.append((bpe_vocab[id_a], bpe_vocab[id_b]))
+        new_id = len(result_bpe_vocab)
+        result_bpe_vocab[new_id] = result_bpe_vocab[id_a] + result_bpe_vocab[id_b]
+        result_bpe_merges.append((result_bpe_vocab[id_a], result_bpe_vocab[id_b]))
 
-        # Update word_freq with new merged token
-        for j, (count, token_id) in enumerate(word_freq):
-            if id_a not in token_id:
-                continue
-            
-            new_token_ids: list[int] = []
+
+        affected = list(global_pair_to_words[best_pair])
+        for word_idx in affected:
+            seq = global_vocab_ids[word_idx]
+            seq_count = global_vocab_counts[word_idx]
+
+            # Remove the old pair counts and update the word's sequence
+            for i in range(len(seq) - 1):
+                pair = (seq[i], seq[i+1])
+                global_pair_counts[pair] -= seq_count
+                if global_pair_counts[pair] <= 0:
+                    del global_pair_counts[pair]
+                global_pair_to_words[pair].discard(word_idx)
+
+            # Update the word's sequence by merging the best pair
+            new_seq = []
             i = 0
-            token_length = len(token_id)
-            token_length1 = len(token_id) - 1
-            while i < token_length:
-                if i < token_length1 and token_id[i] == id_a and token_id[i + 1] == id_b:
-                    new_token_ids.append(new_id)  # New merged token ID
-                    i += 2  # Skip the next byte since it's merged
+            n = len(seq)
+            while i < n:
+                if i < n - 1 and seq[i] == id_a and seq[i+1] == id_b:
+                    new_seq.append(new_id)
+                    i += 2
                 else:
-                    new_token_ids.append(token_id[i])
+                    new_seq.append(seq[i])
                     i += 1
-            
-            word_freq[j] = (count, new_token_ids)
+            global_vocab_ids[word_idx] = new_seq
+
+            # Update the pair counts for the new sequence
+            for i in range(len(new_seq) - 1):
+                pair = (new_seq[i], new_seq[i+1])
+                global_pair_counts[pair] += seq_count
+                global_pair_to_words[pair].add(word_idx)
+
+        global_pair_counts.pop(best_pair, None)
+        global_pair_to_words.pop(best_pair, None)
+
+# endregion
+
+
 
     # Add special tokens to the vocabulary
     for token in special_tokens:
-        bpe_vocab[len(bpe_vocab)] = token.encode("utf-8")
+        result_bpe_vocab[len(result_bpe_vocab)] = token.encode("utf-8")
 
-    return bpe_vocab, bpe_merges
+    return result_bpe_vocab, result_bpe_merges

@@ -375,11 +375,43 @@ GPT-4o = `o200k_base`（20万）：更精细，范式不变。
 - `uv run pytest tests/test_train_bpe.py`：**3/3 全 PASS**（test_train_bpe + special_tokens + speed）。
 - 实测 valid+vocab1000 的 merges 前几个：`(b' ',b't')`, `(b'h',b'e')`, `(b' ',b'a')`, `(b' t',b'he')`(→` the`), `(b' a',b'nd')`(→` and`)——渐进合并正确，符合 §3.3.2。
 
-**优化历程（speed 1.67s → 1.14s，过线）：**
+**优化历程（test 全套 5.01s → 0.87s；speed 项 1.67s → 1.14s → 更快）：**
+
+*第一阶段（朴素版微优化，过 speed 线）：*
 - **优化1 缓存 len**：内层 while 的 `len(token_id)` 提到循环外存变量（profile 显示 len 被调 1亿次，3.6s）。
 - **优化2 替换时跳过不含该对的词**：重建循环**之前**加 `if id_a not in token_id: 原样保留+continue`（C级快速检查）。⚠️ 坑：这个 `if` 必须放在重建循环**前**，放后面等于白重建（"先干完才发现白干"，无效）。
 - **`if __name__ == "__main__":`** 包住底部测试调用，避免 import 时在 valid 上乱跑十几秒。
-- 未做（留给 tinystories 全量）：数 pairs 的增量更新（§3.3.3）、并行预分词。speed 测试小，这俩用不上（并行开销 > 收益）。
+
+*第二阶段（为 tinystories 全量，做真正的大改造）：*
+- **并行预分词**（`multiprocessing.Pool` + `apply_async`）：`find_chunk_boundaries(f, cpu_count, b"<|endoftext|>")` 切 N 块（实测 32 块），各进程跑 `pretokenize_chunk`（传 `input_path,start,end,pattern`，各自 open/seek/read），`result.get()` 汇总。**实测全量 2.2G 预分词仅 12.3 秒**，验证 hint「并行预分词」是关键。
+  - 坑：小数据（speed 测试的 corpus.en）也走 Pool 没被拖垮，仍 PASS——进程启动开销可接受。
+  - `apply_async` 两段式：先全部提交（不阻塞→并行开跑），再逐个 `get()` 收割。
+- **增量更新合并 loop**（治本，消除「每轮全量重数 pairs」）：把 5.01s→0.87s。四个持久结构协同：
+  - `global_vocab_ids: list[list[int]]`（每词 id 序列，**原地改**，下标=词标识）
+  - `global_vocab_counts: list[int]`（次数，下标对齐）
+  - `global_pair_counts: Counter`（对→全局加权计数，**持久**）
+  - `global_pair_to_words: defaultdict(set)`（对→含它的词下标集合）**← 增量的关键索引**
+  - 初始化：遍历所有词一次，建满 4 个结构。
+  - 每轮：从 `pair_counts` 选 best_pair（不重数）→ 只遍历 `pair_to_words[best_pair]` 的词（**不是所有词**）→ 对每词「整词 remove-then-add」：a.减该词当前所有对 b.原地合并序列 c.加新序列所有对。
+- **原地改 vs 重建**：增量更新要求下标稳定，所以合并从「重建 new_word_freq」改成「`global_vocab_ids[word_idx]=new_seq` 原地替换」。
+
+*test 全套耗时时间线（`uv run pytest tests/test_train_bpe.py`）：*
+| 版本 | 耗时 | 关键改动 |
+|---|---|---|
+| 朴素串行 | ~16s | 每轮全量重数 pairs + 重建所有词 |
+| +并行预分词 +原地改 +跳过不含词 | ~5s | Pool 并行、优化1/2 |
+| +增量更新合并 loop | **0.87s** | pair_counts/pair_to_words 持久增量，只碰含 best_pair 的词 |
+
+*增量更新踩过的坑（务必记牢，都是「计数不同步」类）：*
+- **`i`/`j` 变量冲突**：外层 `for j,(count,seq) in enumerate(...)`（词下标），内层扫描 while 用了 `i`——一开始内外都用 `i`，内层 `i=0` 覆盖了外层词下标 → `word_freq[i]` 写错位置。**内外循环变量必须不同名**。
+- **`ord(c)` vs `encode`**：`[ord(c) for c in token]` 是**码点**不是 UTF-8 字节！byte-level 必须 `list(token.encode("utf-8"))`（非 ASCII 会错）。
+- **`pair_to_words` 用 `defaultdict(set)`**：普通 dict 对新 key `.add()` 会 KeyError；`pair_counts` 用 `Counter`（`+=` 新 key 自动 0）。
+- **a 减 / c 加 必须严格对称**：a 减「旧序列所有对」、c 加「新序列所有对」，任何不对称 → 计数漂移 → tie-break 选错 → 测试挂。**整词 remove-then-add** 比「只改 best_pair 周围对」更不易错（因为合并 `A B` 会连带改变 `(前,A)→(前,X)`、`(B,后)→(X,后)`，不只是 `(A,B)` 消失）。
+- **清理 0 计数对**：a 减完 `if pair_counts[pair] <= 0: del`，否则 `max` 会选到 count=0 的僵尸对。
+- **循环外清 best_pair**：`pair_counts.pop(best_pair, None)` + `pair_to_words.pop(best_pair, None)`（防残留导致死循环）。用 `pop(.,None)` 不用 `del`（可能已在 a 里删过）。
+- **`affected = list(pair_to_words[best_pair])` 必须拷贝**：循环体里 `.discard()` 会改这个 set，遍历时改会出错。
+- **`.discard()` 不用 `.remove()`**：同词对同 pair 可能贡献多次（`A B A B`），discard 不存在不报错更安全。
+- **唯一验证方法**：静态查不出计数漂移，必须跑 `test_train_bpe` 和朴素版**逐字节对拍**。
 
 **实现要点/踩过的坑（备忘）：**
 - 序列用 **int(token ID) list** 表示（非 bytes），word_freq = `list[tuple[int, list[int]]]`（次数, ID序列）。`list(word.encode())` 直接得 int list。
