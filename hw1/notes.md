@@ -103,7 +103,7 @@ b'caf\xc3\xa9'  ← bytes：0–255 的字节序列
 
 - LLM 不在**字节层**预测，而是在 **token ID** 上预测。中文和日文 token 是词表里两个不同 ID，ID 相邻也无语义关系 → "字节接近导致混淆"不成立。
 - **真正原因**：① 训练数据 CJK 混杂 → **embedding 空间**里三者互为邻居；② 中文高质量数据稀疏，采样易漂移；③ 采样随机性；④ tokenizer 不匹配（中文被切碎）。
-- **直觉纠正**：不是字节接近，而是 **embedding 空间**里 CJK 向量互为邻居。字节只是最底层存储，模型不在那层"思考"。（与 §3.2 的"高频 token 学得充分"呼应）
+- **直觉纠正**：不是字节接近，而是 **embedding 空间**里 CJK 向量互为邻居。字节只是最底层存储，模型不在那层"思考"。（与 §3.7.2 的"高频 token 学得充分"呼应）
 
 ---
 
@@ -565,7 +565,7 @@ handout 拿 **The Pile**（825 GB，见 §0.2）当尺度参照物——不是�
 
 ### 2.11 分词的代价 & 去 tokenizer 化（延伸）
 
-> 背景与延伸，和 §2 的实现无关。后续读「替换/去掉 tokenizer」方向的论文，笔记记在 §3.4。
+> 背景与延伸，和 §2 的实现无关。后续读「替换/去掉 tokenizer」方向的论文，笔记记在 §3.7.4。
 
 #### 2.11.1 三种主流分词算法
 
@@ -604,7 +604,7 @@ handout 拿 **The Pile**（825 GB，见 §0.2）当尺度参照物——不是�
 | **字符级失明** | 「strawberry 里有几个 r」——模型没见过字符，只见过几个 token ID |
 | **多语言不公平** | 小语种被切得稀碎，同一句话花几倍 token，又贵又差 |
 | **提示词边界效应** | 末尾多一个空格就换一套 token，行为跟着变（前导空格吸附，见 §2.2） |
-| **glitch token** | `SolidGoldMagikarp` 那类：在词表里但训练语料几乎没出现 ⇒ embedding 行从没被更新过 ⇒ 模型碰到就发疯（对应 §3.2「梯度只流回被用到的行」） |
+| **glitch token** | `SolidGoldMagikarp` 那类：在词表里但训练语料几乎没出现 ⇒ embedding 行从没被更新过 ⇒ 模型碰到就发疯（对应 §3.7.2「梯度只流回被用到的行」，机制见 §3.6.2） |
 | **词表格子被垃圾占** | owt 词表里最长的 10 个 token 全是乱码和分隔线（见 §2.8）；词表翻倍 ≠ 压缩率翻倍 |
 
 **最要命的一条不是"问题"而是"约束"**：**encode 必须和训练时完全一致**。模型学的是「ID 47 后面常跟 ID 892」这种统计；训练用 BPE 的 rank 顺序切、推理改用贪心切，同一句话会变成一串不同的 ID，分布一偏模型立刻退化。这就是 `test_tokenizer.py` 里一堆 `test_*_matches_tiktoken` 要求逐 token 对上的原因——**tokenizer 不是"差不多就行"的组件，它是模型的一部分**。
@@ -642,11 +642,270 @@ handout 拿 **The Pile**（825 GB，见 §0.2）当尺度参照物——不是�
 
 ---
 
-## 3. Embedding & 表示学习（讨论）
+## 3. Transformer Architecture（handout §3）
+
+> 从 token ID 到 logits 的完整前向。**11 个 problem / 29 分。**
+> 实现严格自底向上：Linear → Embedding → RMSNorm → SwiGLU → RoPE → softmax → SDPA → MHA → Block → LM → accounting。
+>
+> **和 §2 的根本差异**：§2 的失败模式是**算法逻辑**（计数漂移、tie-break、增量维护记账），靠 brute-force 对拍抓；§3 的算法是给定的，失败模式几乎全是**形状、广播、维度顺序、dtype**，靠形状断言 + toy 输入 + 数学不变量抓。**换了战场就要换工具。**
+
+| handout | problem | 分 | 状态 |
+|---|---|---|---|
+| §3.3.2 | `linear` | 1 | ✅ |
+| §3.3.3 | `embedding` | 1 | ✅ |
+| §3.4.1 | `rmsnorm` | 1 | ⬜ |
+| §3.4.2 | `positionwise_feedforward`（SwiGLU） | 2 | ⬜ |
+| §3.4.3 | `rope` | 2 | ⬜ |
+| §3.4.4 | `softmax` | 1 | ⬜ |
+| §3.4.4 | `scaled_dot_product_attention` | 5 | ⬜ |
+| §3.4.5 | `multihead_self_attention` | 5 | ⬜ |
+| §3.5 | `transformer_block` | 3 | ⬜ |
+| §3.5 | `transformer_lm` | 3 | ⬜ |
+| §3.5 | `transformer_accounting`（书面） | 5 | ⬜ |
+
+### 3.1 整体地图（§3.1）
+
+**端到端形状流**：
+
+| 阶段 | 输出形状 | 备注 |
+|---|---|---|
+| 输入 | `(batch, seq)` | int64 token ID，来自 §2.10 落盘的 `.npy` |
+| Token Embedding | `(batch, seq, d_model)` | 查表（§3.6） |
+| Transformer Block × `num_layers` | `(batch, seq, d_model)` | **进出同形状** |
+| `ln_final`（RMSNorm） | `(batch, seq, d_model)` | pre-norm 架构特有 |
+| `lm_head`（Linear） | `(batch, seq, vocab_size)` | **logits，不是概率** |
+
+**两个骨架级理解**：
+
+1. **`d_model` 是一条从头贯到尾的总线**（residual stream / 残差流）。中间 `num_layers` 个 block 谁也不改变它的宽度，每个 block 只是往这条总线上**加**东西。handout §3.4 那句 "a clean residual stream without any normalization" 说的就是它。
+2. **block 进出同形状 ⇒ 能无脑堆叠**，这才让 `num_layers` 能当自由超参。
+
+**pre-norm block 的两个子层是同一个模式**（Figure 2）：
+
+$$y = x + \text{Sublayer}(\text{RMSNorm}(x))$$
+
+- 子层 1：Sublayer = Causal Multi-Head Self-Attention w/ RoPE
+- 子层 2：Sublayer = SwiGLU FFN
+
+即 **norm 在前、主操作在中、残差在外**。注意残差加回去的是 `x` 而不是 `RMSNorm(x)`——**这正是「残差流保持干净」的含义**。
+
+**三个讨论清楚的问题**：
+
+| 问题 | 答案 |
+|---|---|
+| 为什么 pre-norm 最后要**补**一个 RMSNorm | post-norm 每个子层出口都归一化过，输出天然有界；pre-norm 把 norm 挪到入口后，残差流上的量**层层累加无人约束**，`lm_head` 拿到的东西尺度失控 ⇒ 必须在最后补一次。§7.3 的 `pre_norm_ablation` 测的就是这个 |
+| 位置信息在哪一步进入 | **embedding 之后没有任何位置编码**。位置信息只在每层 attention 内部通过 RoPE 注入，且只作用于 Q/K。⚠️ **这和 GPT-2 不同**（GPT-2 是可学习的绝对位置 embedding，直接加在 token embedding 上）⇒ 本模型只有**一张** embedding 表 |
+| 模型返回 logits 还是概率 | **logits**。handout 自己不一致（§3 开头说 "normalized probability distribution"、Figure 1 顶上画着 Softmax，但 `transformer_lm` 那题说 "unnormalized ... (the logits)"）。以 problem 描述为准。理由：§4.1 的 cross-entropy 要在内部做 log-softmax 才能数值稳定；§6 的 temperature/top-p 也要在 logits 上介入 |
+
+**可学习参数清单**（`transformer_accounting` (a) 问要用）：
+
+| 组件 | 形状 | 个数 |
+|---|---|---|
+| `token_embeddings` | `(vocab_size, d_model)` | 1 |
+| 每个 Block：attn 的 $W_Q,W_K,W_V,W_O$ + FFN 的 $W_1,W_2,W_3$ + 2 个 RMSNorm gain | — | 9 × `num_layers` |
+| `ln_final` | `(d_model,)` | 1 |
+| `lm_head` | `(vocab_size, d_model)` | 1 |
+
+- **RoPE 没有参数**（`cos`/`sin` 是 buffer 不是 Parameter）。
+- **不做 weight tying**：`lm_head.weight` 和 `token_embeddings.weight` 在参考 state dict 里是**两个独立的 key** ⇒ 算参数量时 `vocab_size × d_model` 要算**两次**。
+
+**构造参数**：`vocab_size` / `context_length` / `num_layers` / `d_model` / `num_heads` / `d_ff` / `rope_theta`。
+其中 **`context_length` 只有一个用途——决定 RoPE 预计算 buffer 的长度**，它不出现在任何参数矩阵的形状里。这也是这套架构理论上能外推到更长序列的原因（效果另说）。
+
+### 3.2 张量代数：einops & 内存序（§3.2）
+
+**核心**：轴从「位置」变成「名字」——声明输入输出各轴叫什么，中间的 view/transpose/permute 交给库推。三个 op：`rearrange`（纯搬运，元素数不变）、`reduce`（聚合）、`einsum`（收缩）。
+
+| 动作 | pattern |
+|---|---|
+| 换序 | `"a b c -> a c b"` |
+| 合并 | `"a b c -> a (b c)"` |
+| 拆分 | `"a (b c) -> a b c", b=4`（**必须给一个大小**；不整除直接报错 ⇒ 免费形状断言） |
+| 加轴 | `"a b -> a 1 b"` |
+| **任意批维** | `"... a b -> ... b a"` |
+
+**einsum 两条规则**：同名 = 对齐配对相乘；**左边有、右边没有 = 沿它求和消去**。
+
+> ⚠️ **`(a b)` 左慢变、右快变**（索引 = `a*len(b)+b`，和 row-major 同一条规则）。**只有 `(a b)` 对 `(a b)` 才互逆**——拆分时顺序写反：形状正确、代码照跑、元素被洗牌 ⇒ 数值全错。**MHA 拆 head 时这是决定成败的一行。**
+
+> ⚠️ `einops.einsum(t1, t2, "pat")` 张量在前；`torch.einsum("pat", t1, t2)` pattern 在前且只能单字母轴名。**只用 einops 版。**
+
+**§3.2.1 的精髓**：数学用列向量（$y=Wx$，batch 只能放**后**），PyTorch 是 row-major、batch 必须在**前**（这样每个样本的特征在内存里连续）⇒ 只能用行向量式 $y=xW^\top$ ⇒ **数学和代码永远差一个转置**。但**两种约定对 $W$ 的存储形状没有分歧，都是 $(d_{out}, d_{in})$**。
+⇒ **用 einsum 就对这一节免疫**：写 `"... d_in, d_out d_in -> ... d_out"`，轴名一标，根本不存在「该不该转置」。
+
+### 3.3 命名约定：模块树 ↔ state_dict（贯穿全章）
+
+**`state_dict` 的 key = 属性名沿模块树拼接。** 属性名错一个字母，整条路径就废。**开工前照着定名，后面九个 adapter 全是一行 `load_state_dict`**（读自 `adapters.py` 的 docstring）：
+
+| 层级 | 属性名 |
+|---|---|
+| LM | `token_embeddings` / `layers`（**`nn.ModuleList`**）/ `ln_final` / `lm_head` |
+| Block | `attn` / `ln1` / `ln2` / `ffn` |
+| attn 内 | `q_proj` `k_proj` `v_proj` `output_proj` |
+| ffn 内 | `w1` `w2` `w3` |
+| 叶子参数 | `weight` |
+
+⇒ key 形如 `layers.3.attn.q_proj.weight`、`ln_final.weight`。
+⚠️ `layers` 必须是 **`nn.ModuleList`**，普通 Python list 里的子模块**不会被注册**，参数进不了 `state_dict`、优化器也看不见。
+
+**`load_state_dict` 是原地拷贝**（≈ `param.data.copy_`）⇒ 参数的 device/dtype **不变**，传入张量被自动转换。保持 `strict=True`：key 或形状对不上就报错，**这是免费的命名 + 形状校验**。
+
+**三个坑**：
+
+1. `run_linear` / `run_embedding` 给的是**裸 Tensor**，要自己包成单键字典（叶子无路径前缀，key 就是 `weight`）；`run_transformer_block` / `run_transformer_lm` 给的**本身就是 dict**可直接传。
+2. **device/dtype 在构造时对齐**，取自 **`weights`**（不是输入激活）。device 不一致 → forward 报错（**响的**）；dtype 不一致 → **静默转精度**（**哑的，更麻烦**）。
+3. **persistent buffer 也进 `state_dict`** ⇒ RoPE 的 `cos`/`sin` 若按默认注册会多出参考实现没有的 key，`strict=True` 直接失败。**这才是 §3.4.3 要求 `persistent=False` 的真实原因**，不只是省磁盘。
+
+**调试**：key 对不上时做**对称差** `set(模块.state_dict()) ^ set(给的字典)`。
+**adapter 只做胶水**——里面出现的每一点逻辑，都是模块本该提供而没提供的东西。
+
+### 3.4 参数初始化（§3.3.1）
+
+| 参数 | 分布 | 截断 |
+|---|---|---|
+| **Linear** | $\mathcal{N}(0,\ \sigma^2=\frac{2}{d_{in}+d_{out}})$ ← Xavier/Glorot | $[-3\sigma, 3\sigma]$ |
+| **Embedding** | $\mathcal{N}(0,\ \sigma^2=1)$ | $[-3, 3]$ |
+| **RMSNorm gain** | 全 **1**（恒等变换） | — |
+
+- **Xavier 的分母**：前向要 $\sigma^2\sim1/d_{in}$、反向要 $\sigma^2\sim1/d_{out}$，不可兼得 ⇒ 取调和平均。数值感：GPT-2 XL 的 $d_{model}=1600$ ⇒ $\sigma\approx0.025$，和 GPT-2 论文固定用的 0.02 同数量级。
+- **Embedding 不套 Xavier**：Xavier 前提是「输出 = $d_{in}$ 项加权和」，而 embedding 是**取一行**（§3.6），那个累积效应根本不存在。
+- **gain 写成 0 的话**：前向恒 0、梯度断掉，loss 卡在 $\ln(\text{vocab\_size})$ 不动。
+
+> ⚠️ **最大的坑：`trunc_normal_` 的 `a`/`b` 是绝对边界值，默认 `±2.0`**。写 `std=0.02` 而不传 a/b ⇒ 实际截断在 $\pm100\sigma$ ＝ **等于没截断**。a/b 必须跟着算出的 $\sigma$ 走。
+
+- **截断 ≠ clamp**：`randn().clamp()` 会把两条尾巴压成 $\pm3\sigma$ 处的两个**点质量**，分布形状就变了；`trunc_normal_` 是逆 CDF 采样，直接从截断分布抽。（$3\sigma$ 外概率 0.27%，GPT-2 XL 的 $W_1$ 有 686 万元素 ⇒ 必然出现约 1.8 万个离群值，截断不是洁癖。）
+- **`torch.empty` + 就地初始化是官方 idiom**（`nn.Linear.reset_parameters` 就这么写）：`empty` 只分配不填值，紧接着被逐元素全覆盖 ⇒ 省掉一次注定被覆盖的填充。
+- **实测 `std()` 比名义 $\sigma$ 低约 1.3%**（截断砍尾必然缩方差，PyTorch 不补偿）⇒ **正确行为，别当 bug 查**，更不要后处理去凑。
+
+> ⚠️⚠️ **初始化这块 pytest 完全测不到**——测试都是加载给定权重再比数值，你的 `trunc_normal_` 根本不会执行。$\sigma$ 写错、gain 写成 0、忘了截断，**测试照样全绿**；账要到 §7 训练时才结（loss 不降或前几百步炸），那时隔了十几个组件极难回溯。而 handout 那句 "pre-norm 对初始化异常鲁棒" 意味着**你连明确的失败信号都不会有**。
+> ⇒ **自己加断言**：`weight.std()` ≈ $\sigma$（允许低 1.3%）、`weight.abs().max()` ≤ $3\sigma$。30 秒，省掉 §7 一个下午。这是 §2.9「绿灯 ≠ 证明」的延续。
+
+### 3.5 Linear（§3.3.2）✅ 1 分
+
+**要点**：不带 bias（跟随现代 LLM）｜参数存 $W$ **不是** $W^\top$，形状 `(d_out, d_in)`｜属性名 `weight`｜必须是 `nn.Parameter`｜必须支持任意批维｜禁用 `nn.Linear` / `F.linear`。
+
+**踩过的五个坑**（都是 review 出来的，测试抓不到前两个）：
+
+| # | 坑 | 后果 |
+|---|---|---|
+| 1 | 参数没包进 `nn.Parameter`，只是普通 tensor | 不进 `state_dict`、优化器看不见、`.to()` 搬不走、`load_state_dict` 无效。**这四件事在 §3–§4 全是刚需** |
+| 2 | `std` 硬编码 0.02 且不传 `a`/`b` | 分布和截断双错，测试全绿（见 §3.4） |
+| 3 | einsum pattern 里批维写死成 `b` | 喂 `(batch, seq, d_in)` 直接报错 |
+| 4 | 属性名 `W`、类名小写 | 对不上参考 state dict ⇒ 第 9、10 题要手工搬十几个张量。**这条有连锁后果，越晚改越贵** |
+| 5 | adapter 用 `weights.shape` 反推维度 | 见下 |
+
+> **坑 5 展开**：签名同时给了 `d_in`/`d_out`（**声明的契约**）和 `weights`（**实际的数据**）。用 `weights.shape` 构造 ⇒ 模块形状由数据定义 ⇒ `load_state_dict` 的形状检查变成自己和自己比，**永远不可能报错**。用 `d_in`/`d_out` 构造，它才真的在比对契约 vs 数据，权重转置之类的错会当场抛 `size mismatch` 一眼定位。
+> ⇒ 这就是 §2.10 那条方法论的微型版：**任何时候一个量能用两条路算，就该都算一遍。**
+
+### 3.6 Embedding（§3.3.3）✅ 1 分
+
+**要点**：参数 `weight` 形状 `(num_embeddings, embedding_dim)`，**`d_model` 必须是最后一维**｜$\sigma^2=1$ 截断 $[-3,3]$｜forward 是**高级索引**，einsum 用不上｜禁用 `nn.Embedding` / `F.embedding`，也别绕 one-hot 矩阵乘。
+
+**命名对照**（同一个东西、两个抽象层级）：
+
+| | 通用叫法（`nn.Embedding` 接口） | 本模型语义 |
+|---|---|---|
+| 表有多少**行** | `num_embeddings` | `vocab_size` |
+| 每行多**宽** | `embedding_dim` | `d_model` |
+
+`nn.Embedding` 用通用名是因为 embedding 表不一定装词（位置、说话人、类别都可以）。**这里两者必须相等**，因为输出直接汇入宽度恒为 `d_model` 的残差流。
+> 但原则上可以不等：ALBERT 的 factorized embedding 让 $E \ll H$ 再加一个 $E\to H$ 投影，动机是 embedding 表有 `vocab_size` 行、是参数大户。**本作业不做。**
+
+#### 3.6.1 高级索引（advanced indexing）到底在干什么
+
+从简单情形推上去（源张量 = 4 行 × 3 列的表）：
+
+| 索引对象 | 结果形状 |
+|---|---|
+| 标量 `2` | `(3,)` —— 第 2 行 |
+| 一维 `[2, 0]` | `(2, 3)` —— 两行堆起来 |
+| **任意形状**的整数张量，形状 `(b, s)` | `(b, s, 3)` |
+
+**形状规则**：
+
+$$\text{结果形状} = \text{索引张量的形状} \;+\; \text{源张量被索引维之后的剩余维}$$
+
+代入：源 `(vocab_size, d_model)`、索引 `(batch, seq)` ⇒ 结果 `(batch, seq, d_model)`，**正好是要的输出**。换成 `(batch,)` 或 `(batch, seq, k)` 规则一样成立 ⇒ **「支持任意批维」在这里是白送的**，不用像 Linear 那样写 `...`。
+
+**心智模型（最关键的一句）**：
+
+> **索引张量的"骨架"完全不变，只是每个格子从「装一个整数」变成「装一个长度 `d_model` 的向量」。**
+
+所以末尾必然多长出一维来装这个向量。映射到真实场景：`(2, 5)` 的 ID = 两个句子每句 5 个 token ⇒ `(2, 5, d_model)`，**句子结构一点没动，只是每个位置从「一个编号」变成「一个向量」**。
+
+**底层是一次 gather**（把索引摊平 → 逐个取行 → 按原形状 reshape）。两个后果：
+- **返回拷贝不是视图**（和基础切片 `weight[2:5]` 返回视图不同）⇒ 输出占 `batch×seq×d_model` 的新内存，§7 算显存时是实打实一项。
+- **同一个 ID 出现多次就复制多份**。
+
+**语法为什么这么短**：`[]` 调用 `__getitem__`，PyTorch 的实现里包含了 NumPy 那套高级索引规则。不是特殊语法，是对 `[]` 的重载。
+
+**边界条件**：索引张量必须是整数（`long`/`int`）或布尔，float 会报 `tensors used as indices must be long, int, byte or bool`｜正数越界抛 `IndexError`｜⚠️ **负数会静默回绕**（`-1` 取到最后一行），而 `nn.Embedding` 遇负索引是报错的——**这是本实现与 `nn.Embedding` 唯一的行为差异**。实际 ID 来自 tokenizer 不会为负，可加一条断言兜底。
+
+#### 3.6.2 为什么"选一行"是可微的（selection ≠ argmax）
+
+一个真实的困惑：**这不就是个 top-1 selection 吗，selection 不是不可微吗？**
+
+**关键区分：索引是「算出来的」还是「给定的」。**
+
+| | argmax / top-1 / 采样 | 这里的 gather |
+|---|---|---|
+| 索引从哪来 | **由连续值比较算出来** | **外部给定**（tokenizer 输出，就是数据） |
+| 对索引可微吗 | 需要但不可能 | **不需要**——索引上游没有任何参数 |
+| 对被索引张量可微吗 | 是 | **是** |
+
+「可微」必须问清楚**对谁**可微：
+- **对索引不可微**，也不需要——它是整数 token ID，是一条数据，下游没有东西要梯度。
+- **对 `weight` 可微，而且是线性的**：$y = \text{onehot}(i)^\top E$，$\text{onehot}(i)$ 是常量 ⇒ $y$ 是 $E$ 的线性函数（系数全 0/1）。
+
+⇒ **「取行」和「矩阵乘」在可微性上是同一件事**，只是跳过了乘 0。§3.7.1 写的「理论上等价于 one-hot × 矩阵」不只是直觉类比，**在反向传播这一层严格成立**。
+
+**反向是 scatter-add**（前向 gather 的转置）：按行号把梯度**累加**回去。「累加」是关键——`the` 在 batch 里出现 100 次，这 100 处的梯度全加到同一行 ⇒ 那一行单步收到的梯度量级远大于生僻词。
+⇒ **§3.7.2 那条「高频 token 更新多、学得充分」，机制就在这个累加上；§2.11.3 的 `SolidGoldMagikarp` glitch token 则是从没被 scatter-add 碰过、一直停在随机初始化。**
+
+**本模型里的三处 selection**：
+
+| 位置 | 索引来源 | 可微性 |
+|---|---|---|
+| Embedding 查表 | tokenizer 输出的 ID = **数据** | 对 weight 可微 ✅ |
+| §4.1 cross-entropy 取真值 token 的 logit | 标签 = **数据** | 对 logits 可微 ✅ |
+| §6 生成时采样下一个 token | **模型自己算出来的** | 不可微 ❌（但推理不需要反向） |
+
+> 这顺带解释了 **为什么 LM 训练用 teacher forcing**：下一个 token 的 ID 直接从数据拿（可微路径完整），而不是用模型上一步采样的（那样就断了）。真要在采样上求梯度得动用 Gumbel-softmax / straight-through / RL。
+
+#### 3.6.3 为什么 einops 写不了这一步
+
+`einops` 只有 `rearrange`/`reduce`/`repeat`/`einsum`（+`pack`/`unpack`），**没有 gather**。不是功能缺失，是**语义不匹配**：einsum 处理的是轴之间的**结构关系**（同名对齐、消去求和），而索引是**值参与寻址**——用一个张量里的整数值去决定取另一个张量的哪个位置，跳出了 einsum 记号的表达范围。
+
+- 硬用 einops 的唯一路子是 one-hot + einsum：为取一行先造 `(batch, seq, vocab_size)` 的 0/1 张量，vocab 32000 时中间量比输出大四个数量级。**别这么干。**
+- `einx` **可以**（有 `get_at`/`set_at` 这类向量化索引，用方括号标记被索引的轴）。但不建议：handout 脚注 4 自己说 einx 不够 battle-tested；且 `weight[x]` 是惯用法一眼可读。
+- **原则：einsum 记号的价值在「轴的对齐关系不显然」的地方。** 这里形状规则一句话说完，没有写错的余地，包一层反而是把简单事情复杂化。**真正的主场是 SDPA 和 MHA**（同时管 batch/head/seq/d_k 四个轴）。
+
+#### 3.6.4 x 从哪来：完整数据链路
+
+```
+原始文本  "Once upon a time"
+   ↓  §2.9 Tokenizer.encode
+token ID  [7, 892, 15, 331]
+   ↓  §2.10 落盘成 uint16 .npy（5.41 亿 ID 的一维数组）
+   ↓  §5.1 get_batch：np.memmap 随机采样，切出 (batch_size, context_length)
+x  形状 (batch, seq) 的整数张量
+   ↓  Embedding 查表
+(batch, seq, d_model)  →  Blocks  →  ln_final + lm_head  →  logits
+```
+
+- **训练时不现场调 tokenizer**，ID 在 §2.10 就一次性算完落盘了 ⇒ 印证 §2.12「tokenizer 速度和 LM 训练速度无关」。
+- **`weight` 的行数 = 训 BPE 时定的 `vocab_size`**（TinyStories 10000 / OWT 32000）⇒ §2.8「词表翻倍 ≠ 压缩率翻倍」的代价，一半体现在这张表的大小、另一半在 `lm_head`。
+- **模型不关心 ID 从哪来**（`test_embedding` 喂随机整数照样跑）⇒ 印证 §2.11.2「分词发生在模型之外」。
+- **ID 必须落在 `[0, vocab_size)`**，而 byte-level BPE 永不 OOV（§1.4）保证了这点——**两件事是配套的**，换个不匹配的 tokenizer 就可能喂出越界 ID。
+
+### 3.7 Embedding 的表示学习视角（讨论）
 
 > §2 tokenizer 和 §3 Transformer 之间的桥梁概念，讨论中梳理。
 
-### 3.1 token ID → 向量：embedding matrix 查表
+#### 3.7.1 token ID → 向量：embedding matrix 查表
+
+> 机制层面（索引规则、形状、可微性）见 §3.6；这里记的是**表示学习视角**。
+
 - Embedding matrix 形状 `(vocab_size, d_model)`：**行数=词表大小**（每个 ID 一行），**列数=d_model**（每行是该 token 的向量）。
 - **token ID 就是行号**：给 ID=256 → 取矩阵第 256 行的 `d_model` 维向量。本质是 **lookup（按行号取行）**，不是真矩阵乘法。
   - 理论上等价于 one-hot 向量 × 矩阵，但 one-hot 里绝大部分是 0，乘出来就是取那一行 → 直接取行快得多。
@@ -654,7 +913,7 @@ handout 拿 **The Pile**（825 GB，见 §0.2）当尺度参照物——不是�
 - **特殊 token 在这层无区别**：`<|endoftext|>`(如 ID 10000) 就是矩阵第 10000 行，和普通 token 一样是一个可学习向量。tokenizer 层它"特殊"（不被拆），embedding 层它就是普通一行。
 - 呼应：ID 空间是编号、可无限往上加；256 字节只占 ID 0–255，合并 token 从 256 起，特殊 token 再往后 → 词表没被"占满"。
 
-### 3.2 embedding matrix 如何训练
+#### 3.7.2 embedding matrix 如何训练
 - **它就是普通可学习参数**，没有特殊训练方式 = 整个模型怎么训练它就怎么训练。
 - 训练大循环（handout §5 要实现）：forward（ID→查行→Transformer→logits→loss）→ backward（求梯度）→ step（AdamW 更新）→ zero_grad。
 - **embedding 特有洞察**：一个 batch 只查了出现过的 token 的行 → 反向时**梯度只流回被用到的行**，没出现的 token 那一步梯度=0、不更新。
@@ -662,13 +921,13 @@ handout 拿 **The Pile**（825 GB，见 §0.2）当尺度参照物——不是�
   - **这解释了 §1.5**"中文稀疏→掌握不锐利"：中文 token 出现少 → embedding 行更新少 → 没训充分 → 采样易漂移。
 - **方向由 loss 驱动**：LM 的 loss 是预测下一词的 cross-entropy（§4 `run_cross_entropy`）。梯度告诉每个参数"往哪调能让正确词概率更高"。经海量更新，常出现在相似上下文的 token 向量被"推"到相近位置 → "猫≈狗""CJK 互为邻居"是 loss + 上下文**塑造**出来的，非人为设计。
 
-### 3.3 embedding 参与 pretraining（端到端）
+#### 3.7.3 embedding 参与 pretraining（端到端）
 - **参与，且从随机初始化一起练**。pretraining = 在海量文本上预测下一词、反复更新**所有参数**。
 - 全部可学习参数：embedding matrix + 各层 attn(q/k/v/o) + FFN(w1/w2/w3) + RMSNorm gain + LM head。**一起端到端训练**，没有谁先谁后。
 - LM head 也是 `(vocab_size, d_model)`，做反向的事（向量→各 token 的 logits）；有些模型让输入 embedding 和 LM head **共享矩阵**（weight tying）。
-- 对比"不参与训练"的情况帮理解：① 用冻结的预训练词向量（word2vec/GloVe，见 §3.4）；② 微调时 freeze embedding。CS336 做的是 **from scratch pretraining，embedding 跟着一起学**。
+- 对比"不参与训练"的情况帮理解：① 用冻结的预训练词向量（word2vec/GloVe，见 §3.7.4）；② 微调时 freeze embedding。CS336 做的是 **from scratch pretraining，embedding 跟着一起学**。
 
-### 3.4 历史：word2vec / GloVe（两阶段 → 端到端的演进）
+#### 3.7.4 历史：word2vec / GloVe（两阶段 → 端到端的演进）
 - **word2vec**（2013, Mikolov）：专门训词向量的独立模型，思想"上下文决定词义"。CBOW（上下文→中心词）/ Skip-gram（中心词→上下文）。
 - 著名性质：向量类比 `vec(king)-vec(man)+vec(woman)≈vec(queen)` → 向量空间编码语义关系。
 
@@ -683,4 +942,23 @@ handout 拿 **The Pile**（825 GB，见 §0.2）当尺度参照物——不是�
 
 ---
 
-## 4. 待续（§3 Transformer 实现时继续记）
+### 3.8 进度 & 下一步
+
+| 已完成 | 分 |
+|---|---|
+| `linear`（§3.5） | 1 |
+| `embedding`（§3.6） | 1 |
+
+**下一步：§3.4.1 RMSNorm**——第一次出现「upcast 到 fp32」的数值稳定性考虑。
+
+**§3 阶段性方法论**（从前两题提炼，后面九题继续用）：
+
+1. **命名先行**。模块树的属性名必须和参考 state dict 对齐（§3.3），这是零成本 → 高成本单调递增的决定，越晚改越贵。
+2. **让错误尽早、尽响地暴露**。用契约（签名给的维度）而不是数据（`weights.shape`）构造模块；保持 `strict=True`；device/dtype 在构造时对齐。**响的错误比哑的错误便宜一个数量级。**
+3. **测试覆盖不到的地方要自己兜**：初始化（§3.4）、device/dtype 一致性、数学不变量。这是 §2.9「绿灯 ≠ 证明」在 §3 的延续。
+4. **形状断言 > 打印**。断言让 bug 在产生处炸，而不是三层之后。
+5. **toy 尺寸手算**。抽象规则看不懂时，造个小到能手算的例子跑一遍（§3.6.1 那张 4×3 的表就是这么来的），比看十遍解释管用。
+
+---
+
+## 4. 待续（§4 Training 开始时继续记）
