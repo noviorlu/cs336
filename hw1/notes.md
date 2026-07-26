@@ -18,7 +18,6 @@
 
 **工作流程**：在 `cs336_basics/` 里从零写实现 → 在 `tests/adapters.py` 里把 `run_xxx` 接到自己的实现（只做胶水，无实质逻辑）→ `uv run pytest` 验证。
 
-**跑测试**：`uv run pytest`（不是 `uv run tests`——`tests` 是目录不是命令）。
 
 **Leaderboard（§7.5，6 分）**：在 OWT 上训模型、最小化 validation loss。规则只有两条——单次跑 **≤45 分钟 B200**、只能用课程给的 OWT 数据；其余随意。及格线是打败 loss 5.0 的朴素基线。提 PR 到 `stanford-cs336/assignment1-basics-leaderboard`。**排的是模型质量，不是 tokenizer 速度。**
 
@@ -36,7 +35,8 @@ b'caf\xc3\xa9'  ← bytes：0–255 的字节序列
 
 - **encode**：`str → bytes`（按 UTF-8 规则）；**decode**：反向。二者互逆。
 - 计算机底层只存字节（0–255），但字符有 15 万+ 个，所以需要编码规则做映射。
-- `len()` 忠实地数当前对象有几个元素：`len("café")=4`（字符），`len("café".encode())=5`（字节）。
+- `len()` 数的是当前对象的元素：`len("café")=4`（字符），`len("café".encode())=5`（字节）。
+- **坑**：`print(b'caf\xc3\xa9')` 仍显示 `b'...'`，不会解码成 `café`——bytes 没有"给人看"的形式，要显式 `.decode()`。
 
 ### 1.2 UTF-8 的变长机制
 
@@ -74,10 +74,6 @@ b'caf\xc3\xa9'  ← bytes：0–255 的字节序列
 | UTF-16 | 2 字节 | 变长 2 或 4 | 早期以为 2 字节(65536)够，图定长好算 | 遗留：Windows/Java/JS 内部字符串 |
 | UTF-32 | 4 字节 | **定长 4** | 想要真定长、装下所有码点 | 极少用，太浪费 |
 
-演化：ASCII(7 位) → Unicode 诞生时天真以为 2 字节够 → UTF-16 → 字符超 6 万（现 15 万+，上限 U+10FFFF）→ UTF-16 被迫用代理对变成变长、UTF-32 出来回归定长 → UTF-8（Ken Thompson, 1992）换思路后来居上。
-
-**顺带厘清 ASCII vs 字节容量**（常见混淆）：ASCII 只有 **128** 个字符（0–127，7 位够），因为当年只需覆盖英文；**256 是「一个字节」的容量**（8 位），是存储单位容量。ASCII 只用掉字节前一半，最高位恒为 0；128–255 历史上被各国拿去塞自己的字符（Latin-1、GBK 低区…）互不兼容，催生了 Unicode。
-
 实测 "hello"：utf-8 `[104,101,108,108,111]`（5 字节，无 0）；utf-16 每字符后跟 1 个 0（12 字节）；utf-32 跟 3 个 0（24 字节）。→ 这是 unicode2(a) 的核心证据。
 
 ### 1.4 byte-level BPE 的好处
@@ -87,25 +83,15 @@ b'caf\xc3\xa9'  ← bytes：0–255 的字节序列
 - 永远不会 OOV（任何字符拆到字节都逃不出 0–255）⇒ **不需要 `<unk>`**。
 - "某字符占几字节"的复杂度被 UTF-8 这步完全吸收，训练算法对此透明。
 
-### 1.5 repr vs str/print
-
-| | 面向 | 目标 | `chr(0)` |
-|---|---|---|---|
-| `repr()` / 交互式回显 | 调试 | 精确、无歧义 | `'\x00'`（可见转义） |
-| `str()` / `print()` | 用户 | 干净好看 | 空白（终端渲染不出控制字符） |
-
-- 容器（list/dict/tuple）的 `str` 会对**每个元素调用 `repr`** → `print(["a\nb"])` 显示 `['a\nb']`。
-- **坑**：`print(b'caf\xc3\xa9')` 仍显示 `b'...'`，不会解码成 `café`。bytes 没有"给人看"的 str 形式，要看字得显式 `.decode()`。
-
-### 1.6 延伸：LLM 中文说着变韩/日文 ≠ 字节接近
+### 1.5 延伸：LLM 中文说着变韩/日文 ≠ 字节接近
 
 - LLM 不在**字节层**预测，而是在 **token ID** 上预测。中文和日文 token 是词表里两个不同 ID，ID 相邻也无语义关系 → "字节接近导致混淆"不成立。
 - **真正原因**：① 训练数据 CJK 混杂 → **embedding 空间**里三者互为邻居；② 中文高质量数据稀疏，采样易漂移；③ 采样随机性；④ tokenizer 不匹配（中文被切碎）。
-- **直觉纠正**：不是字节接近，而是 **embedding 空间**里 CJK 向量互为邻居。字节只是最底层存储，模型不在那层"思考"。（与 §4.2 的"高频 token 学得充分"呼应）
+- **直觉纠正**：不是字节接近，而是 **embedding 空间**里 CJK 向量互为邻居。字节只是最底层存储，模型不在那层"思考"。（与 §3.2 的"高频 token 学得充分"呼应）
 
 ---
 
-### 1.7 书面题
+### 1.6 书面题
 
 #### Problem `unicode1` — Understanding Unicode (1 pt)
 
@@ -143,7 +129,7 @@ b'caf\xc3\xa9'  ← bytes：0–255 的字节序列
 
 ---
 
-## 3. BPE Tokenizer 训练（§2.4–2.5）
+## 2. BPE Tokenizer（handout §2.4–2.6）
 
 > 三步：**① Vocab init → ② Pre-tokenization → ③ Merge loop**。
 > 产出（`run_train_bpe` 返回值）：**vocab** `dict[int,bytes]`、**merges** `list[tuple[bytes,bytes]]`（按创建顺序）。
@@ -155,7 +141,7 @@ b'caf\xc3\xa9'  ← bytes：0–255 的字节序列
 > ③ 循环{数对(加权) → 选最高频(平局取字典序大) → 加vocab+记merges → 替换} → vocab + merges
 > ```
 
-### 3.1 Vocab init
+### 2.1 Vocab init
 
 初始词表 = 全部 256 字节值（ID 0–255）+ 特殊 token；之后每合并 1 次词表 +1。
 
@@ -169,13 +155,14 @@ $$\text{vocab\_size} = \underbrace{256}_{\text{初始字节}} + (\text{合并次
 | 合并出的 token（训练算出） | 是 |
 | 特殊 token（人为加入） | **否**（硬边界，不进 merge 统计，但占一个 ID） |
 
+> ⚠️ 造字节的两个坑：`bytes([i])`（**方括号**）才是造单字节，`bytes(65)` 是 65 个 `\x00`、`bytes('A')` 直接报错；把词转字节要用 `list(token.encode("utf-8"))`，**`[ord(c) for c in token]` 得到的是码点不是 UTF-8 字节**（非 ASCII 就错，见 §1.1）。
+
 **特殊 token**：作业里只用 `<|endoftext|>`。共同本质是「人为定义、**永不被拆开**、占固定 ID 但不参与 merge」。
 
-> ⚠️ **ID 不通用**，每个 tokenizer 自己分配：GPT-2 的 `<|endoftext|>`=50256（放**末尾**）、Llama 2 的 `<s>/</s>`=1/2（放**开头**）、Llama 3 的 `<|begin_of_text|>`=128000（放基础词表**之后**）。→ 印证"放开头/末尾"是设计选择。
->
-> **实现提示**：接口是 `list[str]`，**别写死"只有一个"**（`test_train_bpe_special_tokens` 测多个）。放开头还是结尾看 `tests/fixtures/train-bpe-reference-vocab.json` 的排法。
+> ⚠️ **ID 不通用**（GPT-2 放末尾、Llama 放开头），放哪是设计选择——看 `tests/fixtures/train-bpe-reference-vocab.json` 的排法定。
+> **实现提示**：接口是 `list[str]`，**别写死"只有一个"**（`test_train_bpe_special_tokens` 测多个）。
 
-### 3.2 Pre-tokenization
+### 2.2 Pre-tokenization
 
 **不合并，只准备"片段→次数"频率表。** 数据流（顺序重要）：
 ```
@@ -203,9 +190,18 @@ PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s
 - **选项⑤必须在⑥前**：`|` 从左到右优先，具体规则放前、兜底放后。
 - 例：`re.findall(PAT, "I'll pay $100 now!!")` → `['I', "'ll", ' pay', ' $', '100', ' now', '!!']`
 
-**演进**：GPT-2 正则范式至今仍是主流。GPT-4 的 `cl100k_base` 改了三处——**数字限 `\p{N}{1,3}`**（`12345`→`123`+`45`，算术更稳、词表不被撑爆）、缩写忽略大小写、换行处理更细。两个趋势：① 各家向 tiktoken 风格收敛（Llama 3、Mistral、Qwen 2.5、DeepSeek 都从 SentencePiece 倒戈，只剩 Gemma 还用 SP）；② 词表越做越大（5万→10万→20万，多语言覆盖，否则小语种被切碎）。**本作业的 GPT-2 正则 + byte-level BPE = 现在开源主流的基础骨架。**
+**预分词里修过的两个 bug —— 关键是 `pytest` 全绿也抓不到它们**：
 
-### 3.3 Merge loop 算法
+| bug | 触发条件 | 后果 | 修法 |
+|---|---|---|---|
+| `re.split("", chunk)` | `special_tokens=[]` | pattern 为空串 ⇒ **在每个字符之间都切一刀**，pre-token 全被打成单字符 | `re.split(pat, chunk) if pat else [chunk]` |
+| 分块硬编码 `b"<\|endoftext\|>"` | 特殊 token 不叫这个名字 | 找不到切点 ⇒ 边界全退化到 EOF ⇒ **32 进程变 1 个**，并行全失效（实测 `<\|sep\|>` 语料：修前 1 块 / 修后 32 块） | 用 `special_tokens[0].encode()`；无特殊 token 时单块 |
+
+第一条后来在 `encode` 里又以另一种形式出现（`special_split_pat` 为空时要置 `None`，见 §2.9）——**同一个空集合边界，两处都要防。**
+
+**演进**：这套正则至今是主流骨架。GPT-4 的 `cl100k_base` 最重要的改动是**数字限 `\p{N}{1,3}`**（`12345`→`123`+`45`，算术更稳、词表不被撑爆）。各家的分词算法对比见 §2.10.1。
+
+### 2.3 Merge loop 算法
 
 每轮 4 步，循环到词表满：
 1. **数所有相邻对（加权）**：遍历频率表，数每个 pre-token 内相邻对 × 该 pre-token 次数。
@@ -225,9 +221,9 @@ PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s
 
 **两个核心理解**：
 - loop 就是**反复修改同一张频率表**：扫表→选最高频→记录→就地合并→用改动后的表再来一遍。
-- **为什么必须串行**：第 2 轮的 `(e,st)` 是第 1 轮合并的**产物**，第 1 轮之前根本不存在 → 无法提前知道第 2 轮选谁。**这条依赖链无法打破**（并行的讨论见 §3.6）。
+- **为什么必须串行**：第 2 轮的 `(e,st)` 是第 1 轮合并的**产物**，第 1 轮之前根本不存在 → 无法提前知道第 2 轮选谁。**这条依赖链无法打破**（并行的讨论见 §2.6）。
 
-### 3.4 高效实现：四个结构 + 三项技术
+### 2.4 高效实现：四个结构 + 三项技术
 
 朴素实现每轮全量重数 pairs、重建所有词，是 $O(\text{轮数} \times \text{语料})$。当前实现靠四个持久结构协同做**增量维护**：
 
@@ -255,6 +251,9 @@ PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s
 - `delta==0` 的 pair 计数没变 ⇒ 堆里那条旧条目**依然有效** ⇒ 不用 push，不变量不破。
 - 验证 `A B A B` 合并 `(A,B)`：old=`{(A,B):2,(B,A):1}`, new=`{(X,X):1}` → 全对上。
 - **通用性**：这是「局部改动、大部分不变」类增量维护的通法。
+
+> **增量维护的记账纪律**（四条都是被 bug 逼出来的，静态查不出来）：
+> `if pair_counts[pair] <= 0: del` 清 0 计数对，否则会选到僵尸对 ｜ `affected` 必须 `list(...)` 拷贝，循环体里会改这个 set ｜ 用 `.discard()` 不用 `.remove()`，同词可能多次贡献同一 pair（`A B A B`）｜ 用 `pop(k, None)` 不用 `del`，key 可能已在减计数时被删过。
 
 **技术 2：懒删除堆（通用技巧，值得单独记）**
 
@@ -290,7 +289,7 @@ def pop_best(self, pair_counts):                # 和「真相源」核对
 > 哨兵必须是**正数**：`0` 会和 `neg_bytes(b'\x00')` 撞；`b"\xff"` 补码方案也撞（`\x00` 的补码就是 `\xff`）。
 > 穷举验证（含 `\x00`/`\xff` 的 1~3 字节串，66306 组比较）：naive 版 **936 组违反**反序，哨兵版 **0 违反**。
 
-### 3.5 优化记录（一张表）
+### 2.5 优化记录（一张表）
 
 | # | 改动 | 做了什么 | 测量场景 | 耗时 | 加速 |
 |---|---|---|---|---|---|
@@ -299,11 +298,11 @@ def pop_best(self, pair_counts):                # 和「真相源」核对
 | 2 | 增量更新 merge loop | 引入 `pair_counts` + `pair_to_words` 持久结构，只遍历含 best_pair 的词，不再全量重数 | pytest 全套 | **0.87s** | **18×** |
 | 3 | 懒删除堆 | `max()` 每轮全扫几万个 pair → `heapq` O(log n) 弹出 + stale 校验 | TS valid, vocab 10k | 14.3s → **1.46s** | **9.8×** |
 | 4 | `neg_bytes` 按 id 缓存 | id→bytes 只增不改，缓存永不失效，最多算 vocab_size 次 | 同上 | **0.89s** | 1.64× |
-| 5 | delta 更新 | 只动计数真正变化的 pair（见 §3.4 技术 1）；push 次数 4549→2274 | 同上 | **0.54s** | 1.66× |
+| 5 | delta 更新 | 只动计数真正变化的 pair（见 §2.4 技术 1）；push 次数 4549→2274 | 同上 | **0.54s** | 1.66× |
 | 6 | 堆定期重建 | 堆长 > `2×存活+1024` 时按当前 counts 重建，清 stale；峰值堆长 2505→1272 | 同上 | **0.42s** | 1.28× |
 | 7 | `findall` + `Counter.update` | 预分词计数从 Python 循环 `+= 1` 换成 C 里的 `_count_elements`；`PAT` 模块级预编译 | TS train 2.23GB | 12.58s → **7.55s** | 1.67× |
 | 8 | 分块数 = 进程数 × 4 | 文档长度不均导致 worker 空转（实测最慢 79.6ms vs 平均 58ms），多切块让快 worker 多领任务 | 同上 | **7.17s** | 1.05× |
-| 9 | `gc.disable()` | merge loop 期间关分代 GC（`try/finally` 恢复），见 §3.7 教训 1 | owt_valid, vocab 32k | 42.75s → **28.21s** | **1.52×** |
+| 9 | `gc.disable()` | merge loop 期间关分代 GC（`try/finally` 恢复），见 §2.7 教训 1 | owt_valid, vocab 32k | 42.75s → **28.21s** | **1.52×** |
 | 10 | 邻域增量 + per-word 计数常驻 | 一次走完序列就地记录 delta，不再重建两个整词 `Counter`；常驻的 per-word pair 计数用来判断成员关系 | 同上 | **19.93s** | **1.42×** |
 
 **目标语料确认**（owt_train 11.9GB + vocab 32000）：merge **544.95s → 236.54s = 2.30×**，端到端 585.8s → 278.1s。
@@ -313,7 +312,7 @@ def pop_best(self, pair_counts):                # 和「真相源」核对
 > - 即基线代码状态 = #1–#8 已应用，优化后 = #1–#10。
 > - 旁证：同样这两条在迭代语料 owt_valid 上是 42.75 → 28.21 → 19.93 = **2.15×**，与 2.30× 对得上（**兑现率 107%**）。
 >
-> 各阶段的加速倍数不能直接相乘——每条都是在**当时的代码状态**上测的，而且前面的优化会削弱后面的收益（见 §3.7 教训 4）。
+> 各阶段的加速倍数不能直接相乘——每条都是在**当时的代码状态**上测的，而且前面的优化会削弱后面的收益（见 §2.7 教训 4）。
 
 **被否决的尝试**（同样测了、同样对拍通过，但不采纳）：
 
@@ -325,40 +324,29 @@ def pop_best(self, pair_counts):                # 和「真相源」核对
 | rebuild 阈值收紧到 `1.25×` | 22.63s（−13%） | 重建太频繁，每次 O(存活) |
 | rebuild 阈值 `3×`（扫出的最优） | 19.57s（+1.8%） | 低于 5% 采纳阈值；曲线在 2~4× 间很平，现值已在最优区间 |
 
-### 3.6 并行性分析（结论随规模翻转）
+### 2.6 并行性分析（结论随规模翻转）
 
 | 阶段 | 能并行 | 说明 |
 |---|---|---|
-| Pre-tokenization | ✅ 数据并行 | `multiprocessing` 绕开 GIL，按 special token 切块，只汇总 1 次。**价值全在这**——它随数据量线性增长 |
-| Merge loop | ⚠️ **看规模** | 见下 |
-| GPU | ❌ 基本无用 | 符号处理（查字典/找 max/替换）不适合稠密数值并行 |
-| 线程 | ❌ 一律排除 | CPython 3.12 有 GIL，循环体是 100% Python 字节码操作 dict/tuple |
+| Pre-tokenization | ✅ 数据并行 | `multiprocessing` 绕开 GIL，按 special token 切块。**价值全在这**——它随数据量线性增长 |
+| Merge loop | ⚠️ **看规模** | 每轮要「全局决策 + 依赖上轮结果」，只能在**一轮之内**并行（把 affected 的词分给多个 worker） |
+| GPU / 线程 | ❌ | GPU：符号处理不适合稠密数值并行。线程：CPython 3.12 有 GIL，循环体是 100% Python 字节码 |
 
-merge loop 每轮要「全局决策 + 依赖上轮结果」，所以只能在**一轮之内**并行（把 affected 的词分给多个 worker）。**能否划算完全取决于每轮的粒度**：
+**划不划算完全取决于每轮粒度**（对照：派发 32 个空任务 ≈ 300µs）：
 
-| 规模 | unique pre-token | 每轮 word 循环（中位数） | vs 派发 32 个空任务（进程 300µs） | 结论 |
-|---|---|---|---|---|
-| TinyStories valid + vocab 10k | 6 万 | **3.5 µs** | 开销贵 85 倍 | **绝无可能** |
-| owt_train + vocab 32k | **660 万** | 0.3 ms（均值 20.5ms） | 开销占 1.5% | **值得算** |
+| 规模 | unique pre-token | 每轮 word 循环（中位数） | 结论 |
+|---|---|---|---|
+| TinyStories valid + vocab 10k | 6 万 | **3.5 µs** — 开销贵 85 倍 | **绝无可能** |
+| owt_train + vocab 32k | **660 万** | 0.3 ms（均值 20.5ms）— 开销占 1.5% | **值得算** |
 
-**正确的形状是永久分片，不是并行 `for word_idx in affected`**：后者每轮都要把 `ids[wi]` pickle 进 worker、结果 pickle 回来（实测一轮最多搬 714 万个 id），搬运量正比于工作量。永久分片则是——worker k 常驻持有 `words[k::N]` 及自己那份局部 `pair_to_words`，父进程每轮只广播 `(id_a, id_b, new_id)`（几十字节），worker 返回局部 delta 字典，父进程归并后更新 `pair_counts` + heap。
+**正确形状是永久分片**：worker k 常驻持有 `words[k::N]` 和自己那份局部 `pair_to_words`，父进程每轮只广播 `(id_a, id_b, new_id)`（几十字节），worker 回传局部 delta。而不是每轮把 `ids[wi]` pickle 进 worker——实测一轮最多要搬 **714 万个 id**，搬运量正比于工作量。
 
-**当前代码的 Amdahl 上限**（优化后重测）：
+**但上限只有 2.82×**（优化后重测：worker 侧 67% / parent 侧 `pair_counts`+heap **28%** ← 硬地板 / `pop_best` 5%）。优化前是 3.92×——**#10 砍掉的正是可并行的那部分，上限跟着掉**。要破 28% 的地板得连堆也分片，复杂度和 tie-break 风险都上一档。
 
-| 环节 | 占比 |
-|---|---|
-| worker 侧（可分片并行） | 67% |
-| parent 侧（`pair_counts` + heap push） | 28% ← **硬地板** |
-| `pop_best` | 5% |
+**通信开销固定 ≈ 9.5s**（31743 轮 × 一次 round-trip）：owt_valid（loop 才 20.8s）净收益仅 1.2× **不值得**；owt_train（loop 236.5s、轮数相同）只占 4% ⇒ 约 2.5×。
+⇒ **同一份并行代码在两个语料上一个赚一个赔。轮数固定而每轮工作量随语料涨，是并行在这里能成立的唯一原因。**
 
-⇒ 完美 32× 并行的上限只有 **2.82×**（优化前是 3.92×——**O1 砍掉的正是可并行的那部分，上限跟着掉**）。要突破 28% 的地板得连堆也分片（worker 维护局部 top-k、父进程归并候选），复杂度和 tie-break 正确性风险都上一档。
-
-**通信开销是固定的、与语料无关**：31743 轮 × 一次 round-trip(~300µs) ≈ **9.5s**。
-- owt_valid（loop 才 20.8s）：净收益约 1.2×，**不值得**。
-- owt_train（loop 236.5s，轮数相同）：9.5s 只占 4% ⇒ 估算 → ~95s，约 2.5×。
-- ⇒ **同一份并行代码在两个语料上一个赚一个赔。轮数固定而每轮工作量随语料涨，是并行在这里能成立的唯一原因。**
-
-### 3.7 优化方法论（五条教训）
+### 2.7 优化方法论（五条教训）
 
 **流程**（每条优化都走一遍，不跳步）：定基线（3 次中位数 + 存下 merges 作正确性基准）→ profile 找热点 → **一次只改一条** → 对拍 merges 逐条相同（不同就直接回滚，不 debug 性能）→ 测时 → 记账 → 收益 <5% 就回滚 → 全做完在**目标语料**确认。
 
@@ -381,13 +369,7 @@ merge loop 每轮要「全局决策 + 依赖上轮结果」，所以只能在**�
 **5. 微基准和整体跑可能给出相反的结论。**
 第 10 条的微基准是**每词快 3.5×**，整体却慢 27%——差异全在 GC 这种全局效应上。**微基准只能解释局部，不能拍板。**
 
-**profile 怎么做**：
-```python
-import cProfile, pstats
-cProfile.run('train_bpe(...)', 'prof')
-pstats.Stats('prof').sort_stats('tottime').print_stats(20)
-```
-看 **tottime**（函数自身耗时，找瓶颈看它）、**cumtime**（含子调用）、**ncalls**（几百万次=热点）。命令行版 `python -m cProfile -s cumtime`；可视化 `snakeviz`。
+**profile**：`cProfile.run(..., 'prof')` + `pstats.Stats('prof').sort_stats('tottime')`。看 **tottime**（函数自身耗时，找瓶颈看它）和 **ncalls**（几百万次=热点）。
 实战：profile 直接指出 `max` 7.3s + `rank` 6.6s（被调 **1 亿次**）= 几乎全部时间 → 指向"用堆替代每轮全扫"；后来又指出 667 万次 `Counter` 构造 → 指向邻域增量。**先 profile 再优化，别猜。**
 
 **怎么验证优化没改坏结果**（计数漂移这类 bug 静态看不出来，唯一可靠办法是对拍）：
@@ -395,34 +377,7 @@ pstats.Stats('prof').sort_stats('tottime').print_stats(20)
 2. **不变量断言**：每步 merge 后从 `vocab_ids` 从零重算真值，校验 `pair_counts` 没漂移、`pair_to_words` 与真值相等、**每个存活 pair 都有一条携带当前 count 的堆条目**（这条是懒删除正确性的命根子）。
 3. **官方测试** `pytest tests/test_train_bpe.py`。
 
-### 3.8 踩过的坑
-
-*A. 计数不同步类（增量更新）*
-- **`i`/`j` 变量冲突**：外层词下标用 `j`、内层扫描用 `i`，一开始都用 `i` → 内层 `i=0` 覆盖外层下标 → 写错位置。**内外循环变量必须不同名。**
-- **`ord(c)` vs `encode`**：`[ord(c) for c in token]` 是**码点**不是 UTF-8 字节！byte-level 必须 `list(token.encode("utf-8"))`。
-- **减/加必须严格对称**：任何不对称 → 计数漂移 → tie-break 选错 → 测试挂。合并 `A B` 会连带改变 `(前,A)→(前,X)`、`(B,后)→(X,后)`，不只是 `(A,B)` 消失。
-- **清理 0 计数对**：`if pair_counts[pair] <= 0: del`，否则会选到 count=0 的僵尸对。
-- **`affected` 必须拷贝**：`list(pair_to_words[best_pair])`，循环体里会改这个 set。
-- **`.discard()` 不用 `.remove()`**：同词可能多次贡献同一 pair（`A B A B`）。
-- **`pop(k, None)` 不用 `del`**：可能已在减计数时删过。
-
-*B. 一般实现类*
-- **tie-break 不能比 ID 数值**！必须 `(count, (vocab[id_a], vocab[id_b]))` 转回 bytes 比字典序。
-- **merges 存 bytes 对** `(vocab[id_a], vocab[id_b])`，不是 id 对。
-- 替换用「扫描重建新 list」（`i+2`/`i+1`），非原地 pop（避下标错位）；`new_id = len(vocab)` 别用 `len-1`。
-- 特殊 token 最后加，终止条件留余量 `vocab_size - len(special_tokens)`。
-- `bytes([i])`（方括号！）造单字节；`bytes(65)` 是 65 个 0，`bytes('A')` 报错。
-- `if __name__ == "__main__":` 包住底部测试调用，避免 import 时乱跑十几秒。
-- 「跳过不含该 pair 的词」的 `continue` 必须放在重建循环**前**，放后面等于白重建。
-
-*C. 修过的两个正确性 bug*
-
-| bug | 触发条件 | 后果 | 修法 |
-|---|---|---|---|
-| `re.split("", chunk)` | `special_tokens=[]` | pattern 为空串，**在每个字符之间都切一刀**，pre-token 全被打成单字符 | `re.split(pat, chunk) if pat else [chunk]` |
-| 分块硬编码 `b"<\|endoftext\|>"` | 特殊 token 不叫这个名字 | 找不到切点 → 边界全退化到 EOF → **32 进程变 1 个**，并行全失效（实测 `<\|sep\|>` 语料：修前 1 块 / 修后 32 块） | 用 `special_tokens[0].encode()`；无特殊 token 时单块 |
-
-### 3.9 训练产物：两个 tokenizer（2026-07-25）
+### 2.8 训练产物：两个 tokenizer（2026-07-25）
 
 跑法：`python cs336_basics/main_bpe_train.py [tinystories|owt]`，产物落在 `data/<name>_{vocab,merges}.json`。
 
@@ -444,12 +399,12 @@ pstats.Stats('prof').sort_stats('tottime').print_stats(20)
 
 **读数**：owt 的 4.363 比 TinyStories 的 4.071 高 7%——词表大 3.2 倍只换来这点压缩率。原因有两层：① 边际收益递减，BPE 先合并的都是最高频模式，后面 2.2 万个格子吃的是长尾；② owt 的长尾里有相当比例是乱码和分隔线（见下），这些 token 覆盖的文本占比极低，对整体压缩率几乎没贡献。**词表翻倍 ≠ 压缩率翻倍**，这是 leaderboard 上选 vocab_size 时要记住的。
 
-> ⚠️ 这个 compression ratio 是**训练语料全量**的，不是 §2.7(a) 要交的那个（那个是各采样 10 篇文档，且 (b) 还要交叉编码），也不含被 split 掉的 `<|endoftext|>` 分隔符字节。
+> ⚠️ 这个 compression ratio 是**训练语料全量**的，不是 handout §2.7(a) 要交的那个（那个是各采样 10 篇文档，且 (b) 还要交叉编码），也不含被 split 掉的 `<|endoftext|>` 分隔符字节。
 > **但它是 `encode` 的现成验收标准**：写完 `encode` 后在训练语料上跑，bytes/token 应该和这个数很接近，对不上就是 `encode` 有 bug。免费的对拍手段，不用另写 brute force。
 
 **它为什么是免费的**：`_merge_loop` 结束时，`word_ids[i]` 是 pre-token i 依次施加 merge 1..N 之后的序列——而 `Tokenizer.encode` 的 Step 2 做的也是依次施加 merge 1..N。**训练结束时整个语料已经被编码过一遍了**，只需在建索引时额外记下每词的原始字节数（`word_nbytes`，一个 int）。注意要用 `count` 加权：频率表里 `the` 只存一份但语料里出现上百万次。
 
-#### §2.5 的「最长 token 合理吗」——答案是不合理
+#### handout §2.5 的「最长 token 合理吗」——答案是不合理
 
 owt 最长的 10 个 token **一个真词都没有**：
 
@@ -468,23 +423,135 @@ owt 最长的 10 个 token **一个真词都没有**：
 **结论**：
 - TinyStories 最长 token **合理**——GPT-4 生成的干净儿童故事，最长 token 自然是最长的常用词。
 - OWT 最长 token **不合理**——它反映的是网页语料的编码损坏和排版分隔线，不是语言结构。**算法没错，是数据脏**：这些字节序列确实高频，BPE 忠实地学了。
-- 这就是 §2.5(b)「对比两个 tokenizer」的答案：干净合成语料 vs 脏爬取语料。延伸问题——**词表里有多少格子被垃圾占掉了？**这直接吃掉 compression ratio 和 leaderboard 的 token 预算。真实管线会先做数据清洗（去重、编码修复、过滤），正是后面 data 那个 assignment 的主题。
+- 这就是 handout §2.5(b)「对比两个 tokenizer」的答案：干净合成语料 vs 脏爬取语料。延伸问题——**词表里有多少格子被垃圾占掉了？**这直接吃掉 compression ratio 和 leaderboard 的 token 预算。真实管线会先做数据清洗（去重、编码修复、过滤），正是后面 data 那个 assignment 的主题。
 
-### 3.10 下一步
+### 2.9 Tokenizer：encode / decode（handout §2.6）✅ 15 分
 
-- **性能已经够用**：tokenizer **只训练一次**，owt 全量 5 分钟跑完就存盘。继续优化 merge loop 对完成作业的边际价值接近零。
-- **真正该优化的是 `Tokenizer.encode`**（§2.6）：§2.7(c) 专门让你估吞吐并推算「tokenize 825GB 的 Pile 要多久」，(d) 要把 OWT train/valid **全部编码落盘成 uint16 数组**——这才是你会实际等的时间，而且是纯数据并行（文档间独立），比 merge loop 友好得多。
-- **注意**：BPE 训练的速度对 **LM 训练速度零影响**——训练时读的是已落盘的 `np.memmap` 数组，tokenizer 不在那个循环里。影响训练的是 tokenizer 的**输出**：`vocab_size`（决定 embedding/LM head 参数量和 softmax 开销）和 **compression ratio**（bytes/token，决定同样 token 预算下模型看到多少文本——对 45 分钟的 leaderboard 是实打实的杠杆）。而所有优化都严格保持了 merges 逐条相同，**没改变输出，也就没影响训练**。
-- **Rust + PyO3**（handout 认可 `cppyy`/`nanobind`/PyO3）：性能边际价值不大，但学习价值高——算法已调对可原样搬、接口窄、有现成对拍工具，且后续 assignment（Triton kernel、数据管线）会一直用得上。
-- **数据探查用命令行**（比写 Python 快）：`grep -c/-oF`、`wc -l/-c`、`stat -c %s`。实测 TinyStories valid 有 **27630** 个 `<|endoftext|>`、22.5MB；train 2.23GB → 倒推 ~**2.73M** 文档（对得上 handout 的 2.12M 量级）；平均 ~816 字节/文档。
+`pytest tests/test_tokenizer.py` → **24 passed, 1 xfailed**（xfail 是测试自己标的：`encode` 不要求省内存）。
+
+**`__init__` 建四张表**——传进来的 `vocab`/`merges` 都答不了 encode 要问的问题：
+
+| 表 | 类型 | 为什么 |
+|---|---|---|
+| `inverse_vocab` | `dict[bytes, int]` | `vocab` 方向反了；合并操作 bytes，输出要 ID |
+| `merge_rank` | `dict[pair, int]` | list 查"排第几"是 O(n)；rank = 在 `merges` 里的下标 |
+| `cached_word_ids` | `dict[str, list[int]]` | pre-token 记忆化。key 用 `str`，命中时省一次 `.encode()` |
+| `special_split_pat` | 编译的正则 | 依赖 `self.special_tokens`，不能放模块级 |
+
+坑：special token 要追加进 vocab，且**必须同步更新 `inverse_vocab`**；`special_tokens` 参数即使 vocab 全有也得传——`vocab` 只是 `id→bytes`，**没标记谁是特殊的**。
+
+**`encode` 三段**：① `special_split_pat` 切开并保留 → special 直接查表；② 普通段过 `PAT`；③ 每个 pre-token 单独合并。
+
+> ⚠️ ① 必须独立，**不能把 special 塞进 `PAT` 当 `or` 分支**（tiktoken 裁判实测）：
+> `'x <|endoftext|> y'` 合进 PAT 得 `['x', ' <|', 'endoftext', '|>', ' y']` —— special token 被切碎。
+> 因为交替是逐位置试：扫到 `<` 前的**空格**时 special 分支不匹配，` ?[^\s\p{L}\p{N}]+` 贪心吃掉 `' <|'`。**`or` 救不了。**
+> `special_split_pat` 三要点：`re.escape` + 外层捕获组（`re.split` 才保留分隔符）+ **按长度降序**（交替是从左到右优先，不是最长匹配）。
+
+**`_merge_pretoken`**：拆成单字节 → 循环{挑 `merge_rank` 最小的相邻对，合并其所有出现} → 挑不到退出。
+- 与"从头遍历所有 merge"**等价**（实测 277 个 pre-token 零差异），但**快 119 倍**。等价依据：训练时 `new_id = len(vocab)` ⇒ 用到 `X` 的 merge，rank 必大于造出 `X` 的那条；而合并后新冒出的对只可能含 `X` ⇒ 都在前方。
+- 成本：遍历法固定 5 万次，挑最小法 ≤ 词长−1 ≈ **3 次**（加权平均 pre-token 4.22 字节）。
+- **不要用堆**：候选只 ~3 个且每轮只取一次最小值，实测 `min()` 在 3~2000 各规模都比 `heapify+pop` 快 2 倍多。对照训练那边堆赢 9.8×——**同一优化规模不同结论相反**，见 §2.7 教训 1。
+
+**`encode_iterable` 三条不变量**（5MB 文件 / 1MB 内存，且须与整体 `encode` 逐 token 相同）：
+
+| # | 危险 | 守法 |
+|---|---|---|
+| 1 | special token 横跨切点，`split` 只看到半截 | 结算上限 `limit = len(buf) − (S−1)`（S=最长 special 长度）；若仍落在某个 special 匹配内部，**再退到它的 `start()`** |
+| 2 | 最后一个 PAT 匹配可能还没吃完，`\s+(?!\S)` 要看后一字符 | **扣住最后一个匹配**。只扣最后一个文本段——被 special 夹住的段是硬边界 |
+| 3 | ⚠️ **吐已算好的 token，不能拿结算前缀重跑 PAT** | 最短反例 `'\n\n!!'`：整体 `['\n','\n','!!']`，但 `findall('\n\n')` 单独跑时前瞻在 EOS 成功 → `['\n\n']`。**我在这栽了两次** |
+
+实现上用 `itertools.chain(iterable, [None])` 加哨兵、延迟一拍，才知道当前块是不是最后一块。
+「只在遇到 special token 时才结算」不行：roundtrip 测试**没传 special_tokens**，没有刷新点，缓冲区会涨满整个文件。
+已知局限：一个巨大的连续空白串整个是一个匹配，会全堆在 `buf` 里。
+
+**`decode`**：`b"".join(...).decode("utf-8", errors="replace")`。**先拼接再一次性解码**——merge 可能落在多字节字符中间，逐 token 解会各自失败变成两个 `�`。
+
+**验证**：官方测试（含一批 `matches_tiktoken`）+ 自建对拍器（1011 刁钻用例 × 3 种 special 配置 × 5 种切法，含 chunk=1 和逐行）。**三条不变量是被反例逐个逼出来的**，每错一次就往语料里加一个。
+
+### 2.10 分词的代价 & 去 tokenizer 化（延伸）
+
+> 背景与延伸，和 §2 的实现无关。后续读「替换/去掉 tokenizer」方向的论文，笔记记在 §3.4。
+
+#### 2.10.1 三种主流分词算法
+
+| | **BPE** | **WordPiece** | **Unigram LM** |
+|---|---|---|---|
+| 代表 | GPT 系、Llama 3、Qwen | BERT | SentencePiece：Llama 1/2、Gemma |
+| 训练时选谁 | 频率最高的对 `count(AB)` | 似然提升最大，实践上 ≈ `count(AB)/(count(A)·count(B))` | 反向：从大词表剪枝，去掉损失最小的 piece |
+| **推理怎么切** | **重放 merge 序列**（有序） | **词表内最长前缀匹配**（trie） | **Viterbi 求全局最可能切分** |
+| 交付物 | vocab + **merges** | **只要 vocab** | vocab + 每个 piece 的 score |
+| 贪心？ | 是 | 是 | 否，全局最优 |
+| OOV | byte-level 下不存在 | 需要 `[UNK]` | 需要回退 |
+
+**为什么 WordPiece 能贪心而 BPE 不能**：两者把「编码」定义成了不同的东西——
+- BPE：「**复现训练时发生过的那串操作**」⇒ 必然依赖顺序，必然要带着 merges 走。
+- WordPiece：「**在词表里取最长**」⇒ 只依赖词表这个集合，与训练怎么得到它无关。
+
+这是设计取舍，不是谁更聪明。BERT 的具体做法：按空白/标点切词 → 每个词取词表里最长前缀 → 剩余部分加 `##` 前缀继续 → 匹配不上就 `[UNK]`。
+
+> ⚠️ **所以不能把 BPE 的 `encode` 改写成 trie 贪心**。反例：merges 只有 `rank0:(b,c)→bc`、`rank1:(a,b)→ab`，编码 `"abc"`——BPE 挑 rank 最小的 `(b,c)` 得 `[a, bc]`，trie 最长前缀得 `[ab, c]`。**结果不同。** 不是那个算法不好，是它和你训出来的这套 merges 不配套（见 §3.3 末条）。
+
+#### 2.10.2 分词不是 Transformer 的缺陷，但有一条真实因果链
+
+**分词发生在模型之外**：Transformer 拿到的就是一串整数 ID，不知道也不关心它怎么来的。换成 RNN / LSTM / Mamba，问题一模一样。所以这不是 Transformer 架构的缺陷。
+
+但有一条因果链值得记住：
+
+> attention 是 **O(n²)**，embedding 和最后的 softmax 是 **O(vocab)** ⇒ 分词是一道**压缩工序**，把序列长度压下来好让 O(n²) 付得起。
+
+**它本身不产生任何语义价值。** 如果 attention 免费，直接喂字节即可——这正是 §3.4 那批工作的出发点。
+
+#### 2.10.3 分词制造的真问题
+
+| 问题 | 表现 |
+|---|---|
+| **算术差** | `12345` 的切法不稳定，学不到位值关系。GPT-4 的 `\p{N}{1,3}`（见 §2.2）就是为此打的补丁 |
+| **字符级失明** | 「strawberry 里有几个 r」——模型没见过字符，只见过几个 token ID |
+| **多语言不公平** | 小语种被切得稀碎，同一句话花几倍 token，又贵又差 |
+| **提示词边界效应** | 末尾多一个空格就换一套 token，行为跟着变（前导空格吸附，见 §2.2） |
+| **glitch token** | `SolidGoldMagikarp` 那类：在词表里但训练语料几乎没出现 ⇒ embedding 行从没被更新过 ⇒ 模型碰到就发疯（对应 §3.2「梯度只流回被用到的行」） |
+| **词表格子被垃圾占** | owt 词表里最长的 10 个 token 全是乱码和分隔线（见 §2.8）；词表翻倍 ≠ 压缩率翻倍 |
+
+**最要命的一条不是"问题"而是"约束"**：**encode 必须和训练时完全一致**。模型学的是「ID 47 后面常跟 ID 892」这种统计；训练用 BPE 的 rank 顺序切、推理改用贪心切，同一句话会变成一串不同的 ID，分布一偏模型立刻退化。这就是 `test_tokenizer.py` 里一堆 `test_*_matches_tiktoken` 要求逐 token 对上的原因——**tokenizer 不是"差不多就行"的组件，它是模型的一部分**。
+
+#### 2.10.4 去 tokenizer 化的尝试（论文笔记待补）
+
+思路都是「把压缩这一步交给模型自己学，而不是外挂一个固定词表」。SSM / 线性注意力让长序列变便宜之后，这条路更有希望。
+
+| 工作 | 一句话 | 笔记 |
+|---|---|---|
+| **CANINE**（2021, Google） | 字符级编码器，下采样后再进 Transformer | 待补 |
+| **ByT5**（2021, Google） | 直接吃 UTF-8 字节的 T5，无词表 | 待补 |
+| **Charformer**（2021） | 学习式的子词切分（GBST），端到端可微 | 待补 |
+| **MegaByte**（2023, Meta） | 固定大小 patch + 局部/全局两级 Transformer，让字节级序列可扩展 | 待补 |
+| **Byte Latent Transformer**（2024, Meta） | 按**熵**动态划分 patch——信息量大的地方切细，平淡处切粗 | 待补 |
+
+要盯的共同问题：① 序列变长后算力怎么摊（这是分词存在的唯一理由）；② 去掉词表后，前面那张表里的问题解决了几条、又新增了什么；③ 和固定词表相比，同算力下的实际质量。
+
+### 2.11 进度 & 下一步
+
+| handout | 分数 | 状态 |
+|---|---|---|
+| §2.4–2.5 `train_bpe` | 15 | ✅ 3/3（§2.5、§2.9） |
+| §2.6 `Tokenizer` | 15 | ✅ 24 passed, 1 xfailed（§2.10） |
+| **§2.7 实验** | **4** | ⏭ (a) 各采样 10 篇报 bytes/token；(b) 用 TinyStories tokenizer 编码 OWT 样本对比；(c) 估吞吐、推算 Pile 825GB；**(d) train/valid 全部编码落盘成 uint16** |
+
+(d) 是重活，也是**整个作业往下走的前置依赖**——它的产物就是 §5 训练时 `np.memmap` 读的数组。建议顺序：(c) 量吞吐 → 据此估 (d) 要多久、决定要不要并行 → 顺手做 (a)(b)（和 (c) 共用采样编码的代码）→ 最后跑 (d)。
+
+**记住 tokenizer 速度和 LM 训练速度无关**：训练读的是已落盘的 memmap 数组，tokenizer 不在那个循环里。影响训练的是它的**输出**——`vocab_size`（决定 embedding/LM head 参数量和 softmax 开销）和 **compression ratio**（决定同样 token 预算下模型看到多少文本，对 45 分钟的 leaderboard 是实打实的杠杆）。所有优化都保持了 merges 逐条相同 ⇒ 没改变输出 ⇒ 没影响训练。
+
+**Rust + PyO3**（handout 认可 `cppyy`/`nanobind`/PyO3）：性能边际价值已经不大（训练 5 分钟一次性），但学习价值高——算法已调对可原样搬、接口窄、有现成对拍工具，后续 assignment（Triton kernel、数据管线）一直用得上。
+
+**数据探查用命令行**（比写 Python 快）：`grep -c/-oF`、`wc -l/-c`、`stat -c %s`。实测 TinyStories valid 有 **27630** 个 `<|endoftext|>`、22.5MB；train 2.23GB → 倒推 ~**2.73M** 文档；平均 ~816 字节/文档。
+
 
 ---
 
-## 4. Embedding & 表示学习（讨论）
+## 3. Embedding & 表示学习（讨论）
 
 > §2 tokenizer 和 §3 Transformer 之间的桥梁概念，讨论中梳理。
 
-### 4.1 token ID → 向量：embedding matrix 查表
+### 3.1 token ID → 向量：embedding matrix 查表
 - Embedding matrix 形状 `(vocab_size, d_model)`：**行数=词表大小**（每个 ID 一行），**列数=d_model**（每行是该 token 的向量）。
 - **token ID 就是行号**：给 ID=256 → 取矩阵第 256 行的 `d_model` 维向量。本质是 **lookup（按行号取行）**，不是真矩阵乘法。
   - 理论上等价于 one-hot 向量 × 矩阵，但 one-hot 里绝大部分是 0，乘出来就是取那一行 → 直接取行快得多。
@@ -492,22 +559,21 @@ owt 最长的 10 个 token **一个真词都没有**：
 - **特殊 token 在这层无区别**：`<|endoftext|>`(如 ID 10000) 就是矩阵第 10000 行，和普通 token 一样是一个可学习向量。tokenizer 层它"特殊"（不被拆），embedding 层它就是普通一行。
 - 呼应：ID 空间是编号、可无限往上加；256 字节只占 ID 0–255，合并 token 从 256 起，特殊 token 再往后 → 词表没被"占满"。
 
-### 4.2 embedding matrix 如何训练
+### 3.2 embedding matrix 如何训练
 - **它就是普通可学习参数**，没有特殊训练方式 = 整个模型怎么训练它就怎么训练。
 - 训练大循环（§5 要实现）：forward（ID→查行→Transformer→logits→loss）→ backward（求梯度）→ step（AdamW 更新）→ zero_grad。
 - **embedding 特有洞察**：一个 batch 只查了出现过的 token 的行 → 反向时**梯度只流回被用到的行**，没出现的 token 那一步梯度=0、不更新。
   - ⟹ 高频 token 更新多、学得充分；低频/生僻 token 更新少、学得差。
-  - **这解释了 §1.9**"中文稀疏→掌握不锐利"：中文 token 出现少 → embedding 行更新少 → 没训充分 → 采样易漂移。
+  - **这解释了 §1.5**"中文稀疏→掌握不锐利"：中文 token 出现少 → embedding 行更新少 → 没训充分 → 采样易漂移。
 - **方向由 loss 驱动**：LM 的 loss 是预测下一词的 cross-entropy（§4 `run_cross_entropy`）。梯度告诉每个参数"往哪调能让正确词概率更高"。经海量更新，常出现在相似上下文的 token 向量被"推"到相近位置 → "猫≈狗""CJK 互为邻居"是 loss + 上下文**塑造**出来的，非人为设计。
 
-### 4.3 embedding 参与 pretraining（端到端）
+### 3.3 embedding 参与 pretraining（端到端）
 - **参与，且从随机初始化一起练**。pretraining = 在海量文本上预测下一词、反复更新**所有参数**。
 - 全部可学习参数：embedding matrix + 各层 attn(q/k/v/o) + FFN(w1/w2/w3) + RMSNorm gain + LM head。**一起端到端训练**，没有谁先谁后。
 - LM head 也是 `(vocab_size, d_model)`，做反向的事（向量→各 token 的 logits）；有些模型让输入 embedding 和 LM head **共享矩阵**（weight tying）。
-- 对比"不参与训练"的情况帮理解：① 用冻结的预训练词向量（word2vec/GloVe，见 §4.4）；② 微调时 freeze embedding。CS336 做的是 **from scratch pretraining，embedding 跟着一起学**。
-- 术语：**Pretraining**=大规模自监督从零训整个模型（assignment 1 在 TinyStories/OWT 上做的）；**Fine-tuning**=之后小数据针对性再调。
+- 对比"不参与训练"的情况帮理解：① 用冻结的预训练词向量（word2vec/GloVe，见 §3.4）；② 微调时 freeze embedding。CS336 做的是 **from scratch pretraining，embedding 跟着一起学**。
 
-### 4.4 历史：word2vec / GloVe（两阶段 → 端到端的演进）
+### 3.4 历史：word2vec / GloVe（两阶段 → 端到端的演进）
 - **word2vec**（2013, Mikolov）：专门训词向量的独立模型，思想"上下文决定词义"。CBOW（上下文→中心词）/ Skip-gram（中心词→上下文）。
 - 著名性质：向量类比 `vec(king)-vec(man)+vec(woman)≈vec(queen)` → 向量空间编码语义关系。
 
@@ -518,9 +584,8 @@ owt 最长的 10 个 token **一个真词都没有**：
 | 训练目标 | 通用上下文预测 | 直接是最终任务（预测下一词） |
 
 - **为何弃用两阶段**：① 端到端让 embedding 被最终任务塑造，更贴合；② word2vec **静态**——一词一个固定向量，"bank"(银行/河岸)分不开；而 Transformer 里 embedding 只是起点，过 attention 后同词在不同上下文得**不同**表示（contextualized）。
-- **思想活下来了**："上下文决定意义"一脉相承——word2vec 显式用上下文训向量；LM 预测下一词时 loss 把相似上下文的 token 向量推近。§1.9 的"CJK 互为邻居"与 word2vec 类比性质**同源**，只是融进了端到端训练。
-- 作业里**不用** word2vec，但理解它能明白"为什么 embedding 能从零学出有意义结构"——因为预测任务本身就蕴含"上下文决定意义"的信号。
+- **思想活下来了**："上下文决定意义"一脉相承——word2vec 显式用上下文训向量；LM 预测下一词时 loss 把相似上下文的 token 向量推近。§1.5 的"CJK 互为邻居"与 word2vec 类比性质**同源**，只是融进了端到端训练。
 
 ---
 
-## 5. 待续（§3 Transformer 实现时继续记）
+## 4. 待续（§3 Transformer 实现时继续记）

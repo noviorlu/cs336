@@ -10,6 +10,7 @@ Layout
 
 import os
 import gc
+import itertools
 import json
 import time
 import heapq
@@ -452,35 +453,147 @@ class Tokenizer:
             special_tokens: strings that must never be split. Append any that are not
                 already in `vocab`.
         """
-        raise NotImplementedError
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens or []
+        self.inverse_vocab: dict[bytes, int] = {b: i for i, b in vocab.items()}
+        for token in self.special_tokens:
+            b = token.encode("utf-8")
+            if b not in self.inverse_vocab:
+                new_id = len(self.vocab)
+                self.vocab[new_id] = b
+                self.inverse_vocab[b] = new_id
+
+        self.merge_rank: dict[tuple[bytes, bytes], int] = {pair: i for i, pair in enumerate(merges)}
+        self.cached_word_ids: dict[str, list[int]] = {}
+
+        # Special tokens are split out BEFORE PAT runs: they are a hard boundary that the
+        # regex must not look across (a lookahead peeking past one changes how the
+        # whitespace around it is tokenised). Longest first -- alternation is
+        # leftmost-first, not longest-match, so "<|eot|>" ahead of "<|eot|><|eot|>"
+        # would cut the double one in half. The capture group keeps the delimiters.
+        self.special_set: set[str] = set(self.special_tokens)
+        self.special_split_pat = (
+            re.compile(
+                "(" + "|".join(
+                    re.escape(t) for t in sorted(self.special_tokens, key=len, reverse=True)
+                ) + ")"
+            )
+            if self.special_tokens
+            else None
+        )
 
     @classmethod
     def from_files(
-        cls,
+        cls: type["Tokenizer"],
         vocab_filepath: str | os.PathLike,
         merges_filepath: str | os.PathLike,
         special_tokens: list[str] | None = None,
     ) -> "Tokenizer":
         """Construct a Tokenizer from files produced by `store_tokenizer`."""
-        raise NotImplementedError
+        vocab, merges = load_tokenizer(vocab_filepath, merges_filepath)
+        return cls(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> list[int]:
-        """Encode text into a sequence of token IDs.
+        ids: list[int] = []
+        parts = self.special_split_pat.split(text) if self.special_split_pat else [text]
+        for part in parts:
+            if not part:                       # re.split emits empty strings at the edges
+                continue
+            if part in self.special_set:       # one ID straight from the table: no PAT, no merges
+                ids.append(self.inverse_vocab[part.encode("utf-8")])
+                continue
+            for pre_token in COMPILED_PAT.findall(part):
+                # Zipf: the same pre-token recurs constantly, so merge it once and reuse.
+                # Keyed on str so a cache hit costs no re-encode.
+                merged = self.cached_word_ids.get(pre_token)
+                if merged is None:
+                    merged = self.cached_word_ids[pre_token] = self._merge_pretoken(pre_token)
+                ids.extend(merged)
+        return ids
 
-        Step 1 -- pre-tokenize (same PAT as training), each pre-token as UTF-8 bytes.
-                  Pre-tokens are independent: no merge ever crosses their boundary.
-        Step 2 -- apply the merges in creation order within each pre-token.
-        """
-        raise NotImplementedError
+    def _merge_pretoken(self, pre_token: str) -> list[int]:
+        seq = [bytes([b]) for b in pre_token.encode("utf-8")]
+        rank = self.merge_rank
+
+        while len(seq) > 1:
+            # Only pairs that actually have a merge are candidates.
+            candidates = [pair for pair in zip(seq, seq[1:]) if pair in rank]
+            if not candidates:
+                break
+            a, b = min(candidates, key=rank.__getitem__)
+
+            # Merge every occurrence, scanning left to right. Overlaps resolve greedily:
+            # [a, a, a] with (a, a) becomes [aa, a] -- the same way training merged them,
+            # which is what keeps encode consistent with the merge list it replays.
+            merged_seq = []
+            i = 0
+            n = len(seq)
+            while i < n:
+                if i < n - 1 and seq[i] == a and seq[i + 1] == b:
+                    merged_seq.append(a + b)
+                    i += 2
+                else:
+                    merged_seq.append(seq[i])
+                    i += 1
+            seq = merged_seq
+
+        # Every byte string here is either one of the 256 base bytes or the product of a
+        # merge, so it is guaranteed to be in the vocabulary.
+        return [self.inverse_vocab[token] for token in seq]
+
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        """Lazily yield token IDs from an iterable of strings (e.g. an open file).
+        S = max((len(s) for s in self.special_tokens), default=0)
+        buf = ""
+        pending = None
+        for chunk in itertools.chain(iterable, [None]):
+            if pending is None and chunk is not None:
+                pending = chunk
+                continue
+            buf += pending or ""
+            pending = chunk
+            eof = chunk is None
 
-        Memory must stay constant in the size of the input, and the result must be
-        identical to `encode` on the whole text -- so no token may straddle a chunk
-        boundary.
-        """
-        raise NotImplementedError
+            if eof:
+                limit = len(buf)
+            else:
+                limit = len(buf) - (S - 1) if S > 1 else len(buf)
+                if limit <= 0:
+                    continue
+                if self.special_split_pat:
+                    for m in self.special_split_pat.finditer(buf):
+                        if m.start() < limit < m.end():
+                            limit = m.start()
+                if limit <= 0:
+                    continue
+
+            # 在 [0, limit) 上按 special 边界切段：special 是硬边界，PAT 不能跨过它
+            region = buf[:limit]
+            pieces, cursor = [], 0
+            if self.special_split_pat:
+                for m in self.special_split_pat.finditer(region):
+                    pieces.append((False, region[cursor:m.start()]))
+                    pieces.append((True, m.group()))
+                    cursor = m.end()
+            pieces.append((False, region[cursor:]))
+
+            held_len = 0
+            for i, (is_special, piece) in enumerate(pieces):
+                if not piece:
+                    continue
+                if is_special:
+                    yield self.inverse_vocab[piece.encode("utf-8")]
+                    continue
+                pre_tokens = COMPILED_PAT.findall(piece)
+                if i == len(pieces) - 1 and not eof and pre_tokens:
+                    held_len = len(pre_tokens.pop())      # hazard 2: 扣住最后一个
+                for pre_token in pre_tokens:
+                    merged = self.cached_word_ids.get(pre_token)
+                    if merged is None:
+                        merged = self.cached_word_ids[pre_token] = self._merge_pretoken(pre_token)
+                    yield from merged
+            buf = buf[limit - held_len:]
 
     def decode(self, ids: list[int]) -> str:
         """Decode token IDs back into text.
@@ -488,4 +601,7 @@ class Tokenizer:
         IDs come from the user and are not guaranteed to form valid UTF-8; malformed
         bytes must become U+FFFD.
         """
-        raise NotImplementedError
+        # Join first, decode once. Decoding token by token would be wrong: a merge can
+        # land in the middle of a multi-byte character, so one token may hold only the
+        # lead byte and the next token the continuation bytes.
+        return b"".join(self.vocab[i] for i in ids).decode("utf-8", errors="replace")
