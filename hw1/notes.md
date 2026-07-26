@@ -7,6 +7,8 @@
 
 ## 0. 整体地图
 
+### 0.1 四大块 & 工作流程
+
 作业目标：从零搭一个完整的 Transformer LM 训练流程。四大块：
 
 | Handout 章节 | 实现内容 | adapters 函数 | 测试文件 |
@@ -14,12 +16,26 @@
 | §2 BPE Tokenizer | BPE 训练 + Tokenizer(encode/decode) | `run_train_bpe`, `get_tokenizer` | `test_train_bpe.py`, `test_tokenizer.py` |
 | §3 Transformer LM | Linear/Embedding/RMSNorm/SwiGLU/Attention/RoPE/Block/LM | `run_linear` … `run_transformer_lm` | `test_model.py`, `test_nn_utils.py` |
 | §4 Loss & Optimizer | cross-entropy / AdamW / grad clip / cosine LR | `run_cross_entropy` … `run_get_lr_cosine_schedule` | `test_nn_utils.py`, `test_optimizer.py` |
-| §5 Training loop | get_batch / checkpoint 存取 | `run_get_batch`, `run_save/load_checkpoint` | `test_data.py`, `test_serialization.py` |
+| handout §5 Training loop | get_batch / checkpoint 存取 | `run_get_batch`, `run_save/load_checkpoint` | `test_data.py`, `test_serialization.py` |
+
 
 **工作流程**：在 `cs336_basics/` 里从零写实现 → 在 `tests/adapters.py` 里把 `run_xxx` 接到自己的实现（只做胶水，无实质逻辑）→ `uv run pytest` 验证。
 
 
-**Leaderboard（§7.5，6 分）**：在 OWT 上训模型、最小化 validation loss。规则只有两条——单次跑 **≤45 分钟 B200**、只能用课程给的 OWT 数据；其余随意。及格线是打败 loss 5.0 的朴素基线。提 PR 到 `stanford-cs336/assignment1-basics-leaderboard`。**排的是模型质量，不是 tokenizer 速度。**
+**Leaderboard（handout §7.5，6 分）**：在 OWT 上训模型、最小化 validation loss。规则只有两条——单次跑 **≤45 分钟 B200**、只能用课程给的 OWT 数据；其余随意。及格线是打败 loss 5.0 的朴素基线。提 PR 到 `stanford-cs336/assignment1-basics-leaderboard`。**排的是模型质量，不是 tokenizer 速度。**
+
+
+### 0.2 语料
+
+| | 大小 | 是什么 | 特点 |
+|---|---|---|---|
+| **TinyStories** | train 2.23 GB / valid 22.5 MB | GPT-3.5/4 **合成**的儿童故事（Eldan & Li, 2023），词汇刻意限制在 3–4 岁小孩能懂的范围 | 极干净、极同质。用途是让小模型也能训出流利英语，便于快速迭代 |
+| **OpenWebText** | train 11.92 GB / valid 290 MB | Reddit 高赞外链的网页正文，GPT-2 训练语料 WebText 的开源复现 | 真实、嘈杂、多样：乱码、排版分隔线、多语言混杂 |
+| **The Pile**（不下载，只作参照） | 825 GB | EleutherAI (2020)，**22 个来源混合**——arXiv、GitHub 代码、PubMed、专利、Stack Exchange、维基、书籍、字幕、网页 | 卖点是**成分公开且刻意多样**（对比 OWT 的纯网页抓取）。GPT-Neo/GPT-J/Pythia 用它训练；现已被 RedPajama、Dolma 取代，但仍是**"真实预训练语料有多大"的标准参照单位** |
+
+前两个是作业实际用的（`data/`，handout 提供）；Pile 只出现在 handout §2.7(c) 的估算题里——*你的 tokenizer 拿到真实规模语料上要跑多久*（见 §2.10）。
+
+**TinyStories 和 OWT 的差异贯穿整份笔记**：unique pre-token 6 万 vs 660 万、最长 token 是真词 vs 乱码、缓存命中率 99.75% vs 96.93%——**同一份代码在它们身上常常给出相反的结论**（§2.7 教训 1）。这不是巧合：一个是合成的干净同质语料，一个是真实的嘈杂多样语料。
 
 ---
 
@@ -199,7 +215,7 @@ PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s
 
 第一条后来在 `encode` 里又以另一种形式出现（`special_split_pat` 为空时要置 `None`，见 §2.9）——**同一个空集合边界，两处都要防。**
 
-**演进**：这套正则至今是主流骨架。GPT-4 的 `cl100k_base` 最重要的改动是**数字限 `\p{N}{1,3}`**（`12345`→`123`+`45`，算术更稳、词表不被撑爆）。各家的分词算法对比见 §2.10.1。
+**演进**：这套正则至今是主流骨架。GPT-4 的 `cl100k_base` 最重要的改动是**数字限 `\p{N}{1,3}`**（`12345`→`123`+`45`，算术更稳、词表不被撑爆）。各家的分词算法对比见 §2.11.1。
 
 ### 2.3 Merge loop 算法
 
@@ -425,9 +441,38 @@ owt 最长的 10 个 token **一个真词都没有**：
 - OWT 最长 token **不合理**——它反映的是网页语料的编码损坏和排版分隔线，不是语言结构。**算法没错，是数据脏**：这些字节序列确实高频，BPE 忠实地学了。
 - 这就是 handout §2.5(b)「对比两个 tokenizer」的答案：干净合成语料 vs 脏爬取语料。延伸问题——**词表里有多少格子被垃圾占掉了？**这直接吃掉 compression ratio 和 leaderboard 的 token 预算。真实管线会先做数据清洗（去重、编码修复、过滤），正是后面 data 那个 assignment 的主题。
 
+#### 序列化：为什么是 JSON + latin-1
+
+`store_tokenizer` / `load_tokenizer` 落盘 `vocab.json` + `merges.json`。**测试不碰 `from_files`，格式完全自选**，但这几个决定值得记：
+
+**bytes 塞不进文本格式**——实测 `vocab_size=300` 的词表里 **128/300 个 token 不是合法 UTF-8**（多字节字符的续接字节，单独拿出来非法），`b.decode("utf-8")` 直接崩。三种解法：
+
+| 方案 | 谁在用 | 做法 |
+|---|---|---|
+| byte→unicode 映射 | GPT-2 的 `vocab.json`/`merges.txt` | 256 个字节各映射到一个**可打印**字符（空格→`Ġ`、换行→`Ċ`）。**这个 trick 是为了迁就 `merges.txt` 用空格分隔两个 token 的文本格式**——不映射的话 token 本身是空格就歧义了 |
+| **latin-1**（本项目） | — | 字节 0–255 一一映射到码点 U+0000–U+00FF ⇒ `b.decode("latin-1").encode("latin-1") == b` 对**任意**字节串成立。merges 存 JSON 数组而非空格分隔，所以不需要 GPT-2 那套 trick |
+| base64 | tiktoken / Llama 3 | 最保险，代价是不可读 |
+
+**三层别搞混**（以 id=195 为例）：token 是 1 个字节(值 195) → JSON 里是 1 个字符(码点 195, `'Ã'`) → **磁盘上是 2 个字节**(`C3 83`，因为文件按 UTF-8 写)。所以 ≥128 的字节在磁盘上都膨胀一倍。
+
+**为什么不用 `.pt` / pickle**——实测反而是 pickle 最省最快：
+
+| 格式 | 大小 | 写 | 读 |
+|---|---|---|---|
+| `vocab.json`(latin-1) | 172.7 KB | 2.8 ms | 1.7 ms |
+| **`vocab.pkl`** | **114.7 KB** | **0.4 ms** | **0.3 ms** |
+| `vocab.pt`(torch.save) | 340.0 KB | 16.6 ms | 4.3 ms |
+
+⇒ **选 JSON 是在效率上主动认输**。理由是别的三条：① **安全**——pickle 反序列化即执行任意代码，而 tokenizer 是从网上下载的产物（PyTorch 2.6 把 `torch.load` 默认改成 `weights_only=True` 就是为这个）；② **可移植**——读它的常常不是 Python（HF `tokenizers` 是 Rust、llama.cpp 是 C++、transformers.js 是 JS）；③ **可读可 diff**，词表是要人眼检查的东西。
+
+> **先做尺度检查**：172 KB、一个进程只加载一次 ⇒ 大小和速度这两个维度上**所有选项都远低于痛阈**，那就不该拿它们做决策依据。
+> **通则：配置类产物用文本格式，二进制只留给真正大的数值数据。** 同一个作业里两种数据两种答案——vocab/merges 用 JSON（KB 级、要人看），token 数组用 uint16 裸二进制（GB 级、机器随机读，见 §2.10）。
+
 ### 2.9 Tokenizer：encode / decode（handout §2.6）✅ 15 分
 
 `pytest tests/test_tokenizer.py` → **24 passed, 1 xfailed**（xfail 是测试自己标的：`encode` 不要求省内存）。
+
+> ⚠️ **绿灯 ≠ 证明**：`test_encode_iterable_memory_usage` 的 `@memory_limit(1MB)` 装饰器在 `finally` 里就把 rlimit 还原了，而被它装饰的 `_encode_iterable` 是**生成器函数**——调用只创建生成器、不执行，等真正迭代时限制早撤了（实测：普通函数里 rlimit=14MB 生效，生成器迭代时是「无限制」）。所以那个 PASSED 的证明力比看起来弱；真正的依据是**结构本身**（`yield` + `buf` 只留未结算的尾巴）和自建对拍。**测试测的是它写下的那个条件，不一定是你以为的那个条件。**
 
 **`__init__` 建四张表**——传进来的 `vocab`/`merges` 都答不了 encode 要问的问题：
 
@@ -468,11 +513,61 @@ owt 最长的 10 个 token **一个真词都没有**：
 
 **验证**：官方测试（含一批 `matches_tiktoken`）+ 自建对拍器（1011 刁钻用例 × 3 种 special 配置 × 5 种切法，含 chunk=1 和逐行）。**三条不变量是被反例逐个逼出来的**，每错一次就往语料里加一个。
 
-### 2.10 分词的代价 & 去 tokenizer 化（延伸）
+### 2.10 §2.7 实验 & 数据落盘（4 分）✅
+
+三个脚本：`main_bpe_train.py`（训 tokenizer）→ `main_tokenizer_experiments.py`（(a)(b)(c)）→ `main_tokenize_dataset.py`（(d) 落盘）。
+
+**(a)(b) compression ratio（bytes/token，越大越好）**
+
+| 样本 | 用哪个 tokenizer | bytes | tokens | bytes/token |
+|---|---|---|---|---|
+| TinyStories 10 篇 | TinyStories (10k) | 7,633 | 1,861 | 4.102 |
+| OWT 10 篇 | OWT (32k) | 60,084 | 13,586 | **4.422** |
+| OWT 10 篇 | **TinyStories (10k)** ← 交叉 | 60,084 | **17,952** | **3.347** |
+
+只有后两行可比（同一份 OWT 样本）；第一行是另一份样本，只能横向看比值。
+⚠️ 样本量差很多：10 篇儿童故事才 **7.6 KB**，10 篇网页有 **60 KB**——小样本的 ratio 方差大，能和全量的 4.071 对上有运气成分。真要下结论看 §2.10 (d) 的全量数字（4.116 / 4.371）。
+
+⇒ **用错 tokenizer，压缩率掉 24.3%、token 数多 32.1%。** TinyStories 的词表学自 GPT-4 生成的儿童故事，没有网页文本的词汇（URL、技术术语、非英文、排版符号），OWT 只能被切得更碎。
+**这条有真实代价**：leaderboard 是固定 45 分钟算力预算，token 效率低 32% ≈ 模型少看 32% 的文本；推理时 context window 也更快耗尽。**和 §2.11.3「多语言不公平」是同一个机制**——小语种被切碎，本质就是拿一个没覆盖这类文本的词表去编码。
+
+**(c) 吞吐（单进程）**
+
+handout 拿 **The Pile**（825 GB，见 §0.2）当尺度参照物——不是真去跑，是算一笔账：*这个 tokenizer 拿到真实规模的语料上要多久？* 慢 100 倍的实现（比如 `encode` 遍历全部 merge）同样的账就是 90 天，预处理直接变成工程阻塞。
+
+| | 单进程 MB/s | 缓存命中率 | Pile 825GB 单进程 |
+|---|---|---|---|
+| TinyStories | **20.7** | 99.75%（每 401 次出现才真算 1 次） | 11.1 h |
+| OWT | **10.6** | 96.93%（每 32.5 次） | 21.5 h |
+
+⚠️ **别拿单进程 ÷ 32 估并行**。实测 32 进程是 **187.2 MB/s**（见下 (d) 的 owt_train），加速比只有 **17.6×** 不是 32×（效率 55%，损耗在 IO、pickle 回传、父进程拼接、负载不均）。⇒ Pile 的实际估算是 **1.2 小时**，不是 ÷32 得到的 0.67 小时。
+
+⇒ **吞吐由缓存命中率决定，不由词表大小决定。** 同样 20MB，OWT 有 13.5 万个不同 pre-token（TinyStories 才 1.3 万），`_merge_pretoken` 被真正调用的次数多 10 倍。直觉会归因于"词表大 3 倍所以慢"，实际是**语料多样性**。
+
+**(d) 落盘产物**（`data/<split>.npy`，32 进程）
+
+| split | 语料 | 耗时 | token 数 | bytes/token | 文件 |
+|---|---|---|---|---|---|
+| tinystories_train | 2.23 GB | 8.5 s (261 MB/s) | 5.41 亿 | 4.116 | 1.08 GB |
+| tinystories_valid | 0.02 GB | 0.2 s | 546 万 | 4.117 | 0.01 GB |
+| **owt_train** | **11.92 GB** | **63.7 s (187 MB/s)** | **27.27 亿** | 4.371 | **5.45 GB** |
+| owt_valid | 0.29 GB | 2.5 s | 6640 万 | 4.367 | 0.13 GB |
+
+**为什么 uint16**：范围 0–65535，装得下 32000 和 10000。换 uint32 文件直接大一倍（5.45→10.9 GB），而训练是用 `np.memmap` 随机采样的，**文件越小页缓存命中越好**。
+⚠️ **条件是 `vocab_size ≤ 65536`**，落盘时应 assert。Llama 3（128k）、Qwen（15 万）这类词表就必须用 uint32。
+
+**并行怎么做的**：`find_chunk_boundaries` 按 `<|endoftext|>` 切 `进程数×4` 块 → 各 worker `encode` 自己那块 → 父进程按块序拼接。
+- **正确性**：边界落在 special token 起点，而它是硬边界，pre-token 和 merge 都不跨越 ⇒ 分块编码 ≡ 整体编码。**实测验证**：valid 上 546 万 token 与整体 `encode` 逐个相同，`decode` 回原文一字不差。
+- **worker 回传 `np.uint16` 数组而不是 `list[int]`**：pickle 的是 2 字节/token 的连续 buffer，不是几千万个 Python int 对象。
+- **tokenizer 建在模块级**：Linux 的 `Pool` 走 fork，全局对象 copy-on-write 免费继承；且 worker 跨任务复用同一对象，`cached_word_ids` 能累积（块数取 `×4` 就是为了摊薄冷启动）。
+
+> **三条独立路径互相印证**：训练期 `word_ids` 算出 4.071 / 采样 10 篇 `encode` 算出 4.102 / 全量落盘算出 4.116。完全不同的代码路径收敛到同一个数 ⇒ **免费的正确性交叉验证**。方法论上比数字本身值钱：任何时候一个量能用两条路算，就该都算一遍。
+
+### 2.11 分词的代价 & 去 tokenizer 化（延伸）
 
 > 背景与延伸，和 §2 的实现无关。后续读「替换/去掉 tokenizer」方向的论文，笔记记在 §3.4。
 
-#### 2.10.1 三种主流分词算法
+#### 2.11.1 三种主流分词算法
 
 | | **BPE** | **WordPiece** | **Unigram LM** |
 |---|---|---|---|
@@ -491,7 +586,7 @@ owt 最长的 10 个 token **一个真词都没有**：
 
 > ⚠️ **所以不能把 BPE 的 `encode` 改写成 trie 贪心**。反例：merges 只有 `rank0:(b,c)→bc`、`rank1:(a,b)→ab`，编码 `"abc"`——BPE 挑 rank 最小的 `(b,c)` 得 `[a, bc]`，trie 最长前缀得 `[ab, c]`。**结果不同。** 不是那个算法不好，是它和你训出来的这套 merges 不配套（见 §3.3 末条）。
 
-#### 2.10.2 分词不是 Transformer 的缺陷，但有一条真实因果链
+#### 2.11.2 分词不是 Transformer 的缺陷，但有一条真实因果链
 
 **分词发生在模型之外**：Transformer 拿到的就是一串整数 ID，不知道也不关心它怎么来的。换成 RNN / LSTM / Mamba，问题一模一样。所以这不是 Transformer 架构的缺陷。
 
@@ -501,7 +596,7 @@ owt 最长的 10 个 token **一个真词都没有**：
 
 **它本身不产生任何语义价值。** 如果 attention 免费，直接喂字节即可——这正是 §3.4 那批工作的出发点。
 
-#### 2.10.3 分词制造的真问题
+#### 2.11.3 分词制造的真问题
 
 | 问题 | 表现 |
 |---|---|
@@ -514,7 +609,7 @@ owt 最长的 10 个 token **一个真词都没有**：
 
 **最要命的一条不是"问题"而是"约束"**：**encode 必须和训练时完全一致**。模型学的是「ID 47 后面常跟 ID 892」这种统计；训练用 BPE 的 rank 顺序切、推理改用贪心切，同一句话会变成一串不同的 ID，分布一偏模型立刻退化。这就是 `test_tokenizer.py` 里一堆 `test_*_matches_tiktoken` 要求逐 token 对上的原因——**tokenizer 不是"差不多就行"的组件，它是模型的一部分**。
 
-#### 2.10.4 去 tokenizer 化的尝试（论文笔记待补）
+#### 2.11.4 去 tokenizer 化的尝试（论文笔记待补）
 
 思路都是「把压缩这一步交给模型自己学，而不是外挂一个固定词表」。SSM / 线性注意力让长序列变便宜之后，这条路更有希望。
 
@@ -528,15 +623,15 @@ owt 最长的 10 个 token **一个真词都没有**：
 
 要盯的共同问题：① 序列变长后算力怎么摊（这是分词存在的唯一理由）；② 去掉词表后，前面那张表里的问题解决了几条、又新增了什么；③ 和固定词表相比，同算力下的实际质量。
 
-### 2.11 进度 & 下一步
+### 2.12 进度 & 下一步
 
 | handout | 分数 | 状态 |
 |---|---|---|
 | §2.4–2.5 `train_bpe` | 15 | ✅ 3/3（§2.5、§2.9） |
 | §2.6 `Tokenizer` | 15 | ✅ 24 passed, 1 xfailed（§2.10） |
-| **§2.7 实验** | **4** | ⏭ (a) 各采样 10 篇报 bytes/token；(b) 用 TinyStories tokenizer 编码 OWT 样本对比；(c) 估吞吐、推算 Pile 825GB；**(d) train/valid 全部编码落盘成 uint16** |
+| §2.7 实验 | 4 | ✅ 见 §2.10；四个 `.npy` 已落盘 |
 
-(d) 是重活，也是**整个作业往下走的前置依赖**——它的产物就是 §5 训练时 `np.memmap` 读的数组。建议顺序：(c) 量吞吐 → 据此估 (d) 要多久、决定要不要并行 → 顺手做 (a)(b)（和 (c) 共用采样编码的代码）→ 最后跑 (d)。
+**§2 全部 34 分拿下。** 下一步是 handout §3 Transformer——`data/*.npy` 就是 handout §5 训练时 `np.memmap` 读的输入。
 
 **记住 tokenizer 速度和 LM 训练速度无关**：训练读的是已落盘的 memmap 数组，tokenizer 不在那个循环里。影响训练的是它的**输出**——`vocab_size`（决定 embedding/LM head 参数量和 softmax 开销）和 **compression ratio**（决定同样 token 预算下模型看到多少文本，对 45 分钟的 leaderboard 是实打实的杠杆）。所有优化都保持了 merges 逐条相同 ⇒ 没改变输出 ⇒ 没影响训练。
 
@@ -561,7 +656,7 @@ owt 最长的 10 个 token **一个真词都没有**：
 
 ### 3.2 embedding matrix 如何训练
 - **它就是普通可学习参数**，没有特殊训练方式 = 整个模型怎么训练它就怎么训练。
-- 训练大循环（§5 要实现）：forward（ID→查行→Transformer→logits→loss）→ backward（求梯度）→ step（AdamW 更新）→ zero_grad。
+- 训练大循环（handout §5 要实现）：forward（ID→查行→Transformer→logits→loss）→ backward（求梯度）→ step（AdamW 更新）→ zero_grad。
 - **embedding 特有洞察**：一个 batch 只查了出现过的 token 的行 → 反向时**梯度只流回被用到的行**，没出现的 token 那一步梯度=0、不更新。
   - ⟹ 高频 token 更新多、学得充分；低频/生僻 token 更新少、学得差。
   - **这解释了 §1.5**"中文稀疏→掌握不锐利"：中文 token 出现少 → embedding 行更新少 → 没训充分 → 采样易漂移。
