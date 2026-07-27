@@ -89,8 +89,8 @@ class SwiGLU(nn.Module):
 
 class RoPE(nn.Module):
     """
-    i:    position            0 .. max_seq_len-1    \n
-    k:    theta_dim_marker    0 .. d_k/2-1          \n
+    i:    position              0 .. max_seq_len-1    \n
+    k:    pair index            0 .. d_k/2-1          \n
     
     theta[i, k] = i / Theta ^ (2k / d_k)            \n
     """
