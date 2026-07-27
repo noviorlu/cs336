@@ -88,6 +88,12 @@ class SwiGLU(nn.Module):
         return self.w2(x_gate * x_val)
 
 class RoPE(nn.Module):
+    """
+    i:    position            0 .. max_seq_len-1    \n
+    k:    theta_dim_marker    0 .. d_k/2-1          \n
+    
+    theta[i, k] = i / Theta ^ (2k / d_k)            \n
+    """
     def __init__(
         self,
         theta: float,
@@ -97,29 +103,61 @@ class RoPE(nn.Module):
     ):
         super().__init__()
 
-        # k: 0, 2, 4... (2d_k - 2)
+        # 2k, k=0..d_k/2-1 → 取值 0, 2, 4, ..., d_k-2
         dim_range = torch.arange(0, d_k, 2, device=device, dtype=torch.float32) # dim: [d_k // 2]
         
-        # 1 / (theta ^ ((2d_k-2)/d))
+        # inv_freq[k] = 1 / Theta ** (2k / d_k)
         inv_freq = 1.0 / (theta ** (dim_range / d_k)) # dim: [d_k // 2]
 
         # i: 0, 1, 2, ..., max_seq_len - 1 
         t = torch.arange(max_seq_len, device=device, dtype=torch.float32) # dim: [max_seq_len]
         
-        # i / (theta ^ ((2d_k-2)/d)) 
-        # t 是 [max_seq_len] 的列向展开，inv_freq 是 [d_k // 2] 的横向展开，外积相乘后得到二维矩阵
-        freqs = einsum(t, inv_freq, 'i, j -> i j')
+        # freqs[i, k] = theta[i, k] = i * inv_freq[k]
+        freqs = einsum(t, inv_freq, 'i, k -> i k') # dim [max_seq_len, d_k // 2]
 
         cos_cached = freqs.cos()
         sin_cached = freqs.sin()
+        rot90_sign = torch.tensor([-1.0, 1.0], device=device, dtype=torch.float32)
 
         self.register_buffer("cos_cached", cos_cached, persistent=False)
-        self.register_buffer("sin_cached", sin_cached, persistent=False) 
-        
+        self.register_buffer("sin_cached", sin_cached, persistent=False)
+        self.register_buffer("rot90_sign", rot90_sign, persistent=False)
+
     def forward(
         self, 
         x: Float[Tensor, "... sequence_length d_k"], 
         token_positions: Int[Tensor, "... sequence_length"]
     ) -> Float[Tensor, "... sequence_length d_k"]:
-        
+        # [..., sequence_length, k, 1]
+        cos = rearrange(self.cos_cached[token_positions].to(x.dtype), '... k -> ... k 1') 
+        sin = rearrange(self.sin_cached[token_positions].to(x.dtype), '... k -> ... k 1') 
+
+        # [ x0, x1, x2, x3, x4, x5 ] =>
+        # [
+        #   [x0, x1],
+        #   [x2, x3],
+        #   [x4, x5]
+        # ]
+        x_reshaped = rearrange(x, '... (k xy) -> ... k xy', xy=2) # [..., k, 2]
+
+        # [
+        #   [x1, x0],
+        #   [x3, x2],
+        #   [x5, x4]
+        # ] 
+        # x [-1, 1]
+        # =
+        # [
+        #   [-x1, x0],
+        #   [-x3, x2],
+        #   [-x5, x4]
+        # ] 
+        x_rotate = x_reshaped.flip(-1) * self.rot90_sign.to(x.dtype)
+
+        # out0 = x0 * cos - x1 * sin
+        # out1 = x0 * sin + x1 * cos
+        # [out0 out1] = [x0, x1] * cos + [-x1, x0] * sin
+        out = rearrange(x_reshaped * cos + x_rotate * sin, '... k xy -> ... (k xy)')
+        return out
+
         
