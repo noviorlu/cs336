@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
+import math
 from einops import einsum, rearrange
-from jaxtyping import Float, Int
+from jaxtyping import Float, Int, Bool
 from torch import Tensor
 
 class Linear(nn.Module):
@@ -177,15 +178,18 @@ def softmax(x: Float[Tensor, "..."], dim: int) -> Float[Tensor, "..."]:
     # 5. 张量直接相除（分子矩阵 / 分母矩阵）
     return nume / denomi
 
+def scaled_dot_product_attention(                                                            
+    q: Float[Tensor, "b ... queries d_k"],                                                   
+    k: Float[Tensor, "b ... keys d_k"],                                                   
+    v: Float[Tensor, "b ... keys d_v"],                                                   
+    mask: Bool[Tensor, "b ... queries keys"] | None = None,
 
+) -> Float[Tensor, "b ... queries d_v"]:                                                     
+    d_k = q.shape[-1] 
+    QK = einsum(q, k, '... queries d_k, ... keys d_k -> ... queries keys') / math.sqrt(d_k)
+    if mask is not None:
+            QK = QK.masked_fill(mask == False, float('-inf'))
 
+    softQK = softmax(QK, dim=-1)
+    return einsum(softQK, v, '... queries keys, ... keys d_v -> ... queries d_v')
 
-
-
-
-
-
-
-
-
-        
