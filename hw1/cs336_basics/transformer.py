@@ -160,4 +160,32 @@ class RoPE(nn.Module):
         out = rearrange(x_reshaped * cos + x_rotate * sin, '... k xy -> ... (k xy)')
         return out
 
+def softmax(x: Float[Tensor, "..."], dim: int) -> Float[Tensor, "..."]:                      
+    # 1. 找到指定维度 dim 上的最大值                                                         
+    # keepdim=True 极其重要！它能保证找完最大值后形状不塌缩，从而可以和 x 完美相减           
+    x_max = torch.max(x, dim=dim, keepdim=True)[0]
+    
+    # 2. 给所有的元素统一减去最大值（无损降维打击）
+    x_shifted = x - x_max
+    
+    # 3. 算分子：对减去最大值后的张量统一求 exp
+    nume = torch.exp(x_shifted)
+    
+    # 4. 算分母：沿着 dim 维度，把分子全部加起来（同样保持维度）
+    denomi = torch.sum(nume, dim=dim, keepdim=True)
+    
+    # 5. 张量直接相除（分子矩阵 / 分母矩阵）
+    return nume / denomi
+
+
+
+
+
+
+
+
+
+
+
+
         
