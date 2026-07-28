@@ -38,7 +38,7 @@ class Embedding(nn.Module):
         )
         torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=1, a=-3.0, b=3.0)
 
-    def forward(self, x: Int[Tensor, "... sequence_length"]) -> Float[Tensor, "... sequence_length embedding_dim"]:
+    def forward(self, x: Int[Tensor, "... seq_len"]) -> Float[Tensor, "... seq_len embedding_dim"]:
         return self.weight[x]
 
 class RMSNorm(nn.Module):
@@ -51,14 +51,15 @@ class RMSNorm(nn.Module):
     ):
         super().__init__()
         self.eps = eps
-        self.scale = nn.Parameter(
-            torch.empty((d_model,), device=device, dtype=dtype)
+        self.weight = nn.Parameter(
+            torch.ones((d_model,), device=device, dtype=dtype)
         )
+        
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         in_dtype = x.dtype
         x = x.to(torch.float32)
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        result = (x / rms) * self.scale
+        result = (x / rms) * self.weight
         return result.to(in_dtype)
 
 class SiLU(nn.Module):
@@ -93,7 +94,7 @@ class RoPE(nn.Module):
     i:    position              0 .. max_seq_len-1    \n
     k:    pair index            0 .. d_k/2-1          \n
     
-    theta[i, k] = i / Theta ^ (2k / d_k)            \n
+    theta[i, k] = i / Theta ^ (2k / d_k)              \n
     """
     def __init__(
         self,
@@ -126,10 +127,10 @@ class RoPE(nn.Module):
 
     def forward(
         self, 
-        x: Float[Tensor, "... sequence_length d_k"], 
-        token_positions: Int[Tensor, "... sequence_length"]
-    ) -> Float[Tensor, "... sequence_length d_k"]:
-        # [..., sequence_length, k, 1]
+        x: Float[Tensor, "... seq_len d_k"], 
+        token_positions: Int[Tensor, "... seq_len"]
+    ) -> Float[Tensor, "... seq_len d_k"]:
+        # [..., seq_len, k, 1]
         cos = rearrange(self.cos_cached[token_positions].to(x.dtype), '... k -> ... k 1') 
         sin = rearrange(self.sin_cached[token_positions].to(x.dtype), '... k -> ... k 1') 
 
@@ -183,13 +184,83 @@ def scaled_dot_product_attention(
     k: Float[Tensor, "b ... keys d_k"],                                                   
     v: Float[Tensor, "b ... keys d_v"],                                                   
     mask: Bool[Tensor, "b ... queries keys"] | None = None,
-
 ) -> Float[Tensor, "b ... queries d_v"]:                                                     
     d_k = q.shape[-1] 
     QK = einsum(q, k, '... queries d_k, ... keys d_k -> ... queries keys') / math.sqrt(d_k)
     if mask is not None:
-            QK = QK.masked_fill(mask == False, float('-inf'))
+        QK = QK.masked_fill(~mask, float('-inf'))
 
     softQK = softmax(QK, dim=-1)
     return einsum(softQK, v, '... queries keys, ... keys d_v -> ... queries d_v')
+
+class MultiHeadSelfAttention(nn.Module):
+    '''
+    In self attention   d_k = d_v = d
+                        queries = keys = seq_len
+    '''
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int | None = None,
+        theta: float | None = None,
+        device: torch.device | None = None, 
+        dtype: torch.dtype | None = None
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+
+        assert d_model % num_heads == 0
+
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+
+        if max_seq_len is not None and theta is not None:
+            self.rope = RoPE(theta=theta, d_k=d_model // num_heads, max_seq_len=max_seq_len, device=device)
+        else:
+            self.rope = None
+
+    def forward(
+        self,
+        x: Float[Tensor, "... seq_len d_model"],                                                      
+        mask: Bool[Tensor, "... seq_len seq_len"] | None = None,
+        token_positions: Int[Tensor, "... seq_len"] | None = None
+    ) -> Float[Tensor, "... seq_len d_model"]:
+        q = self.q_proj(x) # ... seq_len d_model
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q_arrg = rearrange(q, '... seq_len (h d) -> ... h seq_len d', h=self.num_heads)           
+        k_arrg = rearrange(k, '... seq_len (h d) -> ... h seq_len d', h=self.num_heads)           
+        v_arrg = rearrange(v, '... seq_len (h d) -> ... h seq_len d', h=self.num_heads) 
+
+
+        seq_len = x.shape[-2]
+        casual_mask = torch.tril(                                                               
+            torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device)            
+        )
+
+        if token_positions is None:
+            token_positions = torch.arange(seq_len, device=x.device)
+        else:
+            assert token_positions.dim() == 1   or (token_positions.dim() == 2 
+                                                and token_positions.shape[0] == 1), \
+                f"token_positions 形状 {token_positions.shape} 无法安全广播到 x.shape[:-1]"  
+
+        if self.rope is not None:
+            q_arrg = self.rope(q_arrg, token_positions)
+            k_arrg = self.rope(k_arrg, token_positions)
+
+        if mask is not None:
+            mask = mask & casual_mask
+        else:
+            mask = casual_mask
+
+        o_arrg = scaled_dot_product_attention(q_arrg, k_arrg, v_arrg, mask)
+        o = rearrange(o_arrg, '... h seq_len d -> ... seq_len (h d)')
+
+        return self.output_proj(o) # ... seq_len d_model
+
 

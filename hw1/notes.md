@@ -1187,11 +1187,134 @@ RoPE（§3.9）是在 **MultiHeadAttention 内部、投影和切头之后、调�
 
 这是"**让底层组件对上层的组织方式无知**"的一个具体例子，和 §2 里 `COMPILED_PAT` 能同时被训练和 encode 复用是同一种性质：**接口只承诺自己那一层的语义，不假设调用方怎么组织数据。**
 
-### 3.12 阶段性小结
+### 3.12 Multi-Head Self-Attention：公式与形状
+
+#### 为什么要从单头变成多头
+
+**一个 head 只能表达一种关注方式**，因为它的输出是 V 的加权平均、而 softmax 强制权重和为 1 ⇒ **注意力是零和的**，多看一个地方必然少看另一个。
+
+但一个 token 常常需要**同时**获取性质完全不同的信息。例如
+
+> The keys that I lost **were** on the table.
+
+`were` 既需要 `keys`（主谓一致，决定用 were 不是 was），又需要 `table`（语义）。两者毫无关系，却共用同一份 1.0 预算：
+
+| 权重分配 | 输出 | |
+|---|---|---|
+| 全给位置1 | `[1.0, 0, 0, 0]` | 语义丢了 |
+| 全给位置3 | `[0, 0, 1.0, 0]` | 语法丢了 |
+| 各 0.5 | `[0.5, 0, 0.5, 0]` | **两个都只剩一半，都糊了** |
+
+这就是 Vaswani 原文那句 **"With a single attention head, averaging inhibits this."**
+
+**修法：并排做 $h$ 次，每次有自己独立的 1.0 预算**，最后 concat ⇒ 两种信息都是满强度。
+
+**但朴素做法要 $h$ 倍参数和计算**，于是让每个头只在 $d_k=d_{\text{model}}/h$ 维里工作，$h \times d_{\text{model}}/h = d_{\text{model}}$，总量回到原来。
+
+> **逻辑顺序别搞反**：想要的是「$h$ 套互不竞争的注意力分布」（表达力）；**切分只是把成本压回单头水平的手段**，不是目的。所以 `rearrange('... seq (h d) -> ... h seq d')` 做的是「把 $d_{\text{model}}$ 个提取器分成 $h$ 组」，不是「把 token 拆开」。
+
+#### 三处常见的误说法
+
+| 常见说法 | 实际 |
+|---|---|
+| "把词向量切成 8 份分给各头" | **没有切词向量**。每个头都完整看到全部 $d_{\text{model}}$ 维，切的是 $W_Q$ 的**输出维度**（行分组）。切输入会让每个头对 $1-1/h$ 的特征全瞎（实测验证过） |
+| "参数量和计算量完全一样" | 参数量和**矩阵乘** FLOPs 一样；但**打分矩阵大 $h$ 倍**（$d_{\text{model}}$=512/seq=1024 时实测 104 万 vs 838 万个元素）⇒ softmax 计算量和激活显存都是 $h$ 倍。**矩阵乘免费，softmax 和中间张量不免费** |
+| "Head 1 管语法、Head 2 管语义" | 头**没有被指派角色**，大部分是多义的（polysemantic）。可解释性研究确实找到过功能明确的头（induction head、previous-token head），但那是**训练涌现，不是设计**。准确说法：**结构允许分工，训练可能产生分工** |
+
+> ⚠️ **别用 roofline 解释"为什么多头"**。参数量和矩阵乘 FLOPs 完全相同、而多头在打分矩阵上更吃内存——一个在 compute 和 memory 上都不更优的设计，不可能是被它们驱动的。
+> **判据**：先比两个方案的 FLOPs 和访存量。差很多 → 用 roofline 解释（**MQA/GQA** 是纯 KV-cache 带宽驱动、**FlashAttention** 的前提就是 attention 是 memory-bound）；几乎不差 → 它买的一定是表达力或优化性质（多头、残差、norm 的位置）。
+
+#### 那 compute / memory 的考量在哪？——在 MQA / GQA
+
+推理（自回归解码）时每生成一个 token 都要把之前所有的 K、V 从显存读一遍，这是**彻底的 memory-bound**：GPU 算得快，卡在等数据。缓存大小
+
+$$\text{KV cache}=2\cdot L\cdot \text{seq}\cdot (h_{kv}\cdot d_k)\cdot B$$
+
+实测（$d_{\text{model}}$=4096、seq=8192、32 层、fp16）：
+
+| 方案 | Q 头 | KV 头 | KV cache |
+|---|---|---|---|
+| 单头（$d_k$=4096） | 1 | 1 | **4.29 GB** |
+| MHA 32 头 | 32 | 32 | **4.29 GB** ← 和单头**完全一样** |
+| GQA 32/8（Llama 3） | 32 | 8 | 1.07 GB |
+| MQA 32/1 | 32 | 1 | 0.13 GB |
+
+⚠️ **多头不增加 KV cache 一个字节**——标准多头里 $h\cdot d_k=d_{\text{model}}$，头数在式子里被消掉了。
+**真正砍它的是 MQA/GQA**：让 $h_{kv}\cdot d_k < d_{\text{model}}$，即 **K/V 的总宽度比 $d_{\text{model}}$ 还窄**。这是对「单头和多头共同基线」的偏离，不是在修多头的毛病。
+⇒ 又一次印证上面那条判据：**两个方案的某项指标相同时，别拿这项指标去解释它们的差异。**
+
+另一处常见误说法：「多头把大矩阵切碎，对 GPU 不友好」。**Q/K/V 投影仍是三次完整的 $d_{\text{model}}\times d_{\text{model}}$ 大 GEMM**（handout 要求 "a total of three matrix multiplies"），切头是之后的 reshape、零计算。被拆成批量小矩阵乘的只有 $QK^\top$ 和 $AV$，而 `h` 在那里提供的是**并行度**不是碎片。$d_k$ 守在 64/128 的真实理由是 **tile 效率**（$d_k$ 太小时单个 tile 打不满 tensor core），不是"避免切碎"。
+
+#### handout 的三条式子（§3.4.5）
+
+$$\text{MultiHead}(Q,K,V)=\text{Concat}(\text{head}_1,\dots,\text{head}_h)$$
+$$\text{head}_i=\text{Attention}(Q_i,K_i,V_i)$$
+$$\text{MultiHeadSelfAttention}(x)=W_O\,\text{MultiHead}(W_Q x,\;W_K x,\;W_V x)$$
+
+其中 $Q_i,K_i,V_i$ 是把 $Q,K,V$ 沿 embedding 维切出的第 $i$ 片，$\text{Attention}$ 就是 §3.11 那个引擎。
+
+| 参数 | 形状 | 说明 |
+|---|---|---|
+| $W_Q,\;W_K$ | $\mathbb{R}^{h d_k \times d_{\text{model}}}$ | |
+| $W_V$ | $\mathbb{R}^{h d_v \times d_{\text{model}}}$ | |
+| $W_O$ | $\mathbb{R}^{d_{\text{model}} \times h d_v}$ | |
+
+作业里取 $d_k=d_v=\dfrac{d_{\text{model}}}{h}$，所以 $h d_k = h d_v = d_{\text{model}}$，**四个投影矩阵都是方阵** $d_{\text{model}}\times d_{\text{model}}$。
+
+> 注意 $d_k=d_v=d_{\text{model}}/h$ 是**这个作业的取值**，不是定义。MQA / GQA 这类变体里 K、V 的头数比 Q 少，$h d_v \neq d_{\text{model}}$，那时上面那张形状表才显出必要性。这也是 §3.11 坑 1 说的"恰好对 vs 真的对"。
+
+#### 关键理解一：为什么只需要三次矩阵乘，而不是 $3h$ 次
+
+式 (13) 字面读是"每个头各做一次小投影"，但 $W_Q \in \mathbb{R}^{h d_k \times d_{\text{model}}}$ 本来就是**一整块**。把它的**输出维度**切成 $h$ 段、每段 $d_k$，得到的正是各头的投影矩阵。所以
+
+$$\underbrace{x W_Q^\top}_{\text{一次大 GEMM}} \;\to\; [\dots,\text{seq},\,h d_k] \;\xrightarrow{\text{reshape}}\; [\dots,h,\text{seq},d_k]$$
+
+和"做 $h$ 次小投影再堆起来"**在数学上完全相同**，但一次大矩阵乘远快于 $h$ 次小的。handout 明确要求"a total of three matrix multiplies"（Q、K、V 各一次），脚注还留了个 stretch goal：三个拼成一个更大的矩阵，只做一次。
+
+**切头是纯粹的 reshape，不是计算。** 参数量、FLOPs 都和单头一样——多头改变的只是"这些维度如何分组做 softmax"。
+
+#### 关键理解二：heads 维度必须放在 seq 前面
+
+$$[\dots,\ \text{seq},\ (h\ d_k)] \;\longrightarrow\; [\dots,\ h,\ \text{seq},\ d_k]$$
+
+因为 §3.11 的引擎把**最后两维**当作 `queries × d_k` 来算，前面的 `...` 一律视为 batch。heads 放到 `...` 里，就自动获得"每个头独立做 attention"的语义——**引擎一行都不用改**。
+
+放成 `[..., seq, h, d_k]` 则会让引擎把 `h` 当成 queries、`d_k` 当成特征，算出来的东西毫无意义且**不报错**。
+
+#### 关键理解三：Concat + $W_O$ ≡ 各头结果分别投影后求和
+
+$\text{Concat}$ 得到 $[\dots,\text{seq},h d_v]$，再乘 $W_O \in \mathbb{R}^{d_{\text{model}}\times h d_v}$。把 $W_O$ 沿**输入维度**切成 $h$ 段 $W_O^{(i)}$，则
+
+$$W_O\,\text{Concat}(\text{head}_1,\dots,\text{head}_h)=\sum_{i=1}^{h} W_O^{(i)}\,\text{head}_i$$
+
+⇒ 各头的信息是在 $W_O$ 这一步**相加融合**的，不是简单并排。这也解释了为什么 $W_O$ 不能省——没有它，各头的输出就只是拼在一起、从未交互过。
+
+#### 完整形状流
+
+| 步 | 操作 | 形状 |
+|---|---|---|
+| 0 | 输入 $x$ | `... seq d_model` |
+| 1 | 三次投影 | 各 `... seq d_model`（即 `... seq (h d_k)`） |
+| 2 | 切头 `... seq (h d) -> ... h seq d` | `... h seq d_k` |
+| 3 | **RoPE 只作用于 Q、K** | 不变 |
+| 4 | 因果 mask + §3.11 引擎 | `... h seq d_v` |
+| 5 | 合头 `... h seq d -> ... seq (h d)` | `... seq d_model` |
+| 6 | $W_O$ | `... seq d_model` |
+
+#### 两条 handout 明写的约束
+
+**① 因果 mask**：位置 $i$ 只能看 $j \le i$。用 `torch.triu` 或广播的下标比较造出来，然后**直接交给 §3.11 的引擎**——它已经支持 mask，不要在这里另写一套屏蔽逻辑。
+mask 形状是 `seq × seq`，要能广播到 `... h seq seq`（heads 之间共用同一个 mask）。
+
+**② RoPE 只给 Q、K，不给 V**，而且 **head 维度当作 batch 处理**——每个头施加的是**完全相同**的旋转。
+理由：RoPE 编码的是**位置**，位置是 token 的属性，与"第几个头"无关。V 不参与打分（打分只由 $QK^\top$ 决定），所以旋转 V 没有意义。
+
+> 为什么"旋转 Q 和 K"能编码**相对**位置：RoPE 让 $\langle R_m q,\ R_n k\rangle$ 只依赖 $m-n$（§3.9）。而 attention 的打分正是 $q\cdot k$ ⇒ 位置信息以相对形式进入打分，V 完全不受影响。
+
+### 3.13 阶段性小结
 
 已完成 Linear、Embedding、RMSNorm、SwiGLU、RoPE、Softmax、Scaled Dot-Product Attention。
-**进行中**：MultiHeadAttention——把 d_model 切成 `num_heads` 份，四个投影（q/k/v/o），`rearrange` 出 heads 维度，
-对 Q/K 施加 RoPE，调用 §3.11 的引擎，再 `rearrange` 拼回 d_model。
+**进行中**：MultiHeadSelfAttention（公式与形状已理顺，见 §3.12）。
 
 从这些小题里提炼出的方法论，后面继续用：
 

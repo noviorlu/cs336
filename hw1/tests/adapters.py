@@ -148,7 +148,16 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads)
+    state_dict = {
+        "q_proj.weight": q_proj_weight,
+        "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight,
+        "output_proj.weight": o_proj_weight,
+    }
+    mha.load_state_dict(state_dict)
+    return mha(x=in_features)
+
 
 
 def run_multihead_self_attention_with_rope(
@@ -188,7 +197,15 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, theta=theta)
+    state_dict = {
+        "q_proj.weight": q_proj_weight,
+        "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight,
+        "output_proj.weight": o_proj_weight,
+    }
+    mha.load_state_dict(state_dict)
+    return mha(x=in_features, token_positions=token_positions)
 
 
 def run_rope(
@@ -390,7 +407,7 @@ def run_rmsnorm(
         RMSNorm of the `in_features`.
     """
     rmsnorm = RMSNorm(d_model=d_model, eps=eps, device=weights.device, dtype=weights.dtype)
-    rmsnorm.load_state_dict({"scale": weights})
+    rmsnorm.load_state_dict({"weight": weights})
     return rmsnorm(in_features)
 
 
