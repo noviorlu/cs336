@@ -263,4 +263,19 @@ class MultiHeadSelfAttention(nn.Module):
 
         return self.output_proj(o) # ... seq_len d_model
 
+class TransformerBlock(nn.Module):
+    def __init__(
+        self, 
+    ) -> None:
+        super().__init__()
 
+
+
+
+
+
+
+
+
+
+        

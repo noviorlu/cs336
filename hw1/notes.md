@@ -1311,10 +1311,91 @@ mask 形状是 `seq × seq`，要能广播到 `... h seq seq`（heads 之间共�
 
 > 为什么"旋转 Q 和 K"能编码**相对**位置：RoPE 让 $\langle R_m q,\ R_n k\rangle$ 只依赖 $m-n$（§3.9）。而 attention 的打分正是 $q\cdot k$ ⇒ 位置信息以相对形式进入打分，V 完全不受影响。
 
+#### 因果 mask 建在哪：`__init__` 还是 forward
+
+三种做法在生产里都跑过，所以问题不是"哪个对"，而是"什么决定了选哪个"：
+
+| 做法 | 代表 | 建的次数 |
+|---|---|---|
+| `__init__` 预建 buffer，forward 切片 | GPT-2（`register_buffer("bias", tril(...))`，用时 `[:,:,:T,:T]`） | 一次 |
+| forward 现造 | Llama 参考实现，每次 `full + triu` | 每步每层 |
+| **根本不物化** | FlashAttention / `F.scaled_dot_product_attention(is_causal=True)` | 从不 |
+
+**判据只有一条：mask 依赖形状，还是依赖数据？**
+
+- 纯因果 mask 只依赖 `seq_len` 一个整数 ⇒ 完全静态 ⇒ 可以预建
+- padding / sliding window / packed sequence 依赖这一批数据 ⇒ 只能 runtime
+
+而真实模型几乎总要把两者相与，所以 Llama 走 runtime **不是因为预建不好，是因为它的 mask 本来就不是纯静态的**。
+
+**预建的代价在层数上**（bool，$O(L^2)$；对比 RoPE 表的 $O(L\,d_k)$）：
+
+| $L$ | 单个 mask | ×32 层 | RoPE 表（$d_k{=}128$） |
+|---|---|---|---|
+| 256 | 64 KB | 2 MB | 32 KB |
+| 8192 | 64 MiB | **2 GiB** | 4 MB |
+
+⇒ 一个线性、一个平方。**要预建也该在模型级共享，而不是每层各存一份。**
+
+两条延伸：
+
+- **GPT-2 的 `attn.bias` 最初忘了 `persistent=False`**，那个下三角矩阵被写进了 checkpoint，HF 至今要在 `_keys_to_ignore_on_load_missing` 里过滤。呼应 §3.3 坑 3——**由形状唯一决定的常量不该进 state_dict**。
+- **显式 mask 张量和 FlashAttention 互斥。** FlashAttention 的全部意义是永不物化 $S\times S$ 的打分矩阵；你递给它一个 $S\times S$ 的 mask，就把 $O(S^2)$ 显存搬了回来。所以现代接口把因果性表达成一个 **flag**，让 kernel 在分块循环里用下标比较跳过。
+
+**本作业的选择**：§3.11 的引擎只接受物化的张量，第三条路关掉了。而 forward 里 `x.shape[-2]` 唾手可得 ⇒ **不需要从 `__init__` 传 `max_seq_len` 进来**——非 RoPE 那条适配器恰好也不传它。
+
+> 教训：差点把一个 forward 里本来就有的信息，改成从构造函数传入。**信息在哪一层可得，就在哪一层取**；往上提会凭空制造一个"那条路径没有这个参数"的问题。
+
+#### mask 的两种约定：布尔 vs 加性浮点
+
+PyTorch 的 SDPA 两种都支持，**而它们的"保留"值正好相反**：
+
+| | 布尔 | 加性浮点 |
+|---|---|---|
+| 写法 | `masked_fill(~mask, -inf)` | `scores + mask` |
+| **保留** | `True` | **`0.0`** |
+| 代表 | nanoGPT、PyTorch 默认 | HF Transformers 传统实现 |
+
+**最阴的坑**：`mask == False` 对浮点张量的含义是 `mask == 0.0`。所以一个标准加性 mask 传进来，会被**完全反向**解读——该保留的全屏蔽、该屏蔽的全放行，**且不报错**。用 `~mask` 代替 `mask == False`，float 会直接抛异常。
+
+另外三条：
+
+- **HF 用 `torch.finfo(dtype).min` 而不是 `-inf`**（`-inf` 参与算术易出 NaN）。但它自己有坑：因果 mask + padding mask 都用 `finfo.min`，**相加会溢出成 `-inf`**。
+- **mask 必须加在 `/√d_k` 之后**，否则连 mask 值一起被除。用 `finfo.min` 时除完仍极负，所以"看起来对"——又一个"恰好对"。
+- **整行全屏蔽 → NaN**：`x_max = -inf`，`x - x_max = -inf - (-inf) = nan`。纯因果不会触发（对角线保底），**一旦叠加 padding mask 就会**。
+
+**布尔是加性的特例**（bias 只取 0 或 $-\infty$）。加性能表达布尔表达不了的东西——**ALiBi** 的距离斜坡、**T5 的相对位置偏置**，这些是"部分抑制"而非"完全屏蔽"。业界的分化由此而来：只做因果就用布尔（或干脆不物化），要注入位置偏置就用加性。
+
+#### 一次静态扫描：六个静默失败
+
+MHA 写完后做的一次通读，抓到六个**测试不一定能拦住**的问题。列在这里不是为了记结论，是为了记**它们的共同结构**。
+
+| # | 症状 | 机制 | 为什么哑 |
+|---|---|---|---|
+| 1 | RoPE 完全没生效 | 调用点 `mha(x, token_positions)` 把位置传进了 `mask` 形参 | 形参默认值让漏传合法；Int 张量进 `mask == False` 变成"屏蔽 key 0 那一列"，形状全合法 |
+| 2 | **因果性泄漏** | `if mask is None: mask = causal` —— 一传外部 mask 因果性就没了 | 表现是 **loss 掉得异常漂亮**，会去怀疑 lr / 数据 / 初始化 |
+| 3 | RoPE 静默跳过 | `if rope is not None and token_positions is not None` | 触发点在**下一道题**：`run_transformer_block` 的签名里没有 `token_positions`，但它要求用 RoPE |
+| 4 | RoPE 旋转错位 | positions 无 head 维，右对齐时 batch 撞上 $h$ | 测试传 `[1, seq]` 才侥幸对；conftest 里 `batch = heads = 4`，传 `[batch, seq]` 会**静默算错而不是报错** |
+| 5 | `*` 当逻辑与用 | bool 上结果正确，但对非 bool 静默做算术 | `&` 会直接抛类型错误 |
+| 6 | RMSNorm gain 未初始化 | `torch.empty` 后没有 `ones_` | 测试一律 `load_state_dict` 覆盖它 ⇒ 全绿；从零训练第一步 NaN |
+
+**六个里有五个的共同结构：降级路径不出声。** "参数没传就用默认"、"没有 mask 就用因果"、"没有位置就跳过 RoPE"——每一条单独看都像是贴心的容错，合起来就是一张让错误安静穿过的网。
+
+四条可直接复用的做法：
+
+1. **把隐含契约变成运行时断言。** 注解写了 `Bool` 但 `mask == False` 接受任何 dtype，类型系统拦不住（jaxtyping 默认不做运行时检查）。**一条 dtype 断言能让 #1 在第一次调用就崩，而不是变成一个跑得通的错数。**
+2. **用运算符的类型约束代替记忆。** `&` 不接受 float、`~` 不接受 float ⇒ 选它们等于免费拿到 #5 和加性 mask 反转的防护。这比"记住要检查 dtype"可靠。
+3. **缺省值应该是"补全"，不是"跳过"。** #3 的正解是位置缺省时按 `arange(seq_len)` 生成——但要知道**这只在一次喂完整序列时成立**；增量解码（KV cache）时第一个 token 的位置是 `past_len` 而不是 0，HF 就是从 `past_key_values_length` 算的。**默认值是假设，不是恒等式。**
+4. **约束写在制造它的那一层。** #4 的断言该放在 MHA 而不是 RoPE：`[batch, seq]` 的 positions 对 RoPE 本身完全安全（`run_rope` 直接调用时四维对四维），**是 MHA 塞进 head 维之后才产生的风险**。写进 RoPE 会平白削弱一个更通用的组件。
+
+最后一条对照，说明为什么值得给 mask 和 positions 补断言：
+
+> 同一次改名（`o_proj → output_proj`、`scale → weight`），漏改适配器会让 `load_state_dict(strict=True)` **立刻抛异常并列出 missing / unexpected 的 key**；而上面六个是"跑得通但算错"。**同样是不匹配，一个有 strict 检查、一个没有，调试成本差两个数量级。**
+
 ### 3.13 阶段性小结
 
-已完成 Linear、Embedding、RMSNorm、SwiGLU、RoPE、Softmax、Scaled Dot-Product Attention。
-**进行中**：MultiHeadSelfAttention（公式与形状已理顺，见 §3.12）。
+已完成 Linear、Embedding、RMSNorm、SwiGLU、RoPE、Softmax、Scaled Dot-Product Attention、MultiHeadSelfAttention。
+**下一步**：Transformer block 和完整 LM（handout §3.5 / §3.6）。
 
 从这些小题里提炼出的方法论，后面继续用：
 
@@ -1323,8 +1404,10 @@ mask 形状是 `seq × seq`，要能广播到 `... h seq seq`（heads 之间共�
 3. **测试覆盖不到的地方要自己兜**：初始化、device/dtype 一致性、数学不变量。这是 §2.9"绿灯不等于证明"在这一章的延续。
 4. **形状断言优先于打印。** 断言让 bug 在产生的地方就炸，而不是三层之后。
 5. **toy 尺寸手算。** 抽象规则看不懂的时候，造一个小到能手算的例子跑一遍（§3.6 那张 4×3 的表就是这么来的），比看十遍解释管用。
-6. **"恰好对"不是"真的对"。** `v.shape[-1]` 在 $d_k=d_v$ 时给出正确的数，但理由是错的（§3.11 坑 1）。理由错的代码会在假设变化时静默失效。
-7. **分层要守住**：底层组件只承诺自己那层的语义，不假设调用方怎么组织数据（RoPE 不进 SDPA、`...` 泛化前导维度让 MHA 免费复用）。
+6. **"恰好对"不是"真的对"。** 已经出现三次：`v.shape[-1]` 在 $d_k=d_v$ 时对（§3.11 坑 1）、RoPE 的 positions 在测试传 `[1,seq]` 时对（§3.12）、`finfo.min` 被 $\sqrt{d_k}$ 除完仍够负。**理由错的代码会在假设变化时静默失效**，而不是报错。
+7. **分层要守住**：底层组件只承诺自己那层的语义，不假设调用方怎么组织数据（RoPE 不进 SDPA、`...` 泛化前导维度让 MHA 免费复用）。反过来，**约束也要写在制造它的那一层**——head 维引起的广播风险属于 MHA，不属于 RoPE。
+8. **警惕"贴心的容错"。** `if x is None: 跳过` 这类降级路径，单看都像健壮性，合起来是一张让错误安静穿过的网（§3.12 那六个静默失败里占了五个）。**缺省应该是"补全"而不是"跳过"**，补不出来就报错。
+9. **让运算符替你检查类型。** `&` / `~` 不接受 float，`*` / `== False` 接受——选前者等于免费拿到一层防护，比"记得检查 dtype"可靠。
 
 ---
 
