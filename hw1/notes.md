@@ -1139,17 +1139,69 @@ $$\frac{\exp(v_i - c)}{\sum_j \exp(v_j - c)} = \frac{e^{-c}\exp(v_i)}{e^{-c}\sum
 
 顺带一提，`torch.softmax` 内部就是这么做的——自己实现一遍的价值在于知道它为什么这么做。
 
-### 3.11 阶段性小结
+### 3.11 Scaled Dot-Product Attention
 
-已完成 Linear、Embedding、RMSNorm 和 SwiGLU。
+$$\text{Attention}(Q,K,V)=\text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}+\text{Mask}\right)V$$
 
-从这几道小题里提炼出五条方法论，后面继续用：
+形状：`q: ... queries d_k`、`k: ... keys d_k`、`v: ... keys d_v` → 输出 `... queries d_v`。
+用 `einsum` 而不是 `@`：前面的 `...` 里可能有 batch、也可能有 heads（§3.12 会多塞一维进来），`einsum` 按名字对齐，不用关心到底有几个前导维度。
+
+#### 三个概念问题
+
+**① softmax 沿哪个维度？——`dim=-1`，也就是 keys。**
+
+打分矩阵是 `[..., queries, keys]`：**行 = 一个 query 对所有 key 的打分**。
+"注意力"的本质是分配权重：固定一个 query，它分给所有候选 key 的权重之和必须是 1 ⇒ 沿**列**（最后一维）归一化。
+沿 queries 归一化没有意义——那会变成"所有 query 对同一个 key 的竞争"，不是 attention 的语义。
+
+**② mask 为什么必须是 $-\infty$，不能相乘。**
+
+直觉上"把不该看的位置乘 0"是错的：
+
+$$\text{softmax 之前置 } 0 \;\Longrightarrow\; e^{0}=1$$
+
+被乘成 0 的位置在 softmax 里得到的是 $e^0=1$，**不但没被屏蔽，反而拿到了不小的权重**——比那些真实得分为负的位置还高。要让 softmax 输出 0，必须在**进 softmax 之前**把它变成 $-\infty$（$e^{-\infty}=0$），用 `masked_fill`。
+
+> ⚠️ mask 的布尔约定要**去测试里核对**：`True` 是"保留"还是"屏蔽"，两种约定都有人用，弄反了整个注意力就翻过来了。这属于"契约不在类型里、只在文档/测试里"的一类坑。
+
+**③ RoPE 不在这一层。**
+
+这个函数是**纯计算引擎**：给我 Q、K、V 和 mask，我按公式算。至于 Q、K 有没有加绝对位置编码、有没有做 RoPE 旋转、有没有 ALiBi 偏置——它一概不问。
+
+RoPE（§3.9）是在 **MultiHeadAttention 内部、投影和切头之后、调用本函数之前**，**只对 Q 和 K** 施加的。保持这层的纯粹性，换位置编码方案时这个函数一行都不用改。
+
+#### 踩过的四个坑
+
+| # | 写法 | 问题 |
+|---|---|---|
+| 1 | `/ Tensor.sqrt(v.dim[-1])` | `.dim` 是**方法**、返回维度**个数**不是大小，要 `.shape[-1]`；`Tensor.sqrt` 吃张量不吃 int，标量用 `math.sqrt`。另外公式里是 $\sqrt{d_k}$，该取 `q.shape[-1]`——虽然通常 $d_k=d_v$，但取 v 是**恰好对而不是真的对** |
+| 2 | `maskQK = mask * QK` | 见上面 ②，$e^0=1$ |
+| 3 | 没判断 `mask is None` | 推理时不传 mask，`None * QK` 直接 `TypeError` |
+| 4 | 算了 `maskQK` 却把 `QK` 传进 softmax | **算了没用**。这类 bug 最阴——不报错，结果只是"看起来差不多"，得靠测试或对拍才发现 |
+
+第 1 和第 4 条有个共同教训：**"恰好对"和"真的对"要分开**。`v.shape[-1]` 在 $d_k=d_v$ 时给出正确的数，但理由是错的；哪天用了 $d_k \neq d_v$ 的变体（比如 MQA/GQA 里 V 的维度不同）就会静默出错。
+
+#### 这一层的接口设计值得单独记
+
+`scaled_dot_product_attention` 的形状签名全用 `...` 泛化前导维度，带来一个后面直接兑现的好处：**MultiHeadAttention 把 heads 切出来当成一个额外的前导维度之后，可以原样调用它，一行都不用改**——`heads` 被自动当作 batch 处理。
+
+这是"**让底层组件对上层的组织方式无知**"的一个具体例子，和 §2 里 `COMPILED_PAT` 能同时被训练和 encode 复用是同一种性质：**接口只承诺自己那一层的语义，不假设调用方怎么组织数据。**
+
+### 3.12 阶段性小结
+
+已完成 Linear、Embedding、RMSNorm、SwiGLU、RoPE、Softmax、Scaled Dot-Product Attention。
+**进行中**：MultiHeadAttention——把 d_model 切成 `num_heads` 份，四个投影（q/k/v/o），`rearrange` 出 heads 维度，
+对 Q/K 施加 RoPE，调用 §3.11 的引擎，再 `rearrange` 拼回 d_model。
+
+从这些小题里提炼出的方法论，后面继续用：
 
 1. **命名先行。** 模块树的属性名必须和参考实现的 state_dict 对齐。这是一个成本单调递增的决定：现在改是零成本，越晚改越贵。
 2. **让错误尽早、尽响地暴露。** 用契约（签名给的维度）而不是数据（`weights.shape`）去构造模块；保持 `strict=True`；device 和 dtype 在构造时对齐。**响的错误比哑的错误便宜一个数量级。**
 3. **测试覆盖不到的地方要自己兜**：初始化、device/dtype 一致性、数学不变量。这是 §2.9"绿灯不等于证明"在这一章的延续。
 4. **形状断言优先于打印。** 断言让 bug 在产生的地方就炸，而不是三层之后。
 5. **toy 尺寸手算。** 抽象规则看不懂的时候，造一个小到能手算的例子跑一遍（§3.6 那张 4×3 的表就是这么来的），比看十遍解释管用。
+6. **"恰好对"不是"真的对"。** `v.shape[-1]` 在 $d_k=d_v$ 时给出正确的数，但理由是错的（§3.11 坑 1）。理由错的代码会在假设变化时静默失效。
+7. **分层要守住**：底层组件只承诺自己那层的语义，不假设调用方怎么组织数据（RoPE 不进 SDPA、`...` 泛化前导维度让 MHA 免费复用）。
 
 ---
 
