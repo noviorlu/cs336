@@ -11,7 +11,7 @@ from torch import Tensor
 import cs336_basics.bpe_tokenizer as bpe_tokenizer
 from cs336_basics.transformer import *
 
-
+# V
 def run_linear(
     d_in: int,
     d_out: int,
@@ -34,7 +34,7 @@ def run_linear(
     linear.load_state_dict({"weight": weights})
     return linear(in_features)
 
-
+# V
 def run_embedding(
     vocab_size: int,
     d_model: int,
@@ -57,7 +57,7 @@ def run_embedding(
     embedding.load_state_dict({"weight": weights})
     return embedding(token_ids)
 
-
+# V
 def run_swiglu(
     d_model: int,
     d_ff: int,
@@ -95,7 +95,7 @@ def run_swiglu(
     })
     return swiglu(in_features)
 
-
+# V
 def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys d_k"],
@@ -116,7 +116,7 @@ def run_scaled_dot_product_attention(
     """
     return scaled_dot_product_attention(Q, K, V, mask)
 
-
+# V
 def run_multihead_self_attention(
     d_model: int,
     num_heads: int,
@@ -156,10 +156,12 @@ def run_multihead_self_attention(
         "output_proj.weight": o_proj_weight,
     }
     mha.load_state_dict(state_dict)
-    return mha(x=in_features)
+    
+    seq_len = in_features.shape[-2]
+    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device))
+    return mha(x=in_features, mask=causal_mask)
 
-
-
+# V
 def run_multihead_self_attention_with_rope(
     d_model: int,
     num_heads: int,
@@ -205,9 +207,16 @@ def run_multihead_self_attention_with_rope(
         "output_proj.weight": o_proj_weight,
     }
     mha.load_state_dict(state_dict)
-    return mha(x=in_features, token_positions=token_positions)
+    
+    seq_len = in_features.shape[-2]
+    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device))
+    
+    if token_positions is None:
+        token_positions = torch.arange(seq_len, device=in_features.device)
+        
+    return mha(x=in_features, mask=causal_mask, token_positions=token_positions)
 
-
+# V
 def run_rope(
     d_k: int,
     theta: float,
@@ -230,7 +239,7 @@ def run_rope(
     rope_layer = RoPE(theta, d_k, max_seq_len, in_query_or_key.device)
     return rope_layer(in_query_or_key, token_positions)
 
-
+# V
 def run_transformer_block(
     d_model: int,
     num_heads: int,
@@ -309,9 +318,14 @@ def run_transformer_block(
         theta=theta,
     )
     block.load_state_dict(weights, strict=True)
-    return block(x=in_features)
+    
+    seq_len = in_features.shape[-2]
+    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device))
+    token_positions = torch.arange(seq_len, device=in_features.device)
+    
+    return block(x=in_features, mask=causal_mask, token_positions=token_positions)
 
-
+# V
 def run_transformer_lm(
     vocab_size: int,
     context_length: int,
@@ -391,9 +405,19 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+    )
+    model.load_state_dict(weights, strict=True)
+    return model(x=in_indices)
 
-
+# V
 def run_rmsnorm(
     d_model: int,
     eps: float,
@@ -418,7 +442,7 @@ def run_rmsnorm(
     rmsnorm.load_state_dict({"weight": weights})
     return rmsnorm(in_features)
 
-
+# V
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     """Given a tensor of inputs, return the output of applying SiLU
     to each element.
@@ -577,7 +601,7 @@ def run_load_checkpoint(
     """
     raise NotImplementedError
 
-
+# v
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
@@ -600,7 +624,7 @@ def get_tokenizer(
     """
     return bpe_tokenizer.Tokenizer(vocab, merges, special_tokens)
 
-
+# v
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
