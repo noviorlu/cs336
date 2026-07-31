@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import math
 from einops import einsum, rearrange
-import einx
 from jaxtyping import Float, Int, Bool
 from torch import Tensor
 
@@ -344,25 +343,5 @@ class TransformerLM(nn.Module):
 
         # Return the unnormalized logits (no softmax applied!)
         return self.lm_head(self.ln_final(hidden_states))
-
-def cross_entropy(o: Float[Tensor, "... vocab_size"], t: Int[Tensor, "..."]) -> Float[Tensor, ""]:                      
-    M = einx.max("... v -> ...", o)                                                                     
-    shifted = einx.subtract("... v, ... -> ... v", o, M)
-
-    o_t = einx.get_at("... [v], ... -> ...", o, t)  
-    log_sum_exp = torch.log(einx.sum("... v -> ...", torch.exp(shifted))) 
-
-    return (M - o_t + log_sum_exp).mean() 
-
-
-
-
-
-
-
-
-
-
-
 
 

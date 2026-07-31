@@ -10,6 +10,7 @@ from torch import Tensor
 
 import cs336_basics.bpe_tokenizer as bpe_tokenizer
 from cs336_basics.transformer import *
+from cs336_basics.optimizer import *
 
 # V
 def run_linear(
@@ -496,7 +497,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
     """
     return softmax(in_features, dim)
 
-
+# V
 def run_cross_entropy(
     inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
 ) -> Float[Tensor, ""]:
@@ -514,7 +515,7 @@ def run_cross_entropy(
     """
     return cross_entropy(inputs, targets)
 
-
+# V
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
@@ -524,16 +525,16 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    gradient_clipping(parameters, max_l2_norm)
 
-
+# V
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
-
+# V
 def run_get_lr_cosine_schedule(
     it: int,
     max_learning_rate: float,
@@ -559,7 +560,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return get_lr_cosine_schedule(it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters)
 
 
 def run_save_checkpoint(
@@ -578,7 +579,12 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration,
+    }
+    torch.save(checkpoint, out)
 
 
 def run_load_checkpoint(
@@ -599,7 +605,10 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['iteration']
 
 # v
 def get_tokenizer(
