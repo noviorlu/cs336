@@ -480,7 +480,7 @@ def run_get_batch(
     """
     raise NotImplementedError
 
-
+# V
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     """
     Given a tensor of inputs, return the output of softmaxing the given `dim`
@@ -512,7 +512,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:

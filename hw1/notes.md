@@ -755,13 +755,17 @@ BPE 部分的 34 分全部拿下。产出的四个 `.npy` 文件就是后面训�
 | Embedding | 1 | ✅ |
 | RMSNorm | 1 | ✅ |
 | SwiGLU 前馈网络 | 2 | ✅ |
-| RoPE | 2 | ⬜ |
-| softmax | 1 | ⬜ |
-| 缩放点积注意力 | 5 | ⬜ |
-| 因果多头自注意力 | 5 | ⬜ |
-| Transformer Block | 3 | ⬜ |
-| 完整 Transformer LM | 3 | ⬜ |
-| 资源估算（书面） | 5 | ⬜ |
+| RoPE | 2 | ✅ |
+| softmax | 1 | ✅ |
+| 缩放点积注意力 | 5 | ✅ |
+| 因果多头自注意力 | 5 | ✅ |
+| Transformer Block | 3 | ✅ |
+| 完整 Transformer LM | 3 | ✅ |
+| 资源估算（书面） | 5 | ✅ |
+
+`pytest tests/test_model.py` → **13 passed**。
+
+> **编号说明**：本笔记的 `§3.x` 是**笔记自己的编号**，和 handout 的章节号不是一套。引用 handout 时一律写成 `handout §x.y`。对照：笔记 §3.5/§3.6 = handout §3.3.2/§3.3.3，笔记 §3.7–§3.12 = handout §3.4.1–§3.4.5，笔记 §3.13/§3.14 = handout §3.5。
 
 ### 3.1 整体地图
 
@@ -1762,6 +1766,194 @@ T->inf   : -> d/h = d_k = 64
 
 ---
 
-## 4. 待续
+## 4. 训练：损失与优化器
 
-后面是训练部分（cross-entropy、AdamW、学习率调度、梯度裁剪）、训练循环、文本生成和一系列消融实验。开始做的时候继续记。
+对应 handout §4。这一章的小问题：cross-entropy、SGD/AdamW、学习率调度、梯度裁剪、数据加载、checkpoint、训练循环。
+
+### 4.1 Cross-Entropy Loss
+
+#### 一次前向产出 $m$ 个训练信号
+
+模型在每个位置 $i$ 吐出 logits $o_i \in \mathbb{R}^V$，$\text{softmax}(o_i)$ 就是它对"第 $i+1$ 个 token 是谁"的分布。handout 强调的那句括号注很关键：
+
+> a single forward pass yields $p_\theta(x_{i+1}\mid x_{1:i})$ for **all** $i=1,\dots,m$
+
+**这是因果 mask 的回报。** 位置 $i$ 看不见 $i+1$ 之后，所以每个位置都是一道合法的"预测下一个"。没有因果 mask，位置 $i$ 直接能看到答案，这 $m$ 道题**全部作废**——这就是 §3.12 那条因果性泄漏为什么是最高危故障：它不会崩，只会让 loss 掉得异常漂亮。
+
+#### 推导一：从极大似然到 NLL
+
+目标是让训练语料在模型眼里概率最大：
+
+$$\max_\theta \ \prod_{i=1}^{m} p_\theta(x_{i+1}\mid x_{1:i})$$
+
+连乘上万项极小的数必然下溢 ⇒ 取 $\log$ 变连加；优化器只会最小化 ⇒ 取负：
+
+$$\min_\theta \ \sum_{i=1}^{m} -\log p_\theta(x_{i+1}\mid x_{1:i})$$
+
+对整个数据集平均，就是 handout 式 (16)：
+
+$$\ell(\theta;D)=\frac{1}{|D|\,m}\sum_{x\in D}\sum_{i=1}^{m} -\log p_\theta(x_{i+1}\mid x_{1:i})$$
+
+> **交叉熵在这里不是"被挑中的损失函数设计"，它就是极大似然本身。**
+
+#### 推导二：$p_\theta$ 到底是什么——softmax 是模型的**定义**
+
+推导一给出的是 $-\log p_\theta(x_{i+1}\mid x_{1:i})$。但**模型的 forward 根本不输出 $p$，它输出的是 logits** $o_i\in\mathbb{R}^V$（§3.13：必须返回未归一化的 logits）。
+
+两者的关系是**模型的定义**，不是推导出来的结论——handout 式 (17)：
+
+$$p_\theta(x_{i+1}\mid x_{1:i}) \;:=\; \text{softmax}(o_i)[x_{i+1}] \;=\; \frac{\exp\big(o_i[x_{i+1}]\big)}{\sum_{a=1}^{V}\exp\big(o_i[a]\big)}$$
+
+三样东西要分清：
+
+| 记号 | 是什么 | 性质 |
+|---|---|---|
+| $o_i \in \mathbb{R}^V$ | forward 的原始输出 | **任意实数**，可正可负、和不为 1，**没有概率含义** |
+| $\text{softmax}(o_i)$ | 归一化后的向量 | 每项 $>0$、和为 $1$，**是一个合法分布** |
+| $[\,k\,]$ | 取第 $k$ 个分量 | handout 脚注 6：$o_i[k]$ = 向量 $o_i$ 的第 $k$ 个元素 |
+
+所以 $\text{softmax}(o_i)[x_{i+1}]$ 读作：**"模型分给真实答案那个 token 的概率"**。
+
+代回推导一：
+
+$$\ell_i \;=\; -\log p_\theta(x_{i+1}\mid x_{1:i}) \;=\; -\log\ \text{softmax}(o_i)\big[x_{i+1}\big]$$
+
+单个位置上简记 $o := o_i$、$t := x_{i+1}$（target 下标），就得到推导四的起点：
+
+$$\ell \;=\; -\log\ \text{softmax}(o)[t]$$
+
+**为什么偏偏用 softmax 做这座桥**（把实数向量变成分布的方法不止一种）：
+
+1. **$\exp$ 严格为正** ⇒ 分母恒 $>0$、每项恒 $>0$ ⇒ 外面的 $\log$ 永远有定义
+2. **配上 $-\log$ 后梯度化简成"预测减真实"**（见下面梯度一节）——这是 exp 族独有的
+3. **平移不变**：$\text{softmax}(o+c\mathbf{1})=\text{softmax}(o)$
+
+> 第 3 条不只是个漂亮性质——**它就是推导四里"减最大值"合法的根本原因**。给所有 logit 减去同一个 $M$，模型定义的那个分布**一个字都没变**，所以那不是近似、不是 trick，是恒等变形。
+
+#### 推导三：为什么叫 "cross-entropy"
+
+信息论定义（真实分布 $p$、模型分布 $q$）：
+
+$$H(p,q)=-\sum_{a=1}^{V} p(a)\log q(a)$$
+
+而语言模型每个位置**只观测到一个 token** $t=x_{i+1}$ ⇒ 真实分布是 one-hot（handout 脚注 7 称 Dirac delta）：
+
+$$p(a)=\mathbb{1}[a=t] \quad\Longrightarrow\quad H(p,q)=-\log q(t)$$
+
+**整个求和塌成一项。** 所以"交叉熵"和"负对数似然"在这里是同一个东西，只是来自两个思想传统，名字用了信息论那个。
+
+#### 推导四：数值稳定形式（这是要实现的）
+
+起点是推导二的结果（$o$ 是这个位置的 logits，$t$ 是正确类别下标）：
+
+$$\ell = -\log\ \text{softmax}(o)[t] = -\log \frac{\exp(o[t])}{\sum_{a=1}^{V}\exp(o[a])}$$
+
+**第一步——$\log$ 和 $\exp$ 相消**（handout 的 "cancel out log and exp"）：
+
+$$\ell = -\underbrace{\log \exp(o[t])}_{=\ o[t]} + \log\sum_{a=1}^{V}\exp(o[a]) \;=\; -o[t] + \log\sum_{a=1}^{V}\exp(o[a])$$
+
+⇒ **式子里再也没有 softmax 了，一个概率都不用算出来。** 这正是 §3.13 说"必须交出 logits"的兑现点。
+
+**第二步——减最大值**。令 $M=\max_a o[a]$，把 $e^M$ 提出来：
+
+$$\log\sum_a \exp(o[a]) = \log\Big(e^{M}\sum_a e^{o[a]-M}\Big) = M + \log\sum_a \exp(o[a]-M)$$
+
+**最终形式：**
+
+$$\boxed{\ \ell = \big(M - o[t]\big) + \log\sum_{a=1}^{V}\exp\big(o[a]-M\big)\ }$$
+
+#### 怎么读这个式子：两项各自在说什么
+
+**先看 $t$ 出现在哪** —— 整个式子里**只有一处**：$o[t]$。$M$ 和那个求和都只用到完整的 logit 向量，与 $t$ 无关。
+
+> ⇒ 这就是为什么代码里 `targets` **只在 gather 那一步出现**。整数下标对损失的全部影响，压缩在 $o[t]$ 这一个标量里。
+
+$$\ell \;=\; \underbrace{\big(M - o[t]\big)}_{\text{正确答案比首选差多少}} \;+\; \underbrace{\log\sum_{a}\exp\big(o[a]-M\big)}_{\text{模型整体有多不确定}}$$
+
+| 项 | 取值范围 | 含义 | 依赖 $t$？ |
+|---|---|---|---|
+| $M-o[t]$ | $[0,\ \infty)$ | $=0$ 表示模型的最高分**就是**正确答案；越大表示正确答案落后首选越多 | **是** |
+| $\log\sum_a e^{o[a]-M}$ | $[0,\ \ln V]$ | $\to 0$ 表示某个 logit 遥遥领先（极度自信）；$=\ln V$ 表示所有 logit 相等（完全不确定） | **否** |
+
+第二项范围的两端：所有 logit 相等 $\Rightarrow \sum = V \Rightarrow \log = \ln V$；单个 logit 独大 $\Rightarrow \sum \to 1 \Rightarrow \log \to 0$。
+
+#### 手算一个例子
+
+$$o = [0.1088,\ 0.1060,\ 0.6683,\ 0.5131,\ 0.0645],\qquad t=1,\qquad V=5$$
+
+$$M = 0.6683,\qquad \sum_a e^{o[a]-M} = 3.5443$$
+
+$$\ell = \underbrace{0.6683-0.1060}_{0.5623} + \underbrace{\ln 3.5443}_{1.2654} = 1.8277$$
+
+第二项 $1.2654$ 对比上限 $\ln 5 = 1.6094$ ⇒ **分布相当平，模型基本在瞎猜**。
+
+**由此立刻看出两件事：**
+
+**① 同一行里换个 $t$，第二项一动不动**，只有第一项变：
+
+| $t$ | 第一项 | 第二项 | $\ell$ |
+|---|---|---|---|
+| $2$（正好是 $\arg\max$） | $0$ | 1.2654 | **1.2654** ← 这一行的下限 |
+| $1$（实际答案） | 0.5623 | 1.2654 | 1.8277 |
+
+⇒ **这一行"猜对了也要付 1.2654"**，因为模型即使猜对也毫无把握。
+
+**② $\ell=0$ 需要两件事同时成立**
+
+$$\text{第一项}=0 \iff \text{正确答案就是最高分} \qquad\text{且}\qquad \text{第二项}=0 \iff \text{对它无限自信}$$
+
+**光猜对不够，还得笃定。** 这正是交叉熵和 accuracy 的根本差别——accuracy 只看第一项是不是 0，交叉熵还要罚第二项。也解释了为什么模型能在 accuracy 不变的情况下继续降 loss：它在把第二项压下去（变得更自信）。
+
+#### 为什么这个形式是安全的
+
+| | 保证 | 理由 |
+|---|---|---|
+| **不上溢** | $\exp(\cdot)\in(0,1]$ | $o[a]-M\le 0$ 恒成立 |
+| **不下溢成 $\log 0$** | $\sum_a e^{o[a]-M}\ \ge\ 1$ | $a=\arg\max$ 那一项贡献 $e^0=1$ |
+| **$\ell \ge 0$** | 两项都非负 | $M\ge o[t]$；$\log(\ge 1)\ge 0$ |
+
+最后一行是个免费的自检：**算出负的 loss 就一定是实现错了。**
+
+#### 梯度：为什么是它而不是别的
+
+对 logits 求导（直接从 $\ell=-o[t]+\log\sum_a e^{o[a]}$ 得到）：
+
+$$\frac{\partial \ell}{\partial o_a} = \text{softmax}(o)_a - \mathbb{1}[a=t]$$
+
+也就是**「预测分布」减「真实 one-hot」**。三个好性质：
+
+1. 形式极简，反向几乎零成本
+2. **有界在 $[-1,1]$**，不会爆
+3. **不饱和**——错得越离谱梯度越接近 1，学得越快
+
+对比 MSE + sigmoid：预测越离谱 sigmoid 越平、梯度越接近 0，**错得最狠时学得最慢**。交叉熵治的就是这个毛病。
+
+（accuracy 不可导，且丢掉置信度——"80% 对"和"51% 对"在它眼里一样。）
+
+#### 尺度参照与 perplexity
+
+loss 的单位是 **nats/token**，读作"模型平均每个 token 有多惊讶"。
+
+$$\text{perplexity}=\exp\Big(\frac{1}{m}\sum_{i=1}^{m}\ell_i\Big)$$
+
+含义：**模型实际上在多少个等可能选项之间做选择。**
+
+| 情形 | loss (nats) | perplexity |
+|---|---|---|
+| 均匀瞎猜（$V=10{,}000$） | $\ln V = 9.21$ | 10,000 |
+| TinyStories 训练好的小模型 | ~1.4–1.5 | ~4.1–4.5 |
+| 完全确定且正确 | 0 | 1 |
+
+> **$\ln(\text{vocab\_size})$ 是一个要认识的数字。** loss 卡在 9.21 一动不动 = 模型输出恒定、什么都没学到（§3.4 记过 gain 初始化成 0 就会这样）。看到这个数直接怀疑前向被切断，而不是去调 lr。
+
+#### 实现要点
+
+```
+inputs  : [..., V]      vocab 永远是最后一维，前面全是 batch-like
+targets : [...]         每个位置一个正确类别下标
+返回     : 标量          对所有 batch 维求平均
+```
+
+- **取 $o[t]$ 是"每行取不同的列"**，`inputs[targets]` 是错的（那是按行索引）。要用 `gather` 或高级索引 `[arange(N), targets]`
+- 归约沿 `dim=-1`（vocab），平均对前面所有维——和 §3.11 里 softmax 沿 keys 归一化是同一个约定：**语义维在最后，batch-like 维在前**
+- targets 是 inputs **右移一位**（$x[0{:}m]$ 对 $x[1{:}m{+}1]$），这条在 handout 后面的 `data_loading` 那题正式登场

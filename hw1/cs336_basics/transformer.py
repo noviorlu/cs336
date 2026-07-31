@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from einops import einsum, rearrange
+import einx
 from jaxtyping import Float, Int, Bool
 from torch import Tensor
 
@@ -18,8 +19,8 @@ class Linear(nn.Module):
             torch.empty((out_features, in_features), device=device, dtype=dtype)
         )
         std = (2 / (in_features + out_features)) ** 0.5
-        trunkate = - 3.0 * std, 3.0 * std
-        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=trunkate[0], b=trunkate[1])
+        truncate = - 3.0 * std, 3.0 * std
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=truncate[0], b=truncate[1])
 
     def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... out_features"]:
         return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
@@ -226,7 +227,7 @@ class MultiHeadSelfAttention(nn.Module):
     def forward(
         self,
         x: Float[Tensor, "... seq_len d_model"],                                                      
-        mask: Bool[Tensor, "... seq_len seq_len"] | None = None,
+        mask: Bool[Tensor, "... seq_len seq_len"],
         token_positions: Int[Tensor, "... seq_len"] | None = None
     ) -> Float[Tensor, "... seq_len d_model"]:
         q = self.q_proj(x) # ... seq_len d_model
@@ -279,7 +280,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: Float[Tensor, "... seq_len d_model"],
-        mask: Bool[Tensor, "... seq_len seq_len"] | None = None,
+        mask: Bool[Tensor, "... seq_len seq_len"],
         token_positions: Int[Tensor, "... seq_len"] | None = None
     ) -> Float[Tensor, "... seq_len d_model"]:
         # 1. Attention path
@@ -343,4 +344,25 @@ class TransformerLM(nn.Module):
 
         # Return the unnormalized logits (no softmax applied!)
         return self.lm_head(self.ln_final(hidden_states))
+
+def cross_entropy(o: Float[Tensor, "... vocab_size"], t: Int[Tensor, "..."]) -> Float[Tensor, ""]:                      
+    M = einx.max("... v -> ...", o)                                                                     
+    shifted = einx.subtract("... v, ... -> ... v", o, M)
+
+    o_t = einx.get_at("... [v], ... -> ...", o, t)  
+    log_sum_exp = torch.log(einx.sum("... v -> ...", torch.exp(shifted))) 
+
+    return (M - o_t + log_sum_exp).mean() 
+
+
+
+
+
+
+
+
+
+
+
+
 
