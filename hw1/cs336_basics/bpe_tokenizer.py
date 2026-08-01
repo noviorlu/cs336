@@ -431,6 +431,26 @@ def load_tokenizer(
         merges = [(a.encode("latin-1"), b.encode("latin-1")) for a, b in json.load(f)]
     return vocab, merges
 
+def lookup_token_id(
+    vocab_path: str | os.PathLike,
+    token: str = "<|endoftext|>",
+) -> int:
+    """从 vocab.json 里查一个 token 的 id，查不到就报错。
+
+    用途是让训练脚本不必手填文档分隔符的 id——它随词表变（TinyStories 10k 是
+    9999，OWT 32k 是 31999），手填错了不会崩，只会静默生成一份错误的 document
+    mask（那个 id 在另一套词表里往往是个普通 token，于是注意力被切在随机位置）。
+    只读 vocab，不加载 merges。
+    """
+    with open(vocab_path, encoding="utf-8") as f:
+        vocab = json.load(f)
+    target = token.encode("utf-8").decode("latin-1")
+    for i, s in vocab.items():
+        if s == target:
+            return int(i)
+    raise ValueError(f"{vocab_path} 里没有 token {token!r}（词表大小 {len(vocab)}）")
+
+
 # endregion 4. Serialization
 # ══════════════════════════════════════════════════════════════════════════════
 # region5. Tokenizer (§2.6)

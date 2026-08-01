@@ -7,10 +7,11 @@ import time
 import numpy as np
 import torch
 
-from cs336_basics.transformer import TransformerLM
+from cs336_basics.transformer import TransformerLM, build_attention_mask
 from cs336_basics.optimizer import AdamW, cross_entropy, get_lr_cosine_schedule, gradient_clipping
 from cs336_basics.checkpoint import save_checkpoint, load_checkpoint
 from cs336_basics.data import get_batch
+from cs336_basics.bpe_tokenizer import lookup_token_id
 
 
 # 评估用的种子偏移：和训练种子错开，保证 eval 的采样和训练的采样互不相关。
@@ -73,7 +74,7 @@ def prune_checkpoints(checkpoint_dir, keep_last_n):
     return removed
 
 
-def evaluate_loss(model, dataset, eval_iters, batch_size, context_length, device, seed, ctx):
+def evaluate_loss(model, dataset, eval_iters, batch_size, context_length, device, seed, ctx, doc_sep_id=None):
     model.eval()
     # 每次调用都从同一个种子重开，所以每个 eval point 看到的是完全相同的样本，
     # 曲线上的起伏才是模型在变，而不是采样噪声。
@@ -83,7 +84,10 @@ def evaluate_loss(model, dataset, eval_iters, batch_size, context_length, device
         for _ in range(eval_iters):
             x, y = get_batch(dataset, batch_size, context_length, device, rng=rng)
             with ctx:
-                logits = model(x)
+                seq_len = x.shape[-1]
+                mask = build_attention_mask(seq_len, x.device, x=x, doc_sep_id=doc_sep_id)
+                
+                logits = model(x, mask=mask)
                 loss = cross_entropy(logits, y)
             total += loss.item()
     model.train()
@@ -119,6 +123,12 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--doc_mask_vocab", type=str, default=None,
+                        help="词表 json 的路径（如 data/tinystories_vocab.json）。给了就启用 "
+                             "document mask：从词表里解析出 <|endoftext|> 的 id，挡住注意力跨越"
+                             "文档边界。代价是每步多一个 [B, 1, m, m] 的 bool 张量。"
+                             "不手填 id 是因为它随词表变（10k 是 9999、32k 是 31999），"
+                             "填错不会崩，只会静默生成一份错误的 mask")
 
     # Logging and Evaluation
     parser.add_argument("--eval_interval", type=int, default=500)
@@ -139,6 +149,15 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+    doc_sep_id = None
+    if args.doc_mask_vocab is not None:
+        doc_sep_id = lookup_token_id(args.doc_mask_vocab)
+        if doc_sep_id >= args.vocab_size:
+            raise SystemExit(
+                f"{args.doc_mask_vocab} 解析出的分隔符 id 是 {doc_sep_id}，"
+                f"超出 --vocab_size {args.vocab_size}——词表和数据配错了")
+        print(f"document mask 已启用，<|endoftext|> id = {doc_sep_id}")
 
     device = torch.device(args.device)
     is_cuda = device.type == "cuda"
@@ -230,7 +249,10 @@ def main():
         x, y = get_batch(train_data, args.batch_size, args.context_length, device,
                          rng=np.random.default_rng([args.seed, it]))
         with ctx:
-            logits = model(x)
+            seq_len = x.shape[-1]
+            mask = build_attention_mask(seq_len, x.device, x=x, doc_sep_id=doc_sep_id)
+            
+            logits = model(x, mask=mask)
             loss = cross_entropy(logits, y)
 
         # --- C. Backward Pass & Optimizer Step ---
@@ -256,9 +278,9 @@ def main():
         # --- E. Evaluation and Checkpointing（在这一步的更新之后）---
         if it % args.eval_interval == 0 or it == args.max_iters:
             train_loss = evaluate_loss(model, train_data, args.eval_iters, args.batch_size,
-                                       args.context_length, device, args.seed + EVAL_SEED_OFFSET, ctx)
+                                       args.context_length, device, args.seed + EVAL_SEED_OFFSET, ctx, doc_sep_id)
             val_loss = evaluate_loss(model, val_data, args.eval_iters, args.batch_size,
-                                     args.context_length, device, args.seed + EVAL_SEED_OFFSET + 1, ctx)
+                                     args.context_length, device, args.seed + EVAL_SEED_OFFSET + 1, ctx, doc_sep_id)
             print(f"Step {it}: train_loss {train_loss:.4f}, val_loss {val_loss:.4f}")
 
             # 先写临时文件再 rename：中途被打断也不会留下半截的 checkpoint

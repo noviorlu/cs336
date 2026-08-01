@@ -418,7 +418,11 @@ def run_transformer_lm(
         rope_theta=rope_theta,
     )
     model.load_state_dict(weights, strict=True)
-    return model(x=in_indices)
+    
+    seq_len = in_indices.shape[-1]
+    mask = build_attention_mask(seq_len, in_indices.device)
+    
+    return model(x=in_indices, mask=mask)
 
 # V
 def run_rmsnorm(

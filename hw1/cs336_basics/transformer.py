@@ -288,6 +288,39 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(self.ln2(x))
         return x
 
+def build_attention_mask(
+    seq_len: int,
+    device: torch.device | str,
+    x: Int[Tensor, "... seq_len"] | None = None,
+    doc_sep_id: int | None = None,
+) -> Bool[Tensor, "... 1 seq_len seq_len"]:
+    """构造注意力 mask，True 表示允许注意。
+
+    始终包含因果 mask；传了 x 和 doc_sep_id 就再叠加一层 document mask，
+    挡住注意力跨越文档边界。
+
+    返回值多出的那个长度为 1 的轴是给 num_heads 留的位置：MHA 的打分矩阵是
+    [..., h, seq, seq]，而广播是右对齐的，不给 head 留位就会让 batch 撞上 h。
+    留 1 而不是 expand 成 h，是为了让下游 masked_fill 里的 ~mask 只物化一份。
+    """
+    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
+    
+    if doc_sep_id is not None and x is not None:
+        # Build doc_mask on the fly
+        # doc_id[i] = 位置 i 属于窗口内的第几篇文档。
+        # cumsum 对整型默认提升到 int64，必须显式给 dtype 才是 int32；
+        # bool 可以直接 cumsum，不用先 .long()。上界是窗口内的分隔符个数
+        # （≤ seq_len），int32 绰绰有余。
+        is_sep = x == doc_sep_id
+        doc_id = is_sep.cumsum(-1, dtype=torch.int32) - is_sep.to(torch.int32)  # 分隔符归它结束的那篇
+        doc_mask = doc_id.unsqueeze(-1) == doc_id.unsqueeze(-2)     # 同篇才允许
+        mask = (doc_mask & causal_mask).unsqueeze(-3) # Insert head dim
+    else:
+        # Construct [1, 1, seq, seq]
+        mask = causal_mask.unsqueeze(0).unsqueeze(0)
+    return mask
+
+
 class TransformerLM(nn.Module):
     def __init__(
         self,
@@ -321,17 +354,16 @@ class TransformerLM(nn.Module):
     def forward(
         self,
         x: Int[Tensor, "... seq_len"],
-        mask: Bool[Tensor, "... seq_len seq_len"] | None = None,
+        mask: Bool[Tensor, "... seq_len seq_len"],
         token_positions: Int[Tensor, "... seq_len"] | None = None
     ) -> Float[Tensor, "... seq_len vocab_size"]:
+        # mask 是必填的。这个模型本身不知道自己是自回归的——因果性完全由传进来的
+        # mask 决定（用 build_attention_mask 构造）。给它一个 None 默认值的话，
+        # 忘传就等于全双向注意力，而且不报错、loss 还降得特别漂亮。
+        # 缺省应该是"补全"或"报错"，不能是"跳过"。
         assert x.shape[-1] <= self.context_length, f"Input sequence length {x.shape[-1]} exceeds maximum context length {self.context_length}"
         
         seq_len = x.shape[-1]
-        causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device))
-        if mask is not None:
-            mask = mask & causal_mask
-        else:
-            mask = causal_mask
 
         if token_positions is None:
             token_positions = torch.arange(seq_len, device=x.device)
