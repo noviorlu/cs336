@@ -1,0 +1,39 @@
+# CS336 Assignment 1
+# 7.2.1 Hyperparameter tuning: TinyStories 17M model
+
+# Data params
+train_data: "data/tinystories_train.npy"
+val_data: "data/tinystories_valid.npy"
+checkpoint_dir: "checkpoints/tinystories_17M"
+
+# Model hyperparameters (from PDF 7.2.1)
+vocab_size: 10000
+context_length: 256
+d_model: 512
+num_layers: 4
+num_heads: 16
+d_ff: 1344
+rope_theta: 10000.0
+
+# Optimization hyperparameters
+# Total tokens processed: 327,680,000
+# batch_size * max_iters * context_length = 327,680,000
+# 256 * 5000 * 256 = 327,680,000
+batch_size: 256
+max_iters: 5000
+
+# Typical choices for AdamW / LR Schedule (as suggested by the prompt to reference standard values)
+learning_rate: 5.0e-4
+min_lr: 1.0e-5
+warmup_iters: 100
+weight_decay: 0.1
+max_grad_norm: 1.0
+seed: 1337
+
+# Logging and Evaluation
+eval_interval: 500
+eval_iters: 20
+log_interval: 50
+device: "cuda"
+dtype: "bfloat16"
+compile: true

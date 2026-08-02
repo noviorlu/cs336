@@ -3,6 +3,7 @@ import contextlib
 import os
 import re
 import time
+import yaml
 
 import numpy as np
 import torch
@@ -96,9 +97,11 @@ def evaluate_loss(model, dataset, eval_iters, batch_size, context_length, device
 
 def main():
     parser = argparse.ArgumentParser(description="Train a Transformer Language Model")
+    parser.add_argument("--config", type=str, default=None, help="传入 JSON 或 YAML 配置文件路径，直接加载所有超参数")
+    
     # Data params
-    parser.add_argument("--train_data", type=str, required=True, help="Path to training data (.npy or raw .bin)")
-    parser.add_argument("--val_data", type=str, required=True, help="Path to validation data (.npy or raw .bin)")
+    parser.add_argument("--train_data", type=str, default=None, help="Path to training data (.npy or raw .bin)")
+    parser.add_argument("--val_data", type=str, default=None, help="Path to validation data (.npy or raw .bin)")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint path to resume from")
     parser.add_argument("--keep_last_n", type=int, default=3,
@@ -143,9 +146,42 @@ def main():
                         help="矩阵乘的自动混合精度，仅在 CUDA 上生效")
     parser.add_argument("--compile", action="store_true", help="用 torch.compile 加速，仅在 CUDA 上生效")
 
+    # 第一遍解析：抓取 --config 和 --resume
+    args_config, remaining = parser.parse_known_args()
+    config_path = args_config.config
+
+    # 如果没传 --config 但传了 --resume，自动去 checkpoint 同级目录下找配置
+    if not config_path and args_config.resume:
+        ckpt_dir = os.path.dirname(args_config.resume)
+        if os.path.exists(os.path.join(ckpt_dir, "config.yaml")):
+            config_path = os.path.join(ckpt_dir, "config.yaml")
+        elif os.path.exists(os.path.join(ckpt_dir, "config.json")):
+            config_path = os.path.join(ckpt_dir, "config.json")
+
+    if config_path:
+        if config_path.endswith((".yaml", ".yml")):
+            import yaml
+            with open(config_path, "r") as f:
+                config_dict = yaml.safe_load(f)
+        else:
+            import json
+            with open(config_path, "r") as f:
+                config_dict = json.load(f)
+        # 用文件里的参数去覆盖 argparse 的默认值
+        parser.set_defaults(**config_dict)
+
+    # 第二遍解析：用命令行传进来的参数去覆盖（如果有的话）
     args = parser.parse_args()
 
+    if not args.train_data or not args.val_data:
+        parser.error("必须提供 --train_data 和 --val_data（可通过命令行传，或写在 config 文件里）")
+
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    # 将所有的超参数保存到 checkpoint 目录下，防止以后忘了 d_model、num_layers 等无状态参数
+    config_path = os.path.join(args.checkpoint_dir, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.dump(vars(args), f, default_flow_style=False, sort_keys=False)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
