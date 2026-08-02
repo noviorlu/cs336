@@ -319,7 +319,6 @@ def build_attention_mask(
         mask = causal_mask.unsqueeze(0).unsqueeze(0)
     return mask
 
-
 class TransformerLM(nn.Module):
     def __init__(
         self,
@@ -374,5 +373,3 @@ class TransformerLM(nn.Module):
 
         # Return the unnormalized logits (no softmax applied!)
         return self.lm_head(self.ln_final(hidden_states))
-
-
