@@ -82,6 +82,9 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=100, help="Number of tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8, help="Temperature (0.0 for greedy)")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p cutoff (1.0 to disable)")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="词表前缀（data/<前缀>_vocab.json）。不给就按 vocab_size 自动选："
+                             "10000→tinystories，32000→owt")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -90,8 +93,13 @@ def main():
         config = yaml.safe_load(f)
         
     print("Loading tokenizer...")
-    vocab_path = os.path.join("data", "tinystories_vocab.json")
-    merges_path = os.path.join("data", "tinystories_merges.json")
+    # 词表默认按 vocab_size 认：10000 是 TinyStories，32000 是 OpenWebText。
+    # 写死 tinystories 的话，拿 OWT 的 checkpoint 生成会用错词表——id 对不上，
+    # 出来是乱码，而且不报错。
+    stem = args.tokenizer or ("owt" if config['vocab_size'] > 20000 else "tinystories")
+    vocab_path = os.path.join("data", f"{stem}_vocab.json")
+    merges_path = os.path.join("data", f"{stem}_merges.json")
+    print(f"tokenizer: {stem}（vocab_size={config['vocab_size']}）")
     if not os.path.exists(vocab_path) or not os.path.exists(merges_path):
         print("Warning: Tokenizer files not found at data/. Make sure they exist.")
     

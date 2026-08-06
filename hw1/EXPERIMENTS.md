@@ -326,7 +326,100 @@ top-p 几乎不裁,没把握时裁得狠,所以它比固定温度更稳。
 
 ## 5. `main_experiment` — OpenWebText
 
-*待填*
+架构和步数照抄 TinyStories,只有 `vocab_size` 跟着 tokenizer 变(10K → 32K)。
+这一项就把模型从 22.70 M 撑到 **45.22 M**(多出来的 22.5 M 全在 embedding 和
+lm_head),每 token 算力 111.7 → **179.3 MFLOPs**。
+
+**显存挡了一道**:32K 词表让 logits `[256,256,32000]` 一份就 4.19 GB,batch 256
+直接 OOM。但不能简单降 batch —— 降了就少看一半 token,两个数据集的 loss 更没法比。
+所以用 **micro-batch 128 × 梯度累积 2 = 有效 batch 256**,token 预算和步数都对齐。
+
+| lr | val loss | run |
+|:--|:--|:--|
+| 3e-3 | 3.9489 | `owt_lr3e-3` |
+| **5e-3** | **3.9287** | `owt_lr5e-3` |
+
+### 5.1 两个 loss 不能直接比
+
+TinyStories 1.3323 vs OWT 3.9287,看着差 2.96 倍。**但这个比值是错的** ——
+交叉熵的单位是「每 token 的 nat」,而两边的 token 根本不是一回事:词表不同
+(10K vs 32K),压缩率也不同。可比的口径是 **bits per byte**:
+
+$$\text{BPB} = \frac{\text{loss}}{\ln 2 \cdot (\text{字节/token})}$$
+
+| 语料 | val loss | 困惑度 | 字节/token | **BPB** | 随机猜的 BPB |
+|:--|:--|:--|:--|:--|:--|
+| TinyStories | 1.3323 | 3.79 | 4.071 | **0.472** | 3.264 |
+| OpenWebText | 3.9287 | 51.88 | 4.363 | **1.300** | 3.430 |
+
+**换算后是 2.75 倍,不是 2.96 倍。** 差别不大,但方向说明了问题:OWT 的 token 更
+「重」(4.363 字节/token),同样的 per-token loss 摊到每个字节上要除以更大的数。
+跨 tokenizer 比模型,BPB 才是那个不受词表选择影响的量。
+
+困惑度那一列更直观:TinyStories **3.79** —— 平均每步只在不到 4 个候选里挑;
+OWT **51.88**,52 个候选。
+
+### 5.2 生成的文本
+
+`owt_lr5e-3`,温度 0.8,top-p 0.9:
+
+```
+The future of the U.S. is not yet known, but for the foreseeable future, the
+U.S. will be forced to rely on the U.S. to adapt its policies to the next level
+of strategic surveillance, including an unprecedented expansion of the U.S. It
+is likely that any new policy will be done for such a long time. The U.S. has
+been carefully deploying the U.S. in its efforts to protect its nuclear sites
+and other potential nuclear weapons. [...] That is why the U.S. has already
+ruled out the U.S. nuclear arsenal.
+```
+
+```
+In a recent interview with AP, he said, "I'm just gonna take care of the guys
+who make the show."
+
+"They're gonna sit up and watch this show," he said. "I think that's the end of
+the show. It's going to be a long time, and I think it's going to be a long
+time."
+[...] He is also a former director of the show's minicamp and that's why it's
+been the best show in the world for so many years.
+```
+
+**流畅度:局部完美,整体空洞。** 语法、标点、引号配对、段落结构、新闻/访谈的文体
+全对 —— 单看任何一个从句都像真的。但:
+
+- **强迫性重复**:第一段 204 词里 "U.S." 出现 **19 次**,平均每 10.7 个词一次
+- **自相矛盾**:"the U.S. will be forced to rely on the U.S.";"the U.S. has
+  already ruled out the U.S. nuclear arsenal"
+- **指代无着**:第二段的 "he" 从头到尾没有指称对象,凭空冒出一个 "Servelli"
+- **没有论证推进**:两段都在原地打转,读完不知道说了什么
+
+对照 TinyStories 那段的 type-token ratio:0.548 vs OWT 的 0.490 —— OWT 输出的
+用词反而更单调,尽管它的词表大 3.2 倍。
+
+### 5.3 为什么同样的模型、同样的算力,质量差这么多
+
+**① 任务本身难 2.75 倍(BPB)。** TinyStories 是 GPT-4 按「3-4 岁儿童能懂」的约束
+生成的,词汇、句式、主题都被刻意压窄;OWT 是真实网络爬取,主题、实体、文体、语言
+全部开放。同样 45 M 的容量摊到后者上,每个方向都只够学个皮毛。
+
+**② 学到的是表层统计,不是内容模型。** 上面那两段正是这个分界的样本:句法和文体
+是**局部**规律,几百个 token 的上下文就能学会;而「不要重复」「指代要有着落」「论点
+要推进」是**长程**规律,需要在 256 的上下文里维持状态,还需要世界知识来约束。模型
+把便宜的那一半学到了,贵的那一半没有。
+
+**③ 语料覆盖率差 5 倍。** 同样 3.28 亿 token 的预算:TinyStories 训练集 5.41 亿
+token,跑了 **0.61 个 epoch**;OWT 训练集 27.3 亿,只跑了 **0.12 个 epoch**。更难的
+数据,反而只看了五分之一的覆盖。
+
+**④ 两边都远未训够,OWT 更甚。** 按 Chinchilla 的 20 token/参数:TinyStories 的
+22.7 M 需要 4.54 亿 token(实际给了 3.28 亿,**14.4** token/参数);OWT 的 45.22 M
+需要 9.04 亿(实际同样 3.28 亿,**7.2** token/参数)。**模型大了一倍,预算没变,
+每参数分到的 token 直接减半。**
+
+**⑤ 一多半算力花在了输出投影上。** V 从 10K 到 32K,`lm_head` 占前向 FLOPs 从
+27.5% 涨到 **54.8%**。也就是说这次多花的 60% 算力里,绝大部分买的是「在 32000 个
+候选里做 softmax」的能力,而不是更强的表示 —— 中间 4 层 Transformer 的容量一点
+没变。这是「同样架构换个数据集」时最容易被忽略的一笔账。
 
 ## 6. `leaderboard`
 
