@@ -1,0 +1,16 @@
+program: train.py
+method: grid
+project: cs336-hw1
+
+metric:
+  name: val_loss
+  goal: minimize
+
+parameters:
+  config:
+    value: "tinystories_17M_tuned.yaml"
+  wandb:
+    value: "cs336-hw1"
+  batch_size:
+    # PDF 要求：从 1 一直覆盖到接近 OOM，包含 64 和 128
+    values: [1, 64, 128, 256, 1024]

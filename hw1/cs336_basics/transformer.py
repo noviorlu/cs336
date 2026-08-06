@@ -89,6 +89,30 @@ class SwiGLU(nn.Module):
         x_val = self.w3(x)
         return self.w2(x_gate * x_val)
 
+class FFNSiLU(nn.Module):
+    """不带门控的前馈网络：FFN(x) = W2 · SiLU(W1 x)。handout `swiglu_ablation` 的对照组。
+
+    SwiGLU 有三个矩阵、d_ff = 8/3·d_model；这里只有两个，所以要取 d_ff = 4·d_model
+    才能把参数量对齐（3·8/3 = 2·4 = 8）。消融的是"门控"这一件事，不是参数量，
+    两者不对齐的话对比就没意义了。d_ff 交给调用方传，默认按 4·d_model 补。
+    """
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None
+    ):
+        super().__init__()
+        if d_ff is None:
+            d_ff = 4 * d_model
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.silu = SiLU()
+
+    def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
+        return self.w2(self.silu(self.w1(x)))
+
 class RoPE(nn.Module):
     """
     i:    position              0 .. max_seq_len-1    \n
@@ -254,24 +278,34 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         max_seq_len: int | None = None,
         theta: float | None = None,
-        device: torch.device | None = None, 
+        norm: str = "pre",
+        ffn: str = "swiglu",
+        device: torch.device | None = None,
         dtype: torch.dtype | None = None
     ) -> None:
         super().__init__()
-        self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
+        assert norm in ("pre", "post", "none"), norm
+        assert ffn in ("swiglu", "silu"), ffn
+        self.norm = norm
+
+        # norm="none" 时用 Identity 占位而不是不建这两个属性：state_dict 的 key
+        # 结构保持一致，消融跑出来的 checkpoint 还能被同一套加载代码读进来。
+        mk_norm = (lambda: nn.Identity()) if norm == "none" else \
+                  (lambda: RMSNorm(d_model, device=device, dtype=dtype))
+        self.ln1 = mk_norm()
         self.attn = MultiHeadSelfAttention(
-            d_model=d_model, 
-            num_heads=num_heads, 
-            max_seq_len=max_seq_len, 
-            theta=theta, 
-            device=device, 
+            d_model=d_model,
+            num_heads=num_heads,
+            max_seq_len=max_seq_len,
+            theta=theta,
+            device=device,
             dtype=dtype
         )
-        self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
-        self.ffn = SwiGLU(
-            d_model=d_model, 
-            d_ff=d_ff, 
-            device=device, 
+        self.ln2 = mk_norm()
+        self.ffn = (SwiGLU if ffn == "swiglu" else FFNSiLU)(
+            d_model=d_model,
+            d_ff=d_ff,
+            device=device,
             dtype=dtype
         )
 
@@ -281,6 +315,12 @@ class TransformerBlock(nn.Module):
         mask: Bool[Tensor, "... seq_len seq_len"],
         token_positions: Int[Tensor, "... seq_len"] | None = None
     ) -> Float[Tensor, "... seq_len d_model"]:
+        if self.norm == "post":
+            # post-norm：先加残差再归一化，归一化因此落在残差流**上**（式 27/28）
+            x = self.ln1(x + self.attn(x, mask=mask, token_positions=token_positions))
+            x = self.ln2(x + self.ffn(x))
+            return x
+        # pre-norm（式 25/26）；norm="none" 时 ln1/ln2 是 Identity，退化成纯残差
         # 1. Attention path
         x = x + self.attn(self.ln1(x), mask=mask, token_positions=token_positions)
         # 2. Feed-forward path
@@ -328,11 +368,13 @@ class TransformerLM(nn.Module):
         num_layers: int,
         num_heads: int,
         d_ff: int,
-        rope_theta: float,
-        device: torch.device | None = None, 
+        rope_theta: float | None,
+        norm: str = "pre",
+        ffn: str = "swiglu",
+        device: torch.device | None = None,
         dtype: torch.dtype | None = None
     ):
-        super().__init__() 
+        super().__init__()
         self.context_length = context_length
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList([
@@ -341,12 +383,20 @@ class TransformerLM(nn.Module):
                 num_heads = num_heads,
                 d_ff = d_ff,
                 max_seq_len = context_length,
+                # rope_theta=None 就是 NoPE（handout `no_pos_emb`）：MHA 里
+                # theta 为 None 时根本不建 RoPE 模块，位置信息完全不进模型
                 theta = rope_theta,
+                norm = norm,
+                ffn = ffn,
                 device = device,
                 dtype = dtype
             ) for _ in range(num_layers)
         ])
-        self.ln_final = RMSNorm(d_model = d_model,device=device, dtype=dtype)
+        # ln_final 只有 pre-norm 才需要：pre-norm 把归一化挪到了子层入口，残差流上
+        # 层层累加没人约束，不在出口补一次的话 lm_head 拿到的尺度会失控。post-norm
+        # 每个子层出口都归一化过，本来就有界；norm="none" 是要故意全拆掉。
+        self.ln_final = RMSNorm(d_model = d_model,device=device, dtype=dtype) \
+                        if norm == "pre" else nn.Identity()
         self.lm_head = Linear(in_features = d_model, out_features = vocab_size, device = device, dtype = dtype)
 
     def forward(

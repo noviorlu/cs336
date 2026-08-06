@@ -1,0 +1,15 @@
+program: train.py
+method: grid
+project: cs336-hw1
+
+metric:
+  name: val_loss
+  goal: minimize
+
+parameters:
+  config:
+    value: "tinystories_17M_tuned.yaml"
+  wandb:
+    value: "cs336-hw1"
+  learning_rate:
+    values: [5e-4, 1e-3, 3e-3, 5e-3, 1e-2]

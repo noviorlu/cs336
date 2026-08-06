@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import os
 import re
+import sys
 import time
 import yaml
 
@@ -87,8 +88,10 @@ def model_flops_per_token(args):
     """
     T, L, d, dff, V = (args.context_length, args.num_layers,
                        args.d_model, args.d_ff, args.vocab_size)
-    # MHA：d_q = d_kv = d_model；SwiGLU：w1/w2/w3 三个 d_model×d_ff
-    f_layer = 4 * 2 * T * d * d + 2 * (2 * T * T * d) + 3 * 2 * T * d * dff
+    n_ff = 3 if args.ffn == "swiglu" else 2      # SwiGLU 三个矩阵，无门控的 SiLU 两个
+    # MHA：d_q = d_kv = d_model。RMSNorm、SiLU、残差这些逐元素算子的 FLOPs 相比
+    # 矩阵乘可以忽略（数量级差 d 倍），消融开关不影响这个函数除 n_ff 外的部分。
+    f_layer = 4 * 2 * T * d * d + 2 * (2 * T * T * d) + n_ff * 2 * T * d * dff
     forward = L * f_layer + 2 * T * d * V          # 末尾是 lm_head
     return 3.0 * forward / T
 
@@ -151,6 +154,17 @@ def main():
                              "不手填 id 是因为它随词表变（10k 是 9999、32k 是 31999），"
                              "填错不会崩，只会静默生成一份错误的 mask")
 
+    # 架构消融（handout §7.3）。默认值就是基线模型，不传任何一个 = 原来的行为。
+    parser.add_argument("--norm", type=str, default="pre", choices=["pre", "post", "none"],
+                        help="RMSNorm 放哪。pre=基线（式 25/26）；post=post_norm_ablation（式 27/28，"
+                             "同时去掉 ln_final）；none=layer_norm_ablation（连 ln_final 一起拆光）")
+    parser.add_argument("--ffn", type=str, default="swiglu", choices=["swiglu", "silu"],
+                        help="前馈网络类型。swiglu=基线（3 个矩阵）；silu=swiglu_ablation 的对照组"
+                             "（2 个矩阵，无门控）。选 silu 且没手动给 --d_ff 时，d_ff 自动取 "
+                             "4·d_model 来对齐参数量")
+    parser.add_argument("--no_rope", action="store_true",
+                        help="no_pos_emb：完全去掉位置编码（NoPE），和基线的 RoPE 对比")
+
     # Logging and Evaluation
     parser.add_argument("--eval_interval", type=int, default=0, help="0表示自动设为总步数的 1/10")
     parser.add_argument("--eval_iters", type=int, default=20, help="每次评测使用的 batch 数量")
@@ -201,6 +215,12 @@ def main():
 
     if not args.train_data or not args.val_data:
         parser.error("必须提供 --train_data 和 --val_data（可通过命令行传，或写在 config 文件里）")
+
+    # SiLU 前馈只有两个矩阵，d_ff 要取 4·d_model 才和 SwiGLU 的 8/3·d_model×3 对齐
+    # 参数量（handout 明确要求）。只在没显式指定 --d_ff 时自动改，命令行给了就听命令行。
+    if args.ffn == "silu" and not any(a.split("=")[0] == "--d_ff" for a in sys.argv[1:]):
+        args.d_ff = 4 * args.d_model
+        print(f"[ffn=silu] d_ff 自动改为 4·d_model = {args.d_ff}（对齐 SwiGLU 参数量）")
 
     # 自动换算 interval (如果未手动设置或设为0)
     if args.log_interval <= 0:
@@ -256,12 +276,16 @@ def main():
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         d_ff=args.d_ff,
-        rope_theta=args.rope_theta,
+        rope_theta=None if args.no_rope else args.rope_theta,
+        norm=args.norm,
+        ffn=args.ffn,
         device=device,
     )
     n_params = sum(p.numel() for p in model.parameters())
     flops_per_token = model_flops_per_token(args)
-    print(f"Model: {n_params/1e6:.2f} M params | device {device} | bf16 autocast: {use_bf16}")
+    arch = f"norm={args.norm} ffn={args.ffn} d_ff={args.d_ff} pos={'NoPE' if args.no_rope else 'RoPE'}"
+    print(f"Model: {n_params/1e6:.2f} M params | {arch}")
+    print(f"       device {device} | bf16 autocast: {use_bf16}")
     print(f"MFU 口径: {flops_per_token/1e6:.2f} MFLOPs/token (精确) "
           f"vs {6*n_params/1e6:.2f} (6P 近似，高估 {6*n_params/flops_per_token-1:+.1%}) "
           f"| 峰值 {args.peak_flops/1e12:.1f} TFLOPS")

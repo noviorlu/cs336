@@ -11,8 +11,13 @@ def cross_entropy(o: Float[Tensor, "... vocab_size"], t: Int[Tensor, "..."]) -> 
     M = einx.max("... v -> ...", o)                                                                     
     shifted = einx.subtract("... v, ... -> ... v", o, M)
 
-    o_t = einx.get_at("... [v], ... -> ...", o, t)  
-    log_sum_exp = torch.log(einx.sum("... v -> ...", torch.exp(shifted))) 
+    # 这里不能用 einx.get_at("... [v], ... -> ...", o, t)：它的实现是先把 o 摊平成
+    # 一维、再用算好的线性下标去取，而那个长度是用 int32 算的。o 的元素数一旦过
+    # 2^31，摊平长度就翻负，报 "invalid shape dimension -1673527296"。
+    # batch=1024 时 [1024, 256, 10000] = 26.2 亿个元素，正好越界（26.2e8 - 2^32
+    # = -1673527296）。torch.gather 按维度取，不摊平，也就没有这个上限。
+    o_t = torch.gather(o, -1, t.unsqueeze(-1).long()).squeeze(-1)
+    log_sum_exp = torch.log(einx.sum("... v -> ...", torch.exp(shifted)))
 
     return (M - o_t + log_sum_exp).mean() 
 
