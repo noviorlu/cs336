@@ -391,8 +391,13 @@ def main():
             flops_per_sec = tok_per_sec * flops_per_token
             mfu = (flops_per_sec / args.peak_flops) * 100
 
+            # 峰值显存：batch_size_experiment 要拿它画"batch 撞到显存墙"那条线。
+            # max_memory_allocated 是进程启动以来的高水位，不随 log 归零——正好，
+            # 峰值出现在反向的中段，每步都一样，取高水位就够。
+            peak_gb = torch.cuda.max_memory_allocated() / 1e9 if is_cuda else 0.0
+
             print(f"step {it} | loss {loss_val:.4f} | lr {lr:.4e} | {tok_per_sec:.0f} tok/s "
-                  f"| {flops_per_sec/1e12:.1f} TFLOPS | mfu {mfu:.2f}%")
+                  f"| {flops_per_sec/1e12:.1f} TFLOPS | mfu {mfu:.2f}% | peak {peak_gb:.2f} GB")
             if args.wandb:
                 wandb.log({
                     "train/loss": loss_val,
@@ -400,6 +405,7 @@ def main():
                     "train/tokens_per_sec": tok_per_sec,
                     "train/tflops": flops_per_sec / 1e12,
                     "train/mfu": mfu,
+                    "train/peak_mem_gb": peak_gb,
                     "step": it,
                 }, step=it)
             tokens_seen = 0
