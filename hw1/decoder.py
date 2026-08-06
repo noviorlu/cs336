@@ -105,7 +105,12 @@ def main():
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
         d_ff=config.get('d_ff', config['d_model'] * 4),
-        rope_theta=config.get('rope_theta', 10000.0)
+        # 消融跑出来的 checkpoint 必须按它自己的架构重建。no_rope 尤其危险：
+        # 去掉 RoPE 不改变任何权重的形状，state_dict 能原样装进一个带 RoPE 的
+        # 模型里，不报错，只是生成一堆乱码。norm / ffn 至少还会 shape 不匹配。
+        rope_theta=None if config.get('no_rope') else config.get('rope_theta', 10000.0),
+        norm=config.get('norm', 'pre'),
+        ffn=config.get('ffn', 'swiglu'),
     ).to(args.device)
     
     state_dict = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
@@ -118,16 +123,21 @@ def main():
     
     # Encode prompt
     input_ids = torch.tensor([tokenizer.encode(args.prompt)], dtype=torch.long, device=args.device)
-    
+
+    # handout 要的是「至少 256 个 token，或者到第一个 <|endoftext|> 为止」。
+    # generate() 早就支持 eos_id 提前停，之前只是没人传进去。
+    eos_id = tokenizer.encode("<|endoftext|>")[0]
+
     # Generate
     output_ids = generate(
-        model, 
-        input_ids, 
-        max_new_tokens=args.max_new_tokens, 
+        model,
+        input_ids,
+        max_new_tokens=args.max_new_tokens,
         context_length=config['context_length'],
-        temperature=args.temperature, 
-        top_p=args.top_p, 
-        device=args.device
+        temperature=args.temperature,
+        top_p=args.top_p,
+        device=args.device,
+        eos_id=eos_id,
     )
     
     # Decode

@@ -269,7 +269,60 @@ post-norm      █████                 +0.039  ( 7.3σ)
 
 ## 4. `generate` — 生成文本
 
-*待填*
+checkpoint:`seed3`(val 1.3323,全场最好),温度 0.8,top-p 0.9,提示词
+"Once upon a time"。
+
+```
+Once upon a time, there was a little girl named Sue. She was very excited to go
+to the park. She put on her hat and shoes and ran to the park with her mom.
+
+At the park, Sue saw a boy with a big blue ball. The boy was trying to kick the
+ball too. Sue wanted to play with the boy, so she asked him, "Can I play with
+you?" The boy said, "Yes, let's play together!"
+
+Sue and the boy played with the blue ball for a long time. They kicked the ball
+back and forth, laughing and having fun. They became good friends and played at
+the park every day. And they always remembered to share and be kind to each other.
+<|endoftext|>
+```
+
+**152 token,遇 `<|endoftext|>` 自停** —— handout 允许「至少 256 token **或**到第一个
+`<|endoftext|>` 为止」,这里是后者,而且模型自己学会了在故事讲完时收尾,这本身是个
+好信号。
+
+**流畅度**:完整的叙事结构(起因 → 冲突 → 解决 → 道德收尾),指代一致(Sue / the boy
+全程不串),时态统一,对话引号配对。不低于 handout 给的参考样例。
+
+**一个自洽性检查**:生成文本的压缩率 **4.072 字节/token**,训练语料是 **4.071**
+(见笔记 §2.8)。模型复现出了和语料一致的 token 分布。
+
+### 影响输出质量的因素
+
+同一个 checkpoint、同一个提示词,只改解码参数:
+
+**① 温度** —— 最敏感的一个。
+
+| T | 输出 |
+|:--|:--|
+| 0.0(贪心) | "...She would give the frog a kiss. Lily gave the frog a kiss, and the frog turned into a prince!" —— 完全通顺,但是最安全最套路的故事,而且确定性,每次一样 |
+| 0.8 | 上面那段。通顺 + 有变化,最佳区间 |
+| 1.0 | 仍通顺,但开始出现语义滑坡:"The little ant and the big, dark cave became very dark"(主语粘连)、"The bee was attractive"(用词不当) |
+| 1.5 | **崩坏**:"an elderly mule and special looking navy **tranquurde**"、"**oblboardingorance**"、"**tradmerAdamicking**" |
+
+T=1.5 那些是**不存在的词**,不是用错的词。原因在 tokenizer 那一层:BPE 的词表是
+子词片段,从分布尾巴上采样时模型会把几个片段拼成一个从未在语料里出现过的字符串。
+字符级或词级模型不会这样坏 —— **这是子词切分特有的失效模式**。
+
+**② top-p** —— 和温度是同一件事的两种做法(都是削尾巴),但 top-p 是自适应的。
+T=1.0 + top_p=1.0(不截断)已经出语义滑坡;T=0.8 + top_p=0.9 就干净。模型有把握时
+top-p 几乎不裁,没把握时裁得狠,所以它比固定温度更稳。
+
+**③ 语料的难度(不是解码参数,但影响最大)** —— TinyStories 是 GPT-4 生成的儿童
+故事,词汇、句式、主题都极窄。22.7 M 参数在这上面「流畅」是便宜的。同样的模型、
+同样的算力换到 OpenWebText 上会差得多 —— 见 §5,那正是 handout 要问的问题。
+
+**④ 上下文长度 256** —— 超过 256 token 后前文被裁掉,长故事的一致性维持不住。
+上面那段 152 token 就结束了,还没撞到这个墙。
 
 ## 5. `main_experiment` — OpenWebText
 

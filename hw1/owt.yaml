@@ -1,0 +1,41 @@
+# CS336 Assignment 1
+# 7.4 main_experiment: OpenWebText
+#
+# handout 要求「same model architecture and total training iterations as
+# TinyStories」，所以除了 vocab_size 必须跟着 tokenizer 走（OWT 是 32K），
+# 其余架构和步数一律照抄 tinystories_17M_tuned.yaml。
+#
+# 注意这会把模型从 22.70 M 撑到 45.22 M——多出来的 22.5 M 全在 embedding 和
+# lm_head 上（32000×512 各一份）。连带的后果：
+#   - 每 token 算力 111.7 → 179.3 MFLOPs，慢 1.6 倍
+#   - lm_head 占前向 FLOPs 从 27.5% 涨到 54.8%，一多半的算力花在输出投影上
+#   - logits [256,256,32000] 一份就 4.19 GB（原来 1.31 GB）
+
+train_data: "data/owt_train.npy"
+val_data: "data/owt_valid.npy"
+checkpoint_dir: "checkpoints/owt"
+
+vocab_size: 32000          # ← 唯一因为数据集而变的架构参数
+context_length: 256
+d_model: 512
+num_layers: 4
+num_heads: 16
+d_ff: 1344
+rope_theta: 10000.0
+
+batch_size: 256
+max_iters: 5000
+
+learning_rate: 3.0e-3      # TinyStories 的最优平台是 5e-3~6e-3，OWT 上要重扫
+min_lr: 1.0e-5
+warmup_iters: 200
+weight_decay: 0.01
+max_grad_norm: 1.0
+seed: 1337
+
+eval_interval: 0
+eval_iters: 20
+log_interval: 0
+device: "cuda"
+dtype: "bfloat16"
+compile: true

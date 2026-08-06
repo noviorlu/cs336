@@ -154,6 +154,11 @@ def main():
                              "不手填 id 是因为它随词表变（10k 是 9999、32k 是 31999），"
                              "填错不会崩，只会静默生成一份错误的 mask")
 
+    parser.add_argument("--accum", type=int, default=1,
+                        help="梯度累积步数。有效 batch = batch_size × accum。显存装不下目标 "
+                             "batch 时用它换时间：数学上等价于一次大 batch，但慢 accum 倍。"
+                             "默认 1 = 不累积")
+
     # 架构消融（handout §7.3）。默认值就是基线模型，不传任何一个 = 原来的行为。
     parser.add_argument("--norm", type=str, default="pre", choices=["pre", "post", "none"],
                         help="RMSNorm 放哪。pre=基线（式 25/26）；post=post_norm_ablation（式 27/28，"
@@ -286,6 +291,9 @@ def main():
     arch = f"norm={args.norm} ffn={args.ffn} d_ff={args.d_ff} pos={'NoPE' if args.no_rope else 'RoPE'}"
     print(f"Model: {n_params/1e6:.2f} M params | {arch}")
     print(f"       device {device} | bf16 autocast: {use_bf16}")
+    if args.accum > 1:
+        print(f"       梯度累积 {args.accum} × micro-batch {args.batch_size} "
+              f"= 有效 batch {args.batch_size * args.accum}")
     print(f"MFU 口径: {flops_per_token/1e6:.2f} MFLOPs/token (精确) "
           f"vs {6*n_params/1e6:.2f} (6P 近似，高估 {6*n_params/flops_per_token-1:+.1%}) "
           f"| 峰值 {args.peak_flops/1e12:.1f} TFLOPS")
@@ -357,29 +365,40 @@ def main():
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        # --- B. Forward Pass ---
-        # batch 由 (seed, it) 唯一决定：同一个种子跑两次数据流完全一致，
-        # 从 checkpoint 续训也能接着原来的数据往下走，不需要存 RNG 状态。
-        x, y = get_batch(train_data, args.batch_size, args.context_length, device,
-                         rng=np.random.default_rng([args.seed, it]))
-        with ctx:
-            seq_len = x.shape[-1]
-            mask = build_attention_mask(seq_len, x.device, x=x, doc_sep_id=doc_sep_id)
-            
-            logits = model(x, mask=mask)
-            loss = cross_entropy(logits, y)
-
-        # --- C. Backward Pass & Optimizer Step ---
+        # --- B/C. 前向 + 反向（可分成 accum 个 micro-batch）---
+        # 梯度累积：显存装不下目标 batch 时，把它切成 accum 份依次前向反向，
+        # 梯度在 .grad 里自然累加，最后只 step 一次。数学上等价于一次大 batch，
+        # 代价是慢 accum 倍（省的是显存，不是算力）。
+        # 三个必须做对的地方：
+        #   ① 每份的 loss 要除以 accum。cross_entropy 里已经 .mean() 过了，
+        #      直接累加等于把 accum 份各自的均值再求和，梯度会大 accum 倍
+        #   ② 梯度裁剪只能在累加完之后做一次，对着完整梯度裁
+        #   ③ zero_grad 挪到整轮开头，不能放在每份前面
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss_sum = 0.0
+        for micro in range(args.accum):
+            # batch 由 (seed, it, micro) 唯一确定：同种子重跑数据流完全一致，
+            # 从 checkpoint 续训也接得上，不需要存 RNG 状态。
+            x, y = get_batch(train_data, args.batch_size, args.context_length, device,
+                             rng=np.random.default_rng([args.seed, it, micro]))
+            with ctx:
+                seq_len = x.shape[-1]
+                mask = build_attention_mask(seq_len, x.device, x=x, doc_sep_id=doc_sep_id)
+
+                logits = model(x, mask=mask)
+                loss = cross_entropy(logits, y) / args.accum      # ①
+            loss.backward()
+            loss_sum += loss.detach()
+
+        loss = loss_sum          # 打印/记录的是整个有效 batch 的平均 loss
 
         # 用 raw_model：compile 后的 wrapper 和它共享同一批 Parameter 对象，
         # 但从未编译的那个取更直白，也不会被类型检查器当成普通函数。
-        gradient_clipping(raw_model.parameters(), args.max_grad_norm)
+        gradient_clipping(raw_model.parameters(), args.max_grad_norm)   # ②
 
         optimizer.step()
 
-        tokens_seen += args.batch_size * args.context_length
+        tokens_seen += args.batch_size * args.accum * args.context_length
 
         # --- D. Logging ---
         if it % args.log_interval == 0:
