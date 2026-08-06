@@ -371,6 +371,7 @@ class TransformerLM(nn.Module):
         rope_theta: float | None,
         norm: str = "pre",
         ffn: str = "swiglu",
+        tie_embeddings: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None
     ):
@@ -398,6 +399,25 @@ class TransformerLM(nn.Module):
         self.ln_final = RMSNorm(d_model = d_model,device=device, dtype=dtype) \
                         if norm == "pre" else nn.Identity()
         self.lm_head = Linear(in_features = d_model, out_features = vocab_size, device = device, dtype = dtype)
+
+        # weight tying：输入 embedding 和 lm_head 共用同一个 [V, d] 矩阵。
+        # 省下 V·d 个参数——V=32000、d=768 时是 24.6 M，占这个规模模型的两成多，
+        # 全部可以挪去加深加宽。handout §7.5 明确把它列为推荐的改动之一。
+        #
+        # **init 必须一起改，不然共享之后直接废掉**。两处原来的 std 差了两个数量级：
+        #   Embedding  std = 1        （查表用，尺度进残差流后会被 RMSNorm 吃掉）
+        #   Linear     std = sqrt(2/(d+V)) ≈ 0.008
+        # 共享后同一个矩阵要同时干这两件事。定 lm_head 那一侧：logit_i = Σ_j h_j W_ij，
+        # h 过了 ln_final 所以每个分量 RMS≈1，于是 Var(logit) = d·Var(W)。要让初始
+        # logit 的 std≈1（softmax 不饱和、初始 loss 就是 ln V），取 std = 1/sqrt(d)。
+        # d=768 时是 0.036，和 GPT-2 用的 0.02 同量级。
+        # handout 那句 "you may have to decrease the standard deviation" 说的就是这个。
+        self.tie_embeddings = tie_embeddings
+        if tie_embeddings:
+            torch.nn.init.trunc_normal_(
+                self.token_embeddings.weight, mean=0.0, std=d_model ** -0.5,
+                a=-3.0 * d_model ** -0.5, b=3.0 * d_model ** -0.5)
+            self.lm_head.weight = self.token_embeddings.weight
 
     def forward(
         self,

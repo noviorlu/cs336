@@ -119,6 +119,7 @@ def main():
         rope_theta=None if config.get('no_rope') else config.get('rope_theta', 10000.0),
         norm=config.get('norm', 'pre'),
         ffn=config.get('ffn', 'swiglu'),
+        tie_embeddings=config.get('tie_embeddings', False),
     ).to(args.device)
     
     state_dict = torch.load(args.checkpoint, map_location=args.device, weights_only=True)

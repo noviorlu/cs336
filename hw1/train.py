@@ -167,6 +167,10 @@ def main():
                         help="前馈网络类型。swiglu=基线（3 个矩阵）；silu=swiglu_ablation 的对照组"
                              "（2 个矩阵，无门控）。选 silu 且没手动给 --d_ff 时，d_ff 自动取 "
                              "4·d_model 来对齐参数量")
+    parser.add_argument("--tie_embeddings", action="store_true",
+                        help="输入 embedding 和 lm_head 共用一个矩阵，省下 V·d 个参数。"
+                             "会同时把该矩阵的 init std 改成 1/sqrt(d_model)——两处原来的 std "
+                             "差两个数量级，不改的话共享之后初始 logit 会爆")
     parser.add_argument("--no_rope", action="store_true",
                         help="no_pos_emb：完全去掉位置编码（NoPE），和基线的 RoPE 对比")
 
@@ -284,11 +288,13 @@ def main():
         rope_theta=None if args.no_rope else args.rope_theta,
         norm=args.norm,
         ffn=args.ffn,
+        tie_embeddings=args.tie_embeddings,
         device=device,
     )
     n_params = sum(p.numel() for p in model.parameters())
     flops_per_token = model_flops_per_token(args)
-    arch = f"norm={args.norm} ffn={args.ffn} d_ff={args.d_ff} pos={'NoPE' if args.no_rope else 'RoPE'}"
+    arch = (f"norm={args.norm} ffn={args.ffn} d_ff={args.d_ff} "
+            f"pos={'NoPE' if args.no_rope else 'RoPE'}{' tied' if args.tie_embeddings else ''}")
     print(f"Model: {n_params/1e6:.2f} M params | {arch}")
     print(f"       device {device} | bf16 autocast: {use_bf16}")
     if args.accum > 1:
