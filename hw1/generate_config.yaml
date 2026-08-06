@@ -1,0 +1,15 @@
+# 交互式文本生成配置文件 (Generation Configuration)
+
+# 指定模型结构的配置文件
+model_config: "tinystories_17M.yaml"
+
+# 指定要加载的模型权重文件路径
+checkpoint: "checkpoints/tinystories_17M/ckpt_step_16500.pt"
+
+# 解码/生成参数
+max_new_tokens: 150
+temperature: 0.8
+top_p: 0.9
+
+# 运行设备
+device: "cuda"

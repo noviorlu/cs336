@@ -1,10 +1,10 @@
 # CS336 Assignment 1
-# 7.2.1 Hyperparameter tuning: TinyStories 17M model
+# 7.2.1 Hyperparameter tuning: TinyStories 17M model (Tuned Version)
 
 # Data params
 train_data: "data/tinystories_train.npy"
 val_data: "data/tinystories_valid.npy"
-checkpoint_dir: "checkpoints/tinystories_17M"
+checkpoint_dir: "checkpoints/tinystories_17M_tuned"
 
 # Model hyperparameters (from PDF 7.2.1)
 vocab_size: 10000
@@ -16,17 +16,19 @@ d_ff: 1344
 rope_theta: 10000.0
 
 # Optimization hyperparameters
-# Total tokens processed: 327,680,000
-# batch_size * max_iters * context_length = 327,680,000
-# 256 * 5000 * 256 = 327,680,000
 batch_size: 256
 max_iters: 5000
 
-# Typical choices for AdamW / LR Schedule (as suggested by the prompt to reference standard values)
-learning_rate: 5.0e-4
+# -----------------
+# TUNED HYPERPARAMS
+# -----------------
+# 1. Higher learning rate (1e-3 instead of 5e-4) for this smaller 17M model
+learning_rate: 1.0e-3
 min_lr: 1.0e-5
-warmup_iters: 100
-weight_decay: 0.1
+# 2. Slightly longer warmup to stabilize the higher learning rate
+warmup_iters: 200
+# 3. Lower weight decay (0.01 instead of 0.1) since we don't want to overly constrain a small model
+weight_decay: 0.01
 max_grad_norm: 1.0
 seed: 1337
 

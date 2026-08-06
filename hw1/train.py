@@ -134,9 +134,12 @@ def main():
                              "填错不会崩，只会静默生成一份错误的 mask")
 
     # Logging and Evaluation
-    parser.add_argument("--eval_interval", type=int, default=500)
-    parser.add_argument("--eval_iters", type=int, default=20)
-    parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--eval_interval", type=int, default=0, help="0表示自动设为总步数的 1/10")
+    parser.add_argument("--eval_iters", type=int, default=20, help="每次评测使用的 batch 数量")
+    parser.add_argument("--log_interval", type=int, default=0, help="0表示自动设为总步数的 1/100")
+    
+    # MFU 相关配置
+    parser.add_argument("--peak_flops", type=float, default=312e12, help="显卡理论峰值 FLOPs (默认 312e12，即 A100 bf16 算力)")
     parser.add_argument(
         "--device",
         type=str,
@@ -145,6 +148,7 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"],
                         help="矩阵乘的自动混合精度，仅在 CUDA 上生效")
     parser.add_argument("--compile", action="store_true", help="用 torch.compile 加速，仅在 CUDA 上生效")
+    parser.add_argument("--wandb", type=str, default=None, help="Weights & Biases project name. If provided, enables wandb logging.")
 
     # 第一遍解析：抓取 --config 和 --resume
     args_config, remaining = parser.parse_known_args()
@@ -175,6 +179,16 @@ def main():
 
     if not args.train_data or not args.val_data:
         parser.error("必须提供 --train_data 和 --val_data（可通过命令行传，或写在 config 文件里）")
+
+    # 自动换算 interval (如果未手动设置或设为0)
+    if args.log_interval <= 0:
+        args.log_interval = max(1, args.max_iters // 100)
+    if args.eval_interval <= 0:
+        args.eval_interval = max(1, args.max_iters // 10)
+
+    if args.wandb:
+        import wandb
+        wandb.init(project=args.wandb, config=vars(args))
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
@@ -260,6 +274,20 @@ def main():
 
     print(f"Starting training on {device} ...")
 
+    # Record step 0 baseline before training begins
+    if start_iter == 1:
+        train_loss = evaluate_loss(model, train_data, args.eval_iters, args.batch_size,
+                                   args.context_length, device, args.seed + EVAL_SEED_OFFSET, ctx, doc_sep_id)
+        val_loss = evaluate_loss(model, val_data, args.eval_iters, args.batch_size,
+                                 args.context_length, device, args.seed + EVAL_SEED_OFFSET + 1, ctx, doc_sep_id)
+        print(f"Step 0: train_loss {train_loss:.4f}, val_loss {val_loss:.4f}")
+        if args.wandb:
+            wandb.log({
+                "eval/train_loss": train_loss,
+                "eval/val_loss": val_loss,
+                "step": 0,
+            }, step=0)
+
     tokens_seen = 0
     t0 = time.perf_counter()
 
@@ -307,7 +335,22 @@ def main():
         if it % args.log_interval == 0:
             loss_val = loss.item()          # 这一步本身就是一次同步，放在计时之前
             dt = time.perf_counter() - t0
-            print(f"step {it} | loss {loss_val:.4f} | lr {lr:.4e} | {tokens_seen/dt:.0f} tok/s")
+            tok_per_sec = tokens_seen / dt
+            
+            # 计算 MFU (Model FLOPs Utilization)
+            flops_per_token = 6.0 * n_params
+            flops_per_sec = tok_per_sec * flops_per_token
+            mfu = (flops_per_sec / args.peak_flops) * 100
+            
+            print(f"step {it} | loss {loss_val:.4f} | lr {lr:.4e} | {tok_per_sec:.0f} tok/s | mfu {mfu:.2f}%")
+            if args.wandb:
+                wandb.log({
+                    "train/loss": loss_val,
+                    "train/lr": lr,
+                    "train/tokens_per_sec": tok_per_sec,
+                    "train/mfu": mfu,
+                    "step": it,
+                }, step=it)
             tokens_seen = 0
             t0 = time.perf_counter()
 
@@ -318,6 +361,12 @@ def main():
             val_loss = evaluate_loss(model, val_data, args.eval_iters, args.batch_size,
                                      args.context_length, device, args.seed + EVAL_SEED_OFFSET + 1, ctx, doc_sep_id)
             print(f"Step {it}: train_loss {train_loss:.4f}, val_loss {val_loss:.4f}")
+            if args.wandb:
+                wandb.log({
+                    "eval/train_loss": train_loss,
+                    "eval/val_loss": val_loss,
+                    "step": it,
+                }, step=it)
 
             # 先写临时文件再 rename：中途被打断也不会留下半截的 checkpoint
             ckpt_path = os.path.join(args.checkpoint_dir, f"ckpt_step_{it}.pt")
