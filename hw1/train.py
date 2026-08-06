@@ -75,6 +75,24 @@ def prune_checkpoints(checkpoint_dir, keep_last_n):
     return removed
 
 
+def model_flops_per_token(args):
+    """一步训练（前向+反向）每个 token 的模型 FLOPs，用来算 MFU。
+
+    不用常见的 6P 近似，因为它在小模型上偏得很厉害，而且偏的方向不止一个：
+      - 6P 把 embedding 当成算力。查表是索引，0 FLOP。本作业 V=10000、d=512，
+        embedding 占 P 的 22.6%，等于凭空多出 30.7 MFLOPs/token
+      - 6P 又漏掉注意力里那两个 T² 项（QKᵀ 和 scores@V）
+    这里按 CS336 §5.4 的口径逐个算子加，前向 F 再乘 3（反向约等于前向的 2 倍）。
+    参数在 config 里改了（d_ff、层数……）这里自动跟着变。
+    """
+    T, L, d, dff, V = (args.context_length, args.num_layers,
+                       args.d_model, args.d_ff, args.vocab_size)
+    # MHA：d_q = d_kv = d_model；SwiGLU：w1/w2/w3 三个 d_model×d_ff
+    f_layer = 4 * 2 * T * d * d + 2 * (2 * T * T * d) + 3 * 2 * T * d * dff
+    forward = L * f_layer + 2 * T * d * V          # 末尾是 lm_head
+    return 3.0 * forward / T
+
+
 def evaluate_loss(model, dataset, eval_iters, batch_size, context_length, device, seed, ctx, doc_sep_id=None):
     model.eval()
     # 每次调用都从同一个种子重开，所以每个 eval point 看到的是完全相同的样本，
@@ -139,7 +157,11 @@ def main():
     parser.add_argument("--log_interval", type=int, default=0, help="0表示自动设为总步数的 1/100")
     
     # MFU 相关配置
-    parser.add_argument("--peak_flops", type=float, default=312e12, help="显卡理论峰值 FLOPs (默认 312e12，即 A100 bf16 算力)")
+    parser.add_argument("--peak_flops", type=float, default=209.5e12,
+                        help="显卡理论峰值 FLOPs，算 MFU 的分母。默认 209.5e12 = RTX 5090 的 "
+                             "bf16 tensor core（FP32 累加，PyTorch 走的就是这条）。"
+                             "要填对应 dtype 的**稠密**峰值：5090 那个 419 是带 sparsity 的，"
+                             "104.8 是 FP32 shader；A100 bf16 是 312e12，H100 SXM 是 990e12")
     parser.add_argument(
         "--device",
         type=str,
@@ -238,7 +260,11 @@ def main():
         device=device,
     )
     n_params = sum(p.numel() for p in model.parameters())
+    flops_per_token = model_flops_per_token(args)
     print(f"Model: {n_params/1e6:.2f} M params | device {device} | bf16 autocast: {use_bf16}")
+    print(f"MFU 口径: {flops_per_token/1e6:.2f} MFLOPs/token (精确) "
+          f"vs {6*n_params/1e6:.2f} (6P 近似，高估 {6*n_params/flops_per_token-1:+.1%}) "
+          f"| 峰值 {args.peak_flops/1e12:.1f} TFLOPS")
 
     # raw_model 始终指向未编译的模块。torch.compile 返回的 OptimizedModule 的
     # state_dict 每个 key 都带 `_orig_mod.` 前缀，直接存下来就装不回普通模型了。
@@ -338,16 +364,17 @@ def main():
             tok_per_sec = tokens_seen / dt
             
             # 计算 MFU (Model FLOPs Utilization)
-            flops_per_token = 6.0 * n_params
             flops_per_sec = tok_per_sec * flops_per_token
             mfu = (flops_per_sec / args.peak_flops) * 100
-            
-            print(f"step {it} | loss {loss_val:.4f} | lr {lr:.4e} | {tok_per_sec:.0f} tok/s | mfu {mfu:.2f}%")
+
+            print(f"step {it} | loss {loss_val:.4f} | lr {lr:.4e} | {tok_per_sec:.0f} tok/s "
+                  f"| {flops_per_sec/1e12:.1f} TFLOPS | mfu {mfu:.2f}%")
             if args.wandb:
                 wandb.log({
                     "train/loss": loss_val,
                     "train/lr": lr,
                     "train/tokens_per_sec": tok_per_sec,
+                    "train/tflops": flops_per_sec / 1e12,
                     "train/mfu": mfu,
                     "step": it,
                 }, step=it)
