@@ -3226,32 +3226,30 @@ $S$ 我在页面上叫 **saved tensors**，没有沿用常见的"激活值"这�
 
 剩下的按"吃不吃 GPU"分成两堆，因为它们的排期完全不同。
 
-## 7.1 代码：三件不吃 GPU 的前置
+## 7.1 代码：三件不吃 GPU 的前置（已完成）
 
-**① `decoding`（3 分）——唯一一行都没写的代码。** §6 那五节把温度、top-p、上下文裁剪、$\tau=0$ 的分支、六条可验证的不变量全推完了，**但只有笔记没有实现**：仓库里搜得到的 `decode` 只有 `BPETokenizer.decode`，那是 id → 文本，不是生成。这是卡住后面一切的瓶颈——`generate` 和 `main_experiment` 的第二个 deliverable 都要它。
+**① `decoding`（3 分）** ——已实现（`decoder.py`），细节见下面用户自己补的 §6 Inference 那节。
 
-**② `experiment_log`（3 分）的指标落盘。** 现在只有 `print` 到 stdout。handout 要的是能画出 **loss 对 gradient step** 和 **loss 对墙钟时间**两条曲线，外加一份"试过什么"的实验日志。缺的是持久化（csv / jsonl / wandb 随便哪种）和累计时间戳——`train.py` 里 `tokens_seen` 和 `t0` 每打印一次就归零，只够算瞬时吞吐，重建不出时间轴。后面七道实验题的 deliverable 全是"学习曲线"，都压在这套基建上。
+**② `experiment_log`（3 分）的指标落盘** ——已接 wandb（project `cs336-hw1`），并另有一份 `EXPERIMENTS.md` 作为"试过什么"的实验日志。
 
-**③ 四个 ablation 的开关。** `TransformerBlock` 和 `MultiHeadSelfAttention` 现在把 pre-norm + RoPE + SwiGLU 写死了，`post_norm` / `nope` / `silu_ffn` 这类配置项一个都没有。四道消融题要的是同一份代码走不同分支，不是四个复制粘贴的副本。
+**③ 四个 ablation 的开关** ——已加，见 §8.4。`train.py` 现在有 `--norm pre|post|none`、`--ffn swiglu|silu`、`--no_rope` 三个开关，不传任何一个 = 原来的基线行为。
 
-## 7.2 实验：一道都还没开始
+## 7.2 实验：除 leaderboard 外全部完成
 
-跑过一次 TinyStories，但在第 500 步（第一个 `eval_interval`）之前就断了——`checkpoints/tinystories_17M/` 里只有一个 `config.yaml`，一个 `ckpt_step_*.pt` 都没有。所以下面这些的前置是"先完整跑出一条基线"。
+| Problem                 | 分 | 要交什么                                                        | 状态 |
+| ----------------------- | -- | --------------------------------------------------------------- | ---- |
+| `experiment_log`        | 3  | 追踪基建 + 实验日志文档                                          | ✅ §8 |
+| `learning_rate`         | 3  | lr sweep 的学习曲线 + 至少一条发散曲线 + 边缘稳定性分析；**并且要交出验证损失 ≤ 1.45 的模型** | ✅ §8.3，最好 1.3323 |
+| `batch_size_experiment` | 1  | batch 从 1 扫到显存上限（含 64、128），必要时重调 lr             | ✅ §8.2 |
+| `generate`              | 1  | ≥ 256 token 的文本 + 流畅度评论 + 至少两个影响因素                | ✅ §8.5 |
+| `layer_norm_ablation`   | 1  | 去掉全部 RMSNorm，原 lr 一条 + 调低 lr 一条                      | ✅ §8.4.1 |
+| `pre_norm_ablation`     | 1  | post-norm vs pre-norm 对比曲线                                   | ✅ §8.4.2 |
+| `no_pos_emb`            | 1  | NoPE vs RoPE 对比曲线                                            | ✅ §8.4.3 |
+| `swiglu_ablation`       | 1  | SiLU FFN（$d_{ff}=4d_{model}$ 对齐参数量）vs SwiGLU               | ✅ §8.4.4 |
+| `main_experiment`       | 2  | OWT 学习曲线 + 生成文本 + 解释为什么同样算力下质量更差           | ✅ §8.6 |
+| `leaderboard`           | 6  | 45 分钟 B200 以内，验证损失至少打过 5.0 的基线                   | ⬜ 唯一剩下的 |
 
-
-| Problem                 | 分 | 要交什么                                                        |
-| ----------------------- | -- | --------------------------------------------------------------- |
-| `learning_rate`         | 3  | lr sweep 的学习曲线 + 至少一条发散曲线 + 边缘稳定性分析；**并且要交出验证损失 ≤ 1.45 的模型** |
-| `batch_size_experiment` | 1  | batch 从 1 扫到显存上限（含 64、128），必要时重调 lr             |
-| `generate`              | 1  | ≥ 256 token 的文本 + 流畅度评论 + 至少两个影响因素（依赖 §7.1 ①）|
-| `layer_norm_ablation`   | 1  | 去掉全部 RMSNorm，原 lr 一条 + 调低 lr 一条                      |
-| `pre_norm_ablation`     | 1  | post-norm vs pre-norm 对比曲线                                   |
-| `no_pos_emb`            | 1  | NoPE vs RoPE 对比曲线                                            |
-| `swiglu_ablation`       | 1  | SiLU FFN（$d_{ff}=4d_{model}$ 对齐参数量）vs SwiGLU               |
-| `main_experiment`       | 2  | OWT 学习曲线 + 生成文本 + 解释为什么同样算力下质量更差           |
-| `leaderboard`           | 6  | 45 分钟 B200 以内，验证损失至少打过 5.0 的基线                   |
-
-OWT 的数据已经 tokenize 好了（`owt_train.npy` 5.4 GB、`owt_valid.npy` 133 MB 都在），`main_experiment` 差的只是跑。
+全部实验的推导、数据和讨论在 **§8**。
 
 ## 7.3 一个容易混的题名
 
@@ -3263,8 +3261,316 @@ OWT 的数据已经 tokenize 好了（`owt_train.npy` 5.4 GB、`owt_valid.npy` 1
 
 这正好是全文反复讲的那个模式的又一个实例：**断链是响的，错链是哑的**。所以修的时候别只搜"点不开的"，要按新旧编号的映射表整体过一遍。
 
-## 7.5 建议的顺序
+## 7.5 建议的顺序（回头看：这个顺序是对的）
 
 decoding → experiment_log 落盘 → 跑通 TinyStories 基线 → lr sweep（顺手产出 ≤ 1.45 的模型）→ generate → 加 ablation 开关后四个消融排队跑 → OWT → leaderboard。
 
 前两项是纯代码、不占 GPU，而且是后面所有实验的前置，先做这两个最划算。
+
+**实际执行下来这条顺序还漏了一件事**：应该在 lr sweep **之前**先跑两条只换随机种子的重复实验，把噪声底线量出来。不然后面每个数字都不知道该不该信——我就因此把两处读错了，见 §8.1。
+
+---
+
+# 8. 实验：跑出来的东西
+
+§7 那张表里除 `leaderboard` 外的九道题，全部数据、推导和讨论都在这一章。
+
+**硬件**：单张 RTX 5090（32 GB，bf16 稠密峰值 209.5 TFLOPS）。handout 的预算以 B200 计，墙钟时间不能直接和它比。一次 TinyStories 完整训练（5000 步 × batch 256 × 上下文 256 = 3.28 亿 token）在这张卡上约 **9.5 分钟**，比 handout 说的"1 张 B200 上 20–30 分钟"还快——这说明 handout 那个估计相当保守。
+
+**基线配置**：$V=10000$，$T=256$，$d_{\text{model}}=512$，4 层 16 头，$d_{ff}=1344$，SwiGLU，pre-norm，RoPE $\Theta=10000$。**22.70 M** 参数（含两份 embedding；handout 说的 17M 是非 embedding 口径）。
+
+## 8.1 最重要的一条：先量噪声，再读差值
+
+这条放在最前面，因为它推翻了我自己的两个结论。
+
+跑完 lr sweep 和四个消融之后，我拿到一堆差值：SwiGLU vs 无门控 SiLU 差 0.0023，6e-3 vs 5e-3 差 0.0049，post-norm 差 0.038，NoPE 差 0.056。**问题是：0.0023 到底算不算"更好"？** 没有参照系就没法回答。
+
+所以补跑了三条**完全同配置、只换随机种子**的基线：
+
+$$\text{val loss} = 1.3381 \;/\; 1.3428 \;/\; 1.3323 \quad\Rightarrow\quad \sigma \approx 0.0053,\ \text{极差}\ 0.0105$$
+
+有了 $\sigma$ 再回头看，两处结论直接作废：
+
+| 我原先说的 | $\Delta$ | 倍数 | 实际 |
+| --- | --- | --- | --- |
+| "最优 lr 是 6e-3" | 0.0049 | $0.9\sigma$ | **站不住**。5e-3 和 6e-3 分不出高下，最优是一段**平台** |
+| "SwiGLU 比 SiLU 好 0.0023" | 0.0023 | $0.5\sigma$ | **站不住**。SiLU 的 1.3404 夹在基线自己两个种子（1.3381、1.3428）**中间** |
+
+活下来的：
+
+| 对比 | $\Delta$ | 倍数 | 判定 |
+| --- | --- | --- | --- |
+| NoPE vs RoPE | 0.057 | $10.7\sigma$ | 真 |
+| post-norm vs pre-norm | 0.039 | $7.3\sigma$ | 真 |
+| 8e-3 vs 最优平台 | 0.016 | $3.1\sigma$ | 真 |
+| 3e-3 vs 最优平台 | 0.014 | $2.5\sigma$ | 勉强 |
+
+**这是全章最贵的一课，而且它和 §2.4 的教训是同一个**：在那里，10 篇文档的小样本压缩率能和全量数字对上有运气成分；在这里，一次训练的 val loss 也是个随机变量。**任何"A 比 B 好"的结论，都必须先知道"A 比 A 自己好多少"。** 代价是两条 20 分钟的重复实验，换来的是后面每个数字能不能写进报告。
+
+## 8.2 显存墙：先分清"崩了"和"装不下"
+
+`batch_size_experiment` 要求"从 1 扫到显存上限"。扫到 1024 时报了这个：
+
+```
+RuntimeError: invalid shape dimension -1673527296 at index 0 of shape [-1673527296]
+```
+
+**这不是 OOM。** logits 是 $[1024, 256, 10000]$ = 2,621,440,000 个元素，而
+
+$$2{,}621{,}440{,}000 - 2^{32} = -1{,}673{,}527{,}296$$
+
+一位不差。根因在 `cross_entropy` 里那句 `einx.get_at`：它的实现是**先把张量摊平成一维、再用算好的线性下标去取**，而摊平后的长度用 int32 存。元素数一过 $2^{31}$ 就翻负。换成 `torch.gather`（按维度取，不摊平）就没有这个上限。
+
+修完之后**batch=1024 依然跑不了**，但这次是真 OOM。这两件事必须分开记，因为它们的结论完全不同：一个是"代码有 bug"，另一个是"这张卡就这么大"。
+
+实测的墙（新加了 `torch.cuda.max_memory_allocated()` 到日志和 wandb）：
+
+| batch | 320 | **352** | 384 | 512 | 1024 |
+| --- | --- | --- | --- | --- | --- |
+| 峰值显存 | 22.51 GB | **24.72 GB** | OOM | OOM | OOM |
+
+**384 按线性外推只要 26.9 GB，卡上有 32 GB，却仍然 OOM。** 差的是 `max_memory_allocated`（PyTorch 实际分配的）和 `nvidia-smi` 看到的之间那一截：分配器保留但未使用的块、碎片、CUDA context、显示占用。**所以"理论显存够"和"跑得起来"之间永远有一道 20–25% 的缓冲，规划 batch 时别顶到理论值。**
+
+结果：
+
+| batch | 1 | 64 | 128 | 256 | **352** |
+| --- | --- | --- | --- | --- | --- |
+| val loss | 2.9307 | 1.5452 | 1.4694 | 1.4188 | **1.4025** |
+| MFU | | | | 30.8% | **32.98%** |
+
+**收益递减得很快**：每翻一倍换来的改善是 0.076 → 0.051 → 0.016（最后一档只翻了 1.375 倍）。
+
+**但"大 batch 有害"在这里看不到**，因为实验是**固定步数**的：batch 越大看到的 token 越多，两个效应同向。常说的"批量太大泛化更差"前提是固定 epoch 数、大 batch 因此少走很多步。要复现那个现象得改成固定 token 预算再扫。
+
+**batch=1 掉到 2.93 有三重原因叠加**，不能只归给 batch：① 只看了 $1/352$ 的 token；② lr 没跟着重调（沿用 1e-3，对 batch=1 几乎必然过大）；③ 单样本的梯度噪声。
+
+**真正让人想要大 batch 的是吞吐**：256 → 352 让 MFU 从 30.8% 涨到 32.98%，因为矩阵乘的 $M$ 维从 65,536 涨到 90,112，tensor core 喂得更满。**是硬件效率，不是收敛质量。**
+
+## 8.3 学习率：最优就贴在发散边缘，但中间还有一段窄带
+
+| lr | 5e-4 | 1e-3 | 3e-3 | **5e-3** | **6e-3** | 8e-3 | 1e-2 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| val loss | 1.5066 | 1.4186 | 1.3512 | **1.3377**(3 种子均值) | **1.3328** | 1.3539 | 5.5256 |
+
+**搜索策略**：先按半个数量级粗扫定出"最优在哪一档、发散在哪一档"，再在两者之间补点。粗扫给出最优 5e-3、发散 1e-2，只差一档，于是补了 6e-3 和 8e-3。
+
+**deliverable ②（≤ 1.45）**：达标，最好 **1.3323**。
+
+**deliverable ③（edge of stability）**：最优平台 5e-3 ~ 6e-3，发散阈值 1e-2，只差 **1.7 ~ 2 倍**——"最好的学习率贴在发散边缘"这条民间智慧在这里成立。
+
+但补的两点还捞到一个粗扫看不见的结构：**8e-3 已经变差（$3.1\sigma$），但还没发散**。
+
+```
+   ← 稳定且改善 →|← 平台 →|← 稳定但退化 →|← 发散 →
+ 5e-4 ········ 5e-3 ·· 6e-3 ······· 8e-3 ······· 1e-2
+1.5066        1.3377  1.3328       1.3539       5.5256
+```
+
+从"最优"到"炸掉"**不是断崖**，中间有一段仍然收敛、只是性能退化的窄带。这和 edge-of-stability 的图像自洽：损失面的最大 Hessian 特征值会自己调整到 $\approx 2/\text{lr}$ 附近，lr 越大越把优化推向更平的区域，直到 lr 大过阈值、这个自平衡维持不住。退化窄带就是"还稳得住、但已经被迫在太平的区域里走"的那一段。
+
+**记住这个数：整个 sweep 的收益 $1.5066 \to 1.3323 = 0.174$，全部来自把 lr 从 5e-4 推到 6e-3。** §8.4.1 会再用一次。
+
+## 8.4 四个消融
+
+全部对齐基线 lr=5e-3 / batch=256 / 5000 步（基线 $1.3377$）。
+
+```
+拆光 RMSNorm   ████████████████████  +0.151  （同 lr 直接 NaN，须降 lr 一个数量级）
+NoPE           ███████               +0.057  （10.7σ）
+post-norm      █████                 +0.039  （ 7.3σ）
+无门控 SiLU    ▏                     +0.003  （ 0.5σ）← 噪声
+```
+
+顺序是：**norm 的存在 ≫ 位置编码 > norm 的位置 ≫ FFN 门控**。值得玩味的是这个顺序和"大家爱改哪个"几乎相反——门控（SwiGLU/GeGLU/ReGLU）是近年被换来换去最多的部件，而它在这里恰恰是唯一读不出效应的。
+
+### 8.4.1 `layer_norm_ablation`：RMSNorm 买的不是拟合，是学习率的天花板
+
+在原最优 lr（5e-3）下**第 200 步 NaN**，而且死得极有指向性：
+
+```
+step 150 | loss 2.5222 | lr 3.7500e-03   ← 一路正常下降
+step 200 | loss nan    | lr 5.0000e-03   ← 炸
+```
+
+warmup 正是 200 步——**它恰好在 lr 第一次爬到峰值的那一步炸掉**。前 150 步完全正常。所以不是"去掉 norm 就不能训"，而是"能承受的 lr 上限被大幅压低"。
+
+| lr | 5e-4 | **7e-4** | 1e-3 | 5e-3 | 8e-3 | 1e-2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 拆光 RMSNorm | 1.5433 | **1.4885** 最优 | **NaN** | **NaN** | — | — |
+| 基线 | 1.5066 | — | 1.4186 | 1.3377 | 1.3539 | 5.5256 ✗ |
+
+两条曲线各自的发散阈值：基线在 $[8\text{e-}3,\ 1\text{e-}2)$，no-norm 在 $[7\text{e-}4,\ 1\text{e-}3)$。**比值约 10 倍——拿掉 RMSNorm，可用学习率的天花板整整掉一个数量级。**
+
+**结论，以及它为什么反直觉**：同一个 lr（5e-4）下，拆掉 RMSNorm 只差 **0.037**。RMSNorm 几乎不直接改善拟合。真正的伤害是它把你锁在低 lr 区，而 §8.3 已经测出这段 lr 空间值多少钱：
+
+```
+no-norm 实际能拿到的最好成绩              1.4885  (lr 7e-4)
+若它能用 5e-3、且只付「同 lr 下」那份代价   1.3747  (= 1.3377 + 0.037)
+基线实际拿到的                            1.3377  (lr 5e-3)
+
+总差距 0.151 = 直接代价 0.037 (24%) + 被锁在低 lr 的代价 0.114 (76%)
+```
+
+**约 3/4 的伤害是间接的。** 这解释了为什么它是 Transformer 里少数没人敢动的组件——拿掉它、单看某一个 lr 的损失并不吓人（0.037），吓人的是你从此够不到那段真正出成绩的学习率。
+
+**这也回答了 §3.1 留的那个问题**（"为什么 pre-norm 最后还要补一个 RMSNorm"）的一半：归一化在这个架构里的作用是**约束残差流的尺度**，而尺度失控直接翻译成"学习率不能大"。一个提前的信号：同一份权重下，`norm=none` 相对 pre-norm 的输出最大差是 **126.06**（post-norm 只有 0.84，NoPE 只有 0.53）——**还没训练就差这么多**。
+
+### 8.4.2 `pre_norm_ablation`：位置只值 0.039，但方向明确
+
+post-norm **1.3762**，差 0.039（$7.3\sigma$，真信号），**但完全没有不稳定**，整条曲线稳稳下来。和上一节合起来是一句干净的话：
+
+> norm 的**存在**决定能不能训（拆掉 → 同 lr 直接 NaN）；
+> norm 的**位置**决定训得多好（挪到残差流上 → 稳定，但差一档）。
+
+4 层这个深度上代价只有 0.039。post-norm 真正的问题（深层不 warmup 就发散）要更深的网络才显形，这个规模看不到。
+
+**实现上有个判断要记**：`ln_final` 只有 pre-norm 保留。post-norm 每个子层出口本就归一化过，不需要；`norm=none` 是要故意全拆。这是 handout "remove all of the RMSNorms from your Transformer" 的字面读法。
+
+### 8.4.3 `no_pos_emb`：NoPE 能训，但让模型自己挖位置是要付钱的
+
+NoPE **1.3945**，差 0.057（$10.7\sigma$），训练过程毫无异常。
+
+这印证了 handout 引的 Tsai 2019 / Kazemnejad 2023：decoder-only 模型靠因果 mask 本身就能推断位置，位置编码不是"有没有"的问题。但 0.057 说明**让模型从 mask 里自己挖位置，比直接把相对位置喂给它要贵**——而且这是三个能训起来的消融里最贵的一个。
+
+**一个静默陷阱**：去掉 RoPE **不改变任何权重的形状**。NoPE 训出来的 checkpoint 能原样装进一个带 RoPE 的模型里，不报错，只是生成乱码。`norm` / `ffn` 那两个开关至少还会 shape 不匹配。所以 `decoder.py` 必须从 config 里读 `no_rope` 重建架构——**又一次"断链是响的，错链是哑的"**（§7.4 那条模式的第 N 次复现）。
+
+### 8.4.4 `swiglu_ablation`：门控的效应小到测不出来
+
+SiLU 无门控 **1.3404**，基线三种子 **1.3323 / 1.3381 / 1.3428**：
+
+```
+基线 seed3    1.3323
+基线 seed1337 1.3381
+SiLU 无门控   1.3404   ← 夹在基线自己的种子波动里
+基线 seed2    1.3428
+```
+
+$0.5\sigma$。**这不是"门控带来微小改善"，是"测不出来"。**
+
+参数量已经对齐到 1.6% 以内——SwiGLU 三个矩阵 $3 \cdot 512 \cdot 1344 = 2{,}064{,}384$，SiLU 两个矩阵 $2 \cdot 512 \cdot 2048 = 2{,}097{,}152$，用的是恒等式 $3 \cdot \frac{8}{3} = 2 \cdot 4 = 8$。所以差异不来自容量。
+
+诚实的读法：Shazeer 报的增益本来就不大，而 22.7 M 参数 / 3.3 亿 token / TinyStories 这个尺度不足以让它显形。**要下"SwiGLU 不值得"的结论，需要多种子重复 + 更大规模**，本实验只能说在这个尺度上看不到。
+
+## 8.5 `generate`：子词切分特有的失效模式
+
+`seed3` checkpoint（val 1.3323），温度 0.8，top-p 0.9，**152 token 遇 `<|endoftext|>` 自停**——模型自己学会了在故事讲完时收尾。
+
+叙事结构完整（起因 → 冲突 → 解决 → 道德收尾），指代一致，时态统一，引号配对。**一个自洽性检查**：生成文本的压缩率 **4.072 字节/token**，训练语料是 **4.071**（§2.4 那张训练产物表）——模型复现出了和语料一致的 token 分布。
+
+同 checkpoint、同提示词，只改解码参数：
+
+| $\tau$ | 输出 |
+| --- | --- |
+| 0.0（贪心） | 完全通顺，但最安全最套路，而且确定性，每次一样 |
+| 0.8 | 通顺 + 有变化，最佳区间 |
+| 1.0 | 仍通顺，但出现语义滑坡："The little ant and the big, dark cave became very dark" |
+| **1.5** | **崩坏**："an elderly mule and special looking navy **tranquurde**"、"**oblboardingorance**"、"**tradmerAdamicking**" |
+
+$\tau=1.5$ 那些是**不存在的词**，不是用错的词。**根因在 tokenizer 那一层**：BPE 的词表是子词片段，从分布尾巴上采样时模型会把几个片段拼成一个从未在语料里出现过的字符串。字符级模型（片段太小、拼不出词形）和词级模型（词表里就没有这种东西）都不会这样坏——**这是子词切分特有的失效模式**，也是 §2.4 那个"词表里有多少格子被垃圾占掉"的讨论的下游后果。
+
+top-p 是同一件事的自适应版本：$\tau=1.0$ + top_p=1.0（不截断）已经出滑坡；$\tau=0.8$ + top_p=0.9 就干净。模型有把握时 top-p 几乎不裁，没把握时裁得狠。
+
+## 8.6 `main_experiment`：两个数据集的 loss 不能直接比
+
+架构和步数照抄 TinyStories，**只有 `vocab_size` 跟着 tokenizer 变**（10K → 32K）。这一项就把模型从 22.70 M 撑到 **45.22 M**——多出来的 22.5 M 全在 embedding 和 lm_head。
+
+**连带后果比想象中大**：
+
+| | TinyStories | OpenWebText |
+| --- | --- | --- |
+| 参数量 | 22.70 M | **45.22 M** |
+| 每 token $3F/T$ | 111.7 MFLOPs | **179.3 MFLOPs** |
+| `lm_head` 占前向 FLOPs | 27.5% | **54.8%** |
+| logits $[256,256,V]$ bf16 | 1.31 GB | **4.19 GB** |
+
+**显存挡了一道**：batch 256 直接 OOM。但不能简单降 batch——降了就少看一半 token，两个数据集的 loss 更没法比，而这个对比恰恰是这道题要问的。所以补了**梯度累积**：micro-batch 128 × accum 2 = 有效 batch 256，token 预算和步数都对齐（实现细节见 §8.7）。
+
+### 结果与 BPB 换算
+
+$$\text{BPB} = \frac{\text{loss}}{\ln 2 \cdot (\text{字节/token})}$$
+
+| 语料 | val loss | 困惑度 | 字节/token | **BPB** | 随机猜的 BPB |
+| --- | --- | --- | --- | --- | --- |
+| TinyStories | 1.3323 | 3.79 | 4.071 | **0.472** | 3.264 |
+| OpenWebText | 3.9287 | 51.88 | 4.363 | **1.300** | 3.430 |
+
+原始 loss 比 **2.96×**，BPB 比 **2.75×**。差别不大，但方向说明了问题：**交叉熵的单位是"每 token 的 nat"，而两边的 token 根本不是一回事**——词表不同、压缩率也不同。OWT 的 token 更"重"（4.363 字节/token），同样的 per-token loss 摊到每个字节上要除以更大的数。**跨 tokenizer 比模型，BPB 才是不受词表选择影响的那个量。**
+
+困惑度更直观：TinyStories **3.79**（平均每步只在不到 4 个候选里挑），OWT **51.88**。
+
+### 生成的文本：局部完美，整体空洞
+
+```
+The future of the U.S. is not yet known, but for the foreseeable future, the
+U.S. will be forced to rely on the U.S. to adapt its policies to [...]
+That is why the U.S. has already ruled out the U.S. nuclear arsenal.
+```
+
+语法、标点、引号配对、段落结构、新闻文体**全对**——单看任何一个从句都像真的。但：
+
+- **强迫性重复**：204 词里 "U.S." 出现 **19 次**，平均每 10.7 个词一次
+- **自相矛盾**："the U.S. will be forced to rely on the U.S."
+- **指代无着**：第二个样本的 "he" 从头到尾没有指称对象
+- **type-token ratio 0.490**，比 TinyStories 那段的 0.548 **还低**——词表大 3.2 倍，用词反而更单调
+
+### 为什么同样的模型、同样的算力，质量差这么多
+
+**① 任务本身难 2.75 倍**（BPB）。TinyStories 是 GPT-4 按"3–4 岁儿童能懂"的约束生成的；OWT 是真实网络爬取，主题、实体、文体、语言全部开放。
+
+**② 学到的是表层统计，不是内容模型。** 上面那两段正是分界的样本：句法和文体是**局部**规律，几百 token 的上下文就能学会；"不要重复""指代要有着落""论点要推进"是**长程**规律，需要在 256 的窗口里维持状态，还需要世界知识来约束。**模型把便宜的那一半学到了，贵的那一半没有。**
+
+**③ 语料覆盖率差 5 倍。** 同样 3.28 亿 token 的预算：TinyStories 训练集 5.41 亿 token，跑了 **0.61 个 epoch**；OWT 训练集 27.3 亿，只跑了 **0.12 个**。
+
+**④ 两边都远未训够，OWT 更甚。** 按 Chinchilla 的 20 token/参数：TinyStories 的 22.7 M 实际拿到 **14.4** token/参数，OWT 的 45.22 M 只有 **7.2**。**模型大了一倍，预算没变，每参数分到的 token 直接减半。**
+
+**⑤ 一多半算力买的是 softmax，不是表示。** $V$ 从 10K 到 32K，`lm_head` 占前向 FLOPs 从 27.5% 涨到 **54.8%**。这次多花的 60% 算力，绝大部分买的是"在 32000 个候选里做 softmax"的能力，**中间 4 层 Transformer 的容量一点没变**。这是"同样架构换个数据集"时最容易漏掉的一笔账，也是 §5.4 那个 $T^\ast$ 讨论的实际后果。
+
+## 8.7 顺手补的两件基建
+
+### 梯度累积
+
+显存装不下目标 batch 时，把它切成 `accum` 份依次前向反向，梯度在 `.grad` 里自然累加，最后只 `step` 一次。**数学上等价于一次大 batch，省的是显存不是算力**（时间照样是 accum 倍）。
+
+三个必须做对的地方：
+
+1. **每份的 loss 要除以 `accum`。** `cross_entropy` 里已经 `.mean()` 过了，直接累加等于把 accum 份各自的均值再求和，梯度会大 accum 倍。**实测漏掉时梯度范数正好是 2.00 倍**（accum=2），和推导一致。
+2. **梯度裁剪只能在累加完之后做一次**，对着完整梯度裁。放在每份里面裁的是分片梯度，等价于一个更强、而且依赖切分方式的约束。
+3. **`zero_grad` 挪到整轮开头**，不能放在每份前面（那样就只剩最后一份的梯度了）。
+
+正确性验证：fp64 下 accum=2/4/8 与一次大 batch 的梯度**逐元素相同**（最大差 $1.4\times10^{-17} \sim 2.1\times10^{-17}$，纯舍入）。
+
+数据流的 rng 种子从 `[seed, it]` 改成 `[seed, it, micro]`，续训仍然接得上（§5.3 那个"batch 是 (种子, t) 的纯函数"的设计照旧成立）。
+
+### MFU 的两个常数都填错了，而且偏的方向相反
+
+原来算的是 $\text{MFU} = \text{tok/s} \times 6P \div \text{peak}$：
+
+| | 原来 | 正确 | 差 |
+| --- | --- | --- | --- |
+| 每 token FLOPs | $6P$ = 136.18 M | $3F/T$ = 111.72 M | $6P$ **高估 21.9%** |
+| 峰值 | 340 TFLOPS | 209.5 TFLOPS | **高估 62%** |
+
+**$6P$ 高估的两个来源**：① 它把 embedding 查表当成算力，而查表是索引、**0 FLOP**——本配置下 embedding 占 $P$ 的 22.6%，凭空多出 30.72 MFLOPs/token；② 它又漏掉注意力里两个 $T^2$ 项，少算 6.29 MFLOPs/token。净效果高估 21.9%。
+
+**这个偏差随配置剧烈变化**：换到 OWT（$V$=32K）上，embedding 占参数的 72%，$6P$ **高估 51.3%**。所以 $6P$ 不是"差不多能用的近似"，它的误差取决于 $V \cdot d$ 相对 $L \cdot d^2$ 的比例，小模型 + 大词表时会离谱到不能用。
+
+**峰值那个 340** 不对应 RTX 5090 任何一个公布口径：419 是带 sparsity 的，104.8 是 FP32 shader，**PyTorch 的 bf16 矩阵乘走的是 FP32 累加那条，209.5**。（顺带一个测法：在卡被占用时跑 matmul 基准，bf16 和 tf32 的**比值**仍然是准的——实测 109.2 : 54.7 = 2.00，正好对上规格表的 209.5 : 104.8。）
+
+两个错方向相反，合起来把 MFU 报低了：实测 578,000 tok/s，原报 23.2%，**真实 30.8%**（= 实际 64.6 TFLOPS）。对 22.7 M 这么小的模型 + 手写 attention，30% 算健康（nanoGPT 124M 在 A100 上约 37%，PaLM 540B 46%）。
+
+**剩下的空间在哪**：`scaled_dot_product_attention` 是 einsum + 显式 softmax 手写的，每层要落地 $[256,16,256,256]$ = **0.54 GB** 的 scores（bf16），softmax 后又一份。**attention 只占前向 5.6% 的 FLOPs，却扛着这么多访存。** 换成 FlashAttention 是唯一能明显抬一截的改动——但作业要求手写，这块动不了。
+
+
+
+## 6. Inference (Text Generation)
+
+### 6.1 Decoder Implementation (`decoder.py`)
+- **Core Logic**: Implemented an autoregressive generation loop. In each step, the model predicts the next token distribution.
+- **Temperature Scaling**: `logits / temperature` is used to control the randomness of the generation.
+- **Top-p (Nucleus) Sampling**: We sort the logits in descending order, compute the cumulative softmax probabilities, and mask out tokens whose cumulative probability exceeds `top_p`. This prevents generating completely nonsensical tokens while maintaining diversity.
+- **Handling EOF/Truncation**: Added explicit detection for `eos_id` (the `<|endoftext|>` token, id 9999 for TinyStories 10k vocab). Generation correctly halts early if the model emits this token, saving compute and preventing garbage text padding.
+
+### 6.2 Interactive CLI (`interactive.py`)
+- **Continuous Generation (Story Mode)**: Designed a conversational/interactive CLI where the user can repeatedly provide prompts.
+- **Rolling Context**: To manage the strict `context_length = 256` constraint of the TinyStories model, the script automatically truncates the conversation history from the left, keeping only the most recent tokens. This avoids out-of-memory or shape mismatch errors during long sessions.
+- **MFU Integration**: During generation, we also monitor the generation speed (`tokens/sec`).
