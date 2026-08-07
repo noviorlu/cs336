@@ -3848,6 +3848,44 @@ $$d=704,\ L=11\ \Rightarrow\ d/L = 64,\quad P = 87.5\text{M}$$
 
 **一个必须在提交里写清的口径**：我们没有 B200，所以 handout 要的那条"横轴 < 45 分钟"的曲线只能报 **5090 的真实墙钟 + 换算依据 + 实际交付的模型 FLOPs**。FLOPs 才是不受硬件口径影响的量——和 §8.6 里"跨 tokenizer 只能比 BPB"是同一个道理。
 
+### 结果
+
+**val loss = 3.2786**（26,943 步跑满，墙钟 3 小时 18 分，实测均值 103.2 TFLOPS / MFU 49.3%）。
+
+| run | 配置 | 预算 (FLOPs) | val | 困惑度 | BPB | 从上下文榨出 |
+| --- | --- | --- | --- | --- | --- | --- |
+| OWT 基线 | 45M, $d$512/$L$4 | 5.87e16 | 3.9287 | 50.84 | 1.299 | 3.631 |
+| `lb_A1` | 81M, lr 3e-3（炸） | 2.02e17 | 4.9853 | 146.25 | 1.649 | 2.574 |
+| `mA1` | 81M, $C/4$ | 3.02e17 | 3.5300 | 34.12 | 1.167 | 4.030 |
+| `mB1` | 109.5M, $C/4$ | 3.02e17 | 3.5533 | 34.93 | 1.175 | 4.006 |
+| **`final`** | **109.5M, 跑满 $C$** | **1.21e18** | **3.2786** | **26.54** | **1.084** | **4.281** |
+
+- leaderboard 及格线是 5.0，**超出 1.72**
+- 相对最初的 45M 基线：loss $-0.650$，BPB $1.299 \to 1.084$（$-16.5\%$），从上下文榨出的信息 $+17.9\%$
+- **MFU 随规模单调上升**：45M 26.2% → 81M 43.0% → 109.5M **49.3%**。矩阵乘越大 tensor core 喂得越满。这回头印证了 §8.4.6 里"不能用峰值比 10.74× 换算 B200"的判断——小模型在更大的芯片上 MFU 只会更低
+
+### 生成质量，以及一个不该用的指标
+
+同样的提示词 "The future of"：
+
+**45M（val 3.929）**——204 词里 "U.S." 出现 19 次，"the U.S. has already ruled out the U.S. nuclear arsenal" 这种自相矛盾，"he" 没有指称对象。
+
+**109.5M（val 3.279）**——
+
+```
+The future of politics is in tatters. In fact, it's the future of America.
+I have no interest in politics. I do not have a book on it, and I don't want
+to write a book about politics. I am neither a political expert, nor a
+political theorist. [...] But that's not what America is about. It's about
+creating a political revolution, a movement that transcends politics.
+```
+
+第一人称立场全程一致，有真正的修辞推进（"In fact" / "But that's not what..."），转折成立。仍有重复（"I'm not a Republican because..." 出现两次），但那是真实评论文章也有的那种重复。
+
+**一个我算错方向的指标**：type-token ratio 在等长（~126 词）下是 **0.570（45M）vs 0.520（109.5M）**——**它不支持"更多样"这个结论**。原因是 TTR 惩罚主题聚焦：45M 重复 19 次 "U.S." 是无内容的抽搐，新模型重复 5 次 "politics" 是因为它真的在谈政治，TTR 分不出这两种。**质量提升的证据只能算 val loss 和可读性，不该拿 TTR 硬凑。**
+
+> **同时更正 §8.6**：那里拿 45M 输出的 TTR 0.490 和 TinyStories 的 0.548 作对比，两段长度不同（204 词 vs 126 词），而 **TTR 强烈依赖文本长度**——短文本天然更高。那个对比不成立，已在原处标注。
+
 ## 8.4.7 消融在 OWT 上重跑：一个迁移了，一个彻底没有
 
 §8.4.6 定的表，第 26–30 行的数据。**先看噪声底线**：OWT 基线两个种子 3.9287 / 3.9339，$\sigma \approx 0.0037$。
@@ -3988,7 +4026,8 @@ That is why the U.S. has already ruled out the U.S. nuclear arsenal.
 - **强迫性重复**：204 词里 "U.S." 出现 **19 次**，平均每 10.7 个词一次
 - **自相矛盾**："the U.S. will be forced to rely on the U.S."
 - **指代无着**：第二个样本的 "he" 从头到尾没有指称对象
-- **type-token ratio 0.490**，比 TinyStories 那段的 0.548 **还低**——词表大 3.2 倍，用词反而更单调
+- ~~**type-token ratio 0.490**，比 TinyStories 那段的 0.548 **还低**~~ ← **这条对比不成立**：
+  两段长度不同（204 词 vs 126 词），而 TTR 强烈依赖文本长度，短文本天然更高。详见 §8.4.11
 
 ### 为什么同样的模型、同样的算力，质量差这么多
 
