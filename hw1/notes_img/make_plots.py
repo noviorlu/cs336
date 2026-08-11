@@ -325,4 +325,37 @@ ax.set_ylim(20, 68)
 ax.set_title("矩阵乘越大，tensor core 喂得越满", fontsize=10)
 save(fig, "13_summary", "从 45M 到 109.5M：loss 降 0.65，MFU 从 26% 涨到 49%")
 
+# ═══ 14 固定 token vs 固定算力：同一对模型，两个口径相反的赢家 ═══════════
+fig, axes = plt.subplots(1, 2, figsize=(12.4, 4.7))
+ax = axes[0]
+ra, rb = pick(name="final_d768L12"), pick(name="owt1ep_06B")
+line(ax, ra, "109.5M（d768/L12）", C["blue"], key="eval/val_loss", marker="o", ms=3)
+line(ax, rb, "570.5M（d1408/L22）", C["orange"], key="eval/val_loss", marker="o", ms=3)
+ax.axhline(7.5597, ls="--", lw=1.2, color=C["gray"])
+ax.text(1500, 7.72, "unigram 熵 7.56", fontsize=9, color=C["gray"])
+# 两条 step 含义相同（有效 batch 和 ctx 都一样），所以 step 轴就是 token 轴
+sa = ax.secondary_xaxis("top", functions=(lambda x: x * 65536 / 1e9, lambda x: x * 1e9 / 65536))
+sa.set_xlabel("token (B)", fontsize=10)
+ax.set_xlabel("step"); ax.set_ylabel("val loss"); ax.set_ylim(2.8, 8.5)
+ax.legend(fontsize=10, frameon=False)
+ax.set_title("横轴是 token：0.6B 全程领先，差距还在拉大", fontsize=10, pad=32)
+ax = axes[1]
+lbl = ["固定 token\n(1.70B)", "固定算力\n(1.21e18 FLOPs)"]
+va = [3.2796, 3.2786]; vb = [3.0759, 3.62]
+x = range(2); w = .35
+ax.bar([i - w/2 for i in x], va, w, label="109.5M", color=C["blue"])
+ax.bar([i + w/2 for i in x], vb, w, label="570.5M", color=C["orange"])
+for i in x:
+    ax.text(i - w/2, va[i] + .04, f"{va[i]:.3f}", ha="center", fontsize=10)
+    ax.text(i + w/2, vb[i] + .04, f"{vb[i]:.3f}", ha="center", fontsize=10)
+    win = "0.6B 赢 0.20" if i == 0 else "100M 赢 0.34"
+    # 放柱子上方而不是柱身里——柱身里会被颜色吃掉
+    ax.text(i, max(va[i], vb[i]) + .17, win, ha="center", fontsize=11,
+            color=C["green"] if i == 0 else C["red"], weight="bold")
+ax.set_xticks(list(x)); ax.set_xticklabels(lbl, fontsize=10)
+ax.set_ylabel("val loss"); ax.set_ylim(2.6, 4.05)
+ax.legend(fontsize=10, frameon=False, loc="lower left")
+ax.set_title("换个口径，赢家就反过来", fontsize=10)
+save(fig, "14_fixed_token_vs_flops", "0.6B 每 token 贵 5.1 倍：数据受限时它赢，算力受限时它输")
+
 print("done")
