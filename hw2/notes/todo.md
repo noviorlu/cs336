@@ -378,12 +378,26 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
 1. **PDF 命名不一预警**：抄 PDF 示例时，注意官方管我们的 `rope` 参数叫 `positional_encoder`。
 2. **Hook 盘点**：`tests/adapters.py` 里留了 8 个空接头（如 `get_ddp`）等着后面填。注意 PDF 里写的 `get_flash_autograd_function_triton` 在实际文件里叫 `get_flashattention_autograd_function_triton`。
 3. **💡 表格自动化 Tip**：写 benchmark 时，顺手用 pandas 将结果存成 DataFrame 并调 `.to_markdown()`，方便直接贴进知乎。
-4. **hw2 没有"安装步骤"**。README 的安装指令藏在 Setup 末尾编号 `0.` 的代码块里，容易漏。
-   要点是 **`uv run` 会按 `pyproject.toml` 自动装依赖**——第一次跑任何 `uv run ...` 就地建出
-   `hw2/.venv` 并装好。所以：
-   - 不需要 `uv sync` / `pip install -e` / `conda activate`
-   - §0 Action 4 改完 `pyproject.toml` 后**不用再执行安装命令**，下次 `uv run` 自己重建
-     （`uv.lock` 的 diff 就是证据）
+4. **怎么跑 hw2 的脚本：什么都不用配，直接 `uv run`**。
+   README 的安装指令藏在 Setup 末尾编号 `0.` 的代码块里，容易漏；要点是
+   **`uv run` 会按 `pyproject.toml` 自动装依赖**，第一次跑就地建出 `hw2/.venv`。
+   ```sh
+   cd /home/yc/projects/LLM/hw2
+   uv run python cs336_systems/benchmark.py --size medium
+   uv run pytest
+   uv run pytest -k test_flash_forward_pass_pytorch
+   uv run /home/yc/miniconda3/envs/diff/nsight-compute-2025.3.1/host/target-linux-x64/nsys \
+          profile -o out --force-overwrite true -t cuda,nvtx python xxx.py   # 见 Action 5
+   ```
+   - **从子目录跑也行**，uv 会向上找 `pyproject.toml`（实测在 `cs336_systems/` 里可用）
+   - `VIRTUAL_ENV ... will be ignored` 的警告**是正常的**，意思是"忽略你的 conda，用项目 .venv"
+   - 两个包都是 editable 安装，脚本放哪都能 import：
+     `cs336_systems` → `hw2/cs336_systems/`，`cs336_basics` → **`hw1/cs336_basics/`**（§0 生效）
+   - 要交互式 shell 或让 IDE 认：`source hw2/.venv/bin/activate`；
+     IDE 解释器填 `/home/yc/projects/LLM/hw2/.venv/bin/python`
+   - **别做**：① `conda activate genai`（uv 会忽略；`uv run --active` 能强制用 conda 环境，
+     但那里没有 hw2 的依赖）② `pip install`（不进 `uv.lock`，换机器/上云就丢，加依赖用 `uv add`）
+     ③ 以为改完 `pyproject.toml` 要手动重装（下次 `uv run` 自己重建，`uv.lock` 的 diff 就是证据）
 5. **两个项目的 `.venv` 各自独立，底座还不一样**（2026-08-30 查明）：
    ```
    hw1/.venv  ← /home/yc/miniconda3/envs/genai   Python 3.12.12
