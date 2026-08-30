@@ -447,10 +447,44 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
   - **预热与计时机制**：先执行 $w$ 次预热步（只运行不计时），再执行 $n$ 次测量步。使用高精度的 `timeit.default_timer()` 进行计时。
 - [ ] ⚠️ **GPU 测速天坑防御**：在每一步（无论是 warmup 还是 measure）执行结束后，必须严格调用 `torch.cuda.synchronize()` 强制 CPU 挂起等待 GPU 队列清空，否则测出的只是“CPU 发送指令的时间”。
 - [ ] 默认配置照 §0 的模型配置表：vocab 10000、batch 4、**context_length 512**（PDF Table 1 下方注明"除非另有说明"）
-- ⚙️ **一个必须先定的设计选择：仅前向模式要不要包 `torch.no_grad()`？**
-  PDF 没规定，但它**直接决定下面那张表里哪些格是 OOM**：包了就不存反向激活，
-  显存差一个数量级，xl 可能跑得动；不包则和 fwd+bwd 走同一条代码路径、更诚实。
-  **选哪个都行，但必须在博客里写明**，否则读者拿自己的机器对不上账。
+
+**🔧 骨架设计决定（2026-08-30 定，写之前先读这段）**
+
+| # | 问题 | 结论 |
+|---|---|---|
+| D1 | 仅前向要不要 `no_grad` | **拆成两个正交开关**：`--mode {forward,fwd_bwd,full}` 决定跑到哪步，`--inference` 决定要不要 `no_grad`。**默认不带 `--inference`**（保留 autograd 图） |
+| D2 | 前向/反向怎么分别计时 | **只做相减法**，不在步骤内插 `synchronize` 分段计时 |
+| D3 | OOM 归因到阶段 | 闭包工厂多返回一个 `probe`，闭包内写 `probe.stage` |
+
+- **D1 的依据**：PDF 两处把 forward-only 等同于 inference（§2.2(d) "compared to doing
+  inference (forward pass only)"、§2.5(a) "either doing inference only ... or a full
+  training step"）；但 §2.1 的三种模式读起来是训练步的**前缀**，且 §2.2(a) 要拿 nsys 的
+  前向时间和 §2.1 的数**对账**。两个开关正交就都能满足。
+  → 表会多一列（inference 前向）。**xl 很可能只有这一列跑得出来**，正好是第 1 篇的素材。
+- **D2 的代价**：分段计时要在 fwd/bwd 之间插 `synchronize`，那会**掐断 CPU/GPU 重叠**、
+  把总时间抬高——测量本身改变了被测对象。不值当，改用相减：
+  ```
+  forward             = F          fwd_bwd − forward = B
+  full − fwd_bwd      = O          forward --inference = 独立第 4 列，不参与相减
+  ```
+  ⚠️ **博客里必须写明反向时间是减出来的**，以及它隐含的可加性假设。
+- **D3 为什么需要 probe**：计时循环只调不透明的 `step_fn()`，`try/except` 在闭包外，
+  拿不到"炸在哪一步"。而 §2.1 的表**必须区分**"10B 建模型就挂"和"xl 前向挂"。
+  D2 选了 A 之后 probe 只剩 `stage` 一个字段，等于一句字符串赋值，零成本。
+
+**⚠️ 四条会咬人的实现要点**
+
+1. **sweep 的配置之间必须 `del model, opt` + `empty_cache()` + `reset_peak_memory_stats()`**。
+   不清理的话下一档会继承上一档的显存碎片，**xl 到底 OOM 不 OOM 取决于它前面跑了什么**——
+   而"哪一格 OOM"正是本题的交付物。结果一旦和顺序有关，立刻改成每个配置起子进程跑
+2. **`BenchResult` 要存 `times: list[float]` 逐步原始耗时**，mean/std 只是派生量。
+   因为 **(c) 的结论藏在第 1 步里**：`warmup=0` 时真正要展示的是
+   `step1=380ms / step2=18ms / step3+=12ms`，只报 `mean±std` 就说不出"大在第几步、
+   为什么第 2 步还没稳"
+3. **`fwd_bwd` 模式也要 `zero_grad(set_to_none=True)`**，否则梯度跨步累加、步与步不独立。
+   另外 `set_to_none` 的取值会**改变峰值显存**，要写进脚注
+4. **OOM 捕获别只写 `torch.cuda.OutOfMemoryError`**，有些路径抛的是消息里带
+   "out of memory" 的普通 `RuntimeError`，漏了会让 sweep 直接崩掉而不是记成 OOM
 
 **⚠️ 这个脚本会被反复回来扩展，第一版就留好扩展点**——PDF 特意加粗强调
 "it will pay off to have your script enable these variations via **command-line arguments**"，
