@@ -1,368 +1,494 @@
-# HW1 → HW2 升级与优化 TODO List
+# CS336 Assignment 2 (Systems) — 完整 TODO
 
-> 本表由 Gemini 初稿 + 与官方参考实现（`hw2/cs336-basics/cs336_basics/`）逐文件交叉核对后修订。
-> 底部「修订说明」记录了改动理由，每条结论都有实测支撑。
+> 依据 `cs336_assignment2_systems.pdf`（Version 26.1.3, Spring 2026, 48 页）逐节梳理。
+> 27 个 Problem，**总分 137**。hw1 重构相关的清单已移到 [todo-hw1-refactor.md](todo-hw1-refactor.md)。
 >
-> **前提事实**：你的实现与官方参考实现在数学上等价 —— `state_dict` key 完全一致、
-> 官方权重可直接 `load_state_dict` 进你的模型、同权重同输入 logits 差 `6.7e-07`、
-> hw1 的 19 个测试全过。因此本表**没有一条是数学错误**，全部是接口、健壮性、显存与工程性问题。
->
-> **审核范围**：`hw1/cs336_basics/` 全部模块 + 脚本层 `train.py` / `decoder.py` /
-> `interactive.py` / `scratch_eval.py`（第二轮补审，修正了两条基于半份 `train.py` 的错误判断）。
+> **图例**：`[代码]` 有 pytest 判分 · `[写作]` 只进 writeup.pdf · `[图]` 需要截图/曲线 ·
+> `⚠️多卡` 需要 >1 GPU · `⚠️大显存` 单卡 32G 放不下
+
+## 交付物
+
+| 文件 | 内容 |
+|---|---|
+| `writeup.pdf` | 所有written question 的答案，必须**排版**（typeset），不能手写 |
+| `code.zip` | 跑 `./test_and_make_submission.sh` 生成 |
+| leaderboard | 提交到 github.com/stanford-cs336/assignment2-systems-leaderboard |
+
+## 分值分布
+
+| 章节 | 主题 | 题数 | 分值 |
+|---|---|---:|---:|
+| §2 | Profiling & Benchmarking | 5 | 16 |
+| §3 | Single-GPU Memory（激活检查点） | 1 | 4 |
+| §4 | GPU Kernels（FlashAttention-2 / Triton） | 5 | **29** |
+| §5 | Distributed Data Parallel | 6 | 21 |
+| §6 | Optimizer State Sharding | 2 | 20 |
+| §7 | Fully-Sharded Data Parallel | 2 | 20 |
+| §8 | 并行策略分析（纯推导） | 5 | 17 |
+| §9 | Leaderboard | 1 | 10 |
+| | | **27** | **137** |
+
+分值集中在三块：**FlashAttention (29)**、**FSDP (20)**、**Optimizer Sharding (20)**，
+合计 69 分（占一半）且全部有 pytest 判分。§8 的 17 分是纯纸面推导，性价比最高，可以先做。
 
 ---
 
-## 🔴 1. 阻塞 HW2 的接口问题（不修，hw2 一行都跑不起来）
+## ⚠️ 硬件现实（先读这段，会影响整份计划）
 
-- [X]  **`TransformerLM.forward` 必须支持 `model(x)` 单参数调用**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：`hw1/cs336_basics/transformer.py:422` → `TransformerLM.forward`
-      （连带 `TransformerBlock.forward:312`、`MultiHeadSelfAttention.forward:249`、
-      `scaled_dot_product_attention:206`）
-    - **问题**：现在签名是 `forward(self, x, mask, token_positions=None)`，`mask` 是必填位置参数。
-      官方是 `forward(self, x)`，因果 mask 在 attention 内部构造。hw2 的全部调用点都是单参数：
+本机是**单卡 RTX 5090 / 32 GB**；题面默认 **B200（180 GB）**，多处要求 **2–6 张卡**。
 
-      ```
-      tests/test_ddp.py:102              non_parallel_model(non_parallel_data)
-      tests/test_ddp.py:125              ddp_model(ddp_data)
-      tests/test_fsdp.py:152             non_parallel_model(all_input_ids)
-      tests/test_sharded_optimizer.py:66 non_sharded_model(non_sharded_input)
-      ```
+**好消息：所有判分测试都能在本机跑。** 四个测试文件全部用 `mp.spawn` + **gloo 后端在 CPU 上**
+起 `world_size=2`，不需要真的有两张卡：
 
-      DDP / FSDP / `torch.compile` / benchmark harness 一律假定 `model(x)`。
-    - **目标**：`mask` 改为 `mask=None`，且 **None 时在内部构造因果 mask**（而不是跳过 mask）。
-      这样既保留你原注释担心的那件事（忘传 ≠ 静默变成全双向注意力），又兼容官方接口。
-      document mask 仍然可以显式传入覆盖。
-    - **不要**：不要照抄官方在**每一层**重建 `iota`/mask 的做法（`model.py:513-517`，
-      12 层 × 每步重复构造）。在 `TransformerLM.forward` 里构造一次、下传给所有 block 才对，
-      这是你现在就比官方好的地方，别改掉。
-  - **🔧 修复日志 (Fix Log)**：
-    - [X]  在 `transformer.py` 中将 `TransformerLM.forward`、`TransformerBlock.forward`、`MultiHeadSelfAttention.forward`、`scaled_dot_product_attention` 的 `mask` 参数设置了默认值 `None`。
-    - [X]  在 `TransformerLM.forward` 内部增加了 `if mask is None: mask = build_attention_mask(...)`，使得因果 mask 只需在最外层构造一次即可全模型共享。
-    - [X]  同步修改了 `tests/test_causality.py` 的测试用例 `test_mask_is_required` 为 `test_mask_is_optional_but_causal_by_default`，并且实测验证其行为符合预期且不退化为双向注意力。
-    - [X]  实测 pytest 通过。
-- [X]  **修复 RoPE 的 heads 维广播缺陷**
-  - **🔍 问题分析 (Problem Analysis)**：
+```
+tests/test_ddp.py:40                _setup_process_group(..., backend="gloo")
+tests/test_sharded_optimizer.py:31  backend="gloo"
+tests/test_fsdp.py:120              backend="gloo"
+tests/test_attention.py             单卡即可（Triton kernel）
+```
 
-    - **位置**：`transformer.py` → **`MultiHeadSelfAttention.forward:263-266`**（**不是** `RoPE` 内部）
-    - **问题**：`token_positions` 为 `[B, S]` 时，`cos` 是 `[B, S, half, 1]`，
-      而 `x_reshaped` 是 `[B, h, S, half, 2]`，右对齐广播导致 `B` 撞上 `h`。实测：
+**坏消息：benchmarking 题目大量指定 xl 模型。** 实测参数量与显存需求（vocab=10000）：
 
-      ```
-      1D token_positions [S]:    torch.Size([2, 6, 16])   ✓
-      2D token_positions [B, S]: RuntimeError: size of tensor a (4) must match b (2) at dim 1
-      ```
+| size | params | fp32 权重 | 权重+梯度+AdamW 两个动量 | 单卡 32G |
+|---|---:|---:|---:|:--:|
+| small | 0.13B | 0.5 G | 2.1 G | ✓ |
+| medium | 0.42B | 1.7 G | 6.8 G | ✓ |
+| large | 0.97B | 3.9 G | 15.5 G | ✓（激活要省着用） |
+| **xl** | **3.41B** | 13.6 G | **54.5 G** | ✗ |
+| 10B | 12.83B | 51.3 G | 205.3 G | ✗ |
+| leaderboard | 8.13B | — | bf16 权重就 16.3 G | ✗（题面要求两张 B200） |
 
-      测试没抓到，是因为 `tests/test_model.py:101` 传的是 `rearrange(pos_ids, "seq -> 1 seq")`，
-      B=1 时 `1` 可以广播成 `h` 蒙混过关；B>1 必炸。
-    - **目标**：照官方 `model.py:505-507` 的位置修，在**调用 RoPE 之前**给 `token_positions` 补 head 轴：
+**决策项（越早定越好）**
 
-      ```python
-      if self.rope is not None:
-          if token_positions is not None and token_positions.ndim > 1:
-              token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
-      ```
-    - **⚠️ 不要在 `RoPE.forward` 内部 `cos.unsqueeze(-4)`**（Gemini 初稿的建议）。
-      RoPE 也会被独立调用（`run_rope` adapter、`test_rope`），此时 `x` 是 `[B, S, d]` 没有 head 维，
-      无条件 unsqueeze 会**静默**产出错误形状、不报错。实测：
-
-      ```
-      独立调用 RoPE, x=[B,S,d], pos 1D -> [2,6,4,2]      ✓
-      独立调用 RoPE, x=[B,S,d], pos 2D -> [2,2,6,4,2]    ✗ 多出一个 B，无报错
-      ```
-
-      修在 MHA 里，RoPE 保持"输入什么形状就按什么形状转"的纯函数语义。
-  - **🔧 修复日志 (Fix Log)**：
-
-    - [X]  在 `transformer.py` 的 `MultiHeadSelfAttention.forward` 内部调用 `self.rope` 之前，增加了对 `token_positions.ndim > 1` 的判断并注入 `heads` 的长度 1 占位维度（`rearrange(token_positions, "... seq -> ... 1 seq")`）。
-    - [X]  遵守“函数纯度”原则，没有修改 `RoPE.forward` 内部实现，确保独立调用时的逻辑正确性。
-    - [X]  在 `tests/test_model.py` 中新加了一个测试用例 `test_multihead_self_attention_with_rope_2d_positions` 专门测试 B=3 时输入 `[B, S]` 的 `token_positions`，实测不报错通过。
+- [ ] **决定 xl 相关题目怎么处理**。三个选项：
+  1. 租云上的 A100/H100/B200（§2.1.6、§5 全部 benchmark、§6、§7 都点名 xl）
+  2. 在本机用 **large** 替代 xl，在 writeup 里显式声明替换并说明理由（推荐做法：
+     趋势和结论通常不变，但必须写清楚，否则会被当成没做）
+  3. 只做 forward-only / 不带优化器状态的部分（xl 纯前向 13.6 G 权重 + 激活，
+     bf16 下 6.8 G，单卡可以跑，够回答 memory_profiling 的一部分）
+- [ ] **决定 leaderboard 做不做**（10 分，硬性要求两张 B200 + 10 分钟内跑完）
+- [ ] 装 `nsys`（Nsight Systems CLI）——§2.1.4、§2.1.6(f)、§5.3.2(b)、§7 accounting(b) 都要它
 
 ---
 
-## 🟠 2. 显存与吞吐
+## §0 前置准备
 
-- [x]  **RoPE cache 全模型共享一份**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：`transformer.py:245`（`RoPE` 建在 `MultiHeadSelfAttention.__init__` 里）
-    - **问题**：每层各建一个 RoPE 实例，cos/sin cache 复制 N 份。实测 12 层小模型：
+- [ ] **决定用官方 basics 还是自己的 hw1 实现**
+  - `pyproject.toml:35` 现在指向 `./cs336-basics`（官方参考实现）。改成自己的 hw1：
+    ```toml
+    cs336-basics = { path = "../hw1", editable = true }
+    ```
+  - **用自己的实现需要先补三处兼容**（我们刚做完的重构已经解决了接口和权重层面的问题——
+    `model(x)` 单参数可调用、state_dict 与官方逐 key 一致、logits 差 6e-07——但命名还没对齐）：
+    - [ ] 类名：官方 `BasicsTransformerLM` vs 我们的 `TransformerLM`
+    - [ ] 模块路径：官方 `cs336_basics.model` vs 我们的 `cs336_basics.transformer`
+      （§2.1.4 要求 `cs336_basics.model.scaled_dot_product_attention = annotated_版本`，
+      §9 leaderboard 的测试代码也直接 import 这两个名字）
+    - [ ] 最省事的做法：在 `cs336_basics/model.py` 建一个转发模块 +
+      `BasicsTransformerLM = TransformerLM` 别名，而不是改动已经测试通过的代码
+  - 用官方实现的好处：leaderboard 和所有题面示例代码开箱即用；坏处：hw1 的消融开关
+    （norm/ffn/tie/doc-mask）用不上
+- [ ] **确认 `uv` 工作流**：`uv run pytest`、`uv run nsys profile -- python ...`
+- [ ] **建 `cs336_systems/` 的骨架**（现在只有一个空 `__init__.py`，题面明确说"从零随便写"）
+- [ ] **`tests/adapters.py` 的 8 个 hook**，全部还是 `raise NotImplementedError`：
+  `get_flashattention_autograd_function_pytorch` / `get_flashattention_autograd_function_triton` /
+  `get_ddp` / `ddp_on_after_backward` / `get_fsdp` / `fsdp_on_after_backward` /
+  `fsdp_gather_full_params` / `get_sharded_optimizer`
+  - ⚠️ PDF 里写的是 `adapters.get_flash_autograd_function_triton`，**实际文件里叫
+    `get_flashattention_autograd_function_triton`**，以文件为准
+  - ⚠️ `fsdp_on_after_backward` 和 `fsdp_gather_full_params` 在 PDF 的 fsdp 题面里**没提**，
+    但 adapters.py 里有，别漏
+- [ ] **表格自动化**：题面强烈建议用代码生成表格（`pandas.DataFrame.to_latex()` /
+  `.to_typst()`），这份作业要交的表非常多。先把这个基础设施搭好，后面每题省一大截时间
 
-      ```
-      distinct RoPE module instances: 12
-      buffers: 36 个 / 786 KB
-      ```
+**统一模型配置**（vocab_size=10000，batch_size=4，除非特别说明 context_length=512）
 
-      量级是 `L × context_length × d_head/2 × 4B × 2`。现在 0.79 MB 无所谓，
-      但 context 8192 / d_head 128 / 32 层就是 ~270 MB 显存白扔，`.to(device)` 也要多搬。
-    - **目标**：照官方 `model.py:199-213`，在 `TransformerLM.__init__` 建**一个** RoPE，
-      以参数形式传给每个 `TransformerBlock` → `MultiHeadSelfAttention`。
-      保留 `rope_theta=None` → 不建 RoPE（NoPE 消融）的行为。
-    - **顺带**：`rot90_sign`（`transformer.py:146,150`）是个 2 元素常量 buffer，也跟着复制 N 份，
-      共享后一并解决。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 在 `TransformerLM.__init__` 顶层统一实例化了一次 `RoPE`（若 `rope_theta` 不为 None）。
-    - [x] 将 `MultiHeadSelfAttention` 和 `TransformerBlock` 的 `__init__` 签名中的 `max_seq_len` 和 `theta` 替换为了直接接收 `rope` 实例引用。
-    - [x] 修改了 `tests/adapters.py` 以及 `tests/test_rope.py` 中独立测试单层/单头模块时的实例化逻辑。
-    - [x] 成功节约了大量重复缓存的显存开销，所有测试全部通过。
-- [x]  **数据加载异步传输（Pinned Memory）**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：`cs336_basics/data.py:39` -> `get_batch`
-    - **问题**：现在是 `torch.from_numpy(x).to(device).to(torch.int32)`。虽然利用
-      `uint16` 省了一半 PCIe 带宽（好评！），但没加 `pin_memory` 和 `non_blocking`，
-      导致从 Host 往 Device 搬数据时会阻塞 CPU 计算，拉长每一步的 step time。
-    - **目标**：保留 `uint16` 优势的前提下，改为 `pin_memory().to(device, non_blocking=True)`。
-    - **⚠️ 避坑指南**：PyTorch 不支持直接 pin `uint16`，要么先 `astype(np.int32)`
-      再 pin（耗内存带宽），要么保留现有写法（实测很多系统下 `uint16` `from_numpy` 也能
-      走通，需要测试）。用 `train.py` 的 step time 实测确认，没测出收益就别写进 notes。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 在 `data.py` 的 `get_batch` 中，加入 `if torch.device(device).type == "cuda":`，使用 `.pin_memory().to(device, non_blocking=True)` 实现了异步拷贝。
-    - [x] 成功保留了原有 `uint16` 张量在内存中的低带宽优势。
-- [x]  **梯度裁剪去掉每步一次的 GPU→CPU 同步**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：`optimizer.py:117` → `gradient_clipping`
-    - **问题**：`if total_norm > max_l2_norm:` 会把 GPU 张量拉回 CPU 判断，每个训练步阻塞一次。
-      代码注释里写的"这也是 PyTorch 官方做法"**不准确** —— `torch.nn.utils.clip_grad_norm_`
-      恰恰**没有**这个分支，它用 `torch.clamp(clip_coef, max=1.0)` 无条件乘，
-      正是为了避开这次同步。官方 hw2 版 `nn_utils.py:29` 用 `min(1, ...)` 也是同一思路。
-    - **目标**：
-
-      ```python
-      clip_coef = torch.clamp(max_l2_norm / (total_norm + eps), max=1.0)
-      for g in grads:
-          g.detach().mul_(clip_coef.to(g.device))
-      ```
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 在 `optimizer.py` 的 `gradient_clipping` 中，移除了 `if total_norm > max_l2_norm:`。
-    - [x] 替换为 `clip_coef = torch.clamp(max_l2_norm / (total_norm + eps), max=1.0)` 并无条件相乘，彻底消除阻塞。
-- [x]  **把因果 mask 移出梯度累积内循环**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：`train.py:379-381`（累积内循环）、`train.py:110-113`（`evaluate_loss`）
-    - **问题**：`build_attention_mask(seq_len, x.device, x=x, doc_sep_id=doc_sep_id)`
-      在每个 micro-batch 里都重建一次 `[S,S]` 的 `tril`。`doc_sep_id is None` 时
-      这个张量每步完全相同，`--accum 8` 就是每步白造 8 次。
-    - **目标**：`doc_sep_id is None` 时在训练循环外构造一次并复用；
-      `doc_sep_id` 非 None 时（依赖 `x` 的内容）保持每 micro-batch 重建。
-    - 做完 §1 第一条（forward 内部构造 mask）之后，这里可以直接不传 mask，
-      由模型内部缓存一份因果 mask，两件事一起收掉。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 在 `train.py` 的 `for` 循环外层预先生成了 `global_causal_mask`。
-    - [x] 未开启文档打包时直接复用，彻底去除了每步在 GPU 上重复建 `[Seq, Seq]` 矩阵的开销。
-- [x]  **RMSNorm 改用 `rsqrt`**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：`transformer.py:61-62`
-    - **问题**：`torch.sqrt(...)` 再做除法是两个算子；官方 `model.py:101` 用 `torch.rsqrt(...)` 再乘。
-    - **目标**：`x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)`
-    - **注意**：这是**速度**优化（少一次除法、可融合），**不是精度**优化 ——
-      rsqrt 并不比 sqrt+div 更准，别在注释里这么写。收益很小，排在最后做。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 在 `RMSNorm.forward` 中，将 `torch.sqrt` 加除法替换为了硬件更快的 `torch.rsqrt` 并用乘法。
-    - [x] 避免了 GPU 上除法指令的高延迟，提升了层归一化操作的吞吐量。
-    - [x] 实测 `tests/test_model.py::test_rmsnorm` 精度未受影响，完全通过。
-- [ ]  ~~**降低 `get_batch` 索引内存开销（改连续切片 + torch.stack）**~~ — **不要做，已实测否决**
-  - **🔍 问题分析 (Problem Analysis)**：
-
-    - Gemini 初稿建议把 `np.add.outer` 换成官方那种逐样本连续切片 `dataset[i:i+C]` + `torch.stack`，
-      理由是"提高缓存命中率"。实测（200M token memmap，B=128 C=256，30 次平均）**方向相反**：
-
-      ```
-      mine (np.add.outer fancy)   0.12 ms/batch   ← 现状，最快
-      hybrid (slice C+1 + stack)  0.19 ms/batch   ← 纯切片写法，慢 1.6×
-      official (slice + astype)   0.54 ms/batch   ← 官方写法，慢 4.5×
-      ```
-
-      索引矩阵本身只有 `128×256×8B = 256 KB`，谈不上"内存开销"。**现状保持不变。**
-      （注：这是 page cache 已热的情况；冷盘时两者都是 IO bound，结论不变。）
-  - **🔧 修复日志 (Fix Log)**：
-    - [等待修复]...
-- [等待修复]...
+| size | d_model | d_ff | num_layers | num_heads |
+|---|---:|---:|---:|---:|
+| small | 768 | 3072 | 12 | 12 |
+| medium | 1024 | 4096 | 24 | 16 |
+| large | 1280 | 5120 | 36 | 20 |
+| xl | 2560 | 10240 | 32 | 32 |
+| 10B | 4608 | 12288 | 50 | 36 |
 
 ---
 
-## 🔵 3. 模型功能与序列化补全
+## §2 Profiling and Benchmarking（16 分）
 
-- [x]  **`generate` 收进模型，做成 `@torch.no_grad()` 方法**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：从 `hw1/decoder.py:8-75` 迁到 `transformer.py` → `TransformerLM.generate`
-    - **问题**：现在采样逻辑是脚本级函数，签名要外部传 `context_length`、`device`，
-      还要调用方自己 `build_attention_mask`，而且 import 了 `bpe_tokenizer`，复用性差。
-    - **目标**：签名 `generate(self, x, max_new_tokens, temperature=1.0, top_k=None, top_p=None, eos_token_id=None)`，
-      `context_length` 从 `self` 拿，mask 由 forward 内部构造（依赖 §1 第一条）。
-    - **⚠️ 官方的 top_k 是坏的，别抄**：`model.py:306` 写的是 `masked_fill` 而非 `masked_fill_`，
-      返回值被丢弃，top_k 完全无效。实测：
+### 2.1 `benchmarking_script` — 4 分 `[代码基建]` `[写作]`
 
-      ```
-      t.masked_fill(mask, -inf)  → t 原封不动：[[1.0, 5.0, 2.0, 9.0]]
-      ```
+- [ ] **(a) 写 benchmark 脚本**（这是后面一切的地基，命令行参数要设计好）
+  - 按超参初始化模型 / 造随机 batch（随机权重随机数据即可，只测速度和显存）
+  - 支持三种模式：只 forward / forward+backward / forward+backward+optimizer step
+  - `w` 步 warm-up 后计时 `n` 步；用 `timeit.default_timer()`（比 `time.time()` 分辨率高）
+  - **每步之后 `torch.cuda.synchronize()`** —— CUDA 调用是异步的，不同步就测的是"提交耗时"
+  - 后面会不断往这个脚本上加开关：混合精度、memory profiler、torch.compile、NVTX、DDP……
+    **一开始就按"可组合的 flag"来设计**
+- [ ] **(b)** 对 §0 表里全部 5 个 size 测 forward / backward / optimizer step，
+  5 warmup + 10 measurement，报**均值和标准差**。→ 1-2 句话
+- [ ] **(c)** 去掉 warm-up 重测；再试 1 步、2 步 warm-up。解释为什么结果还是不同。→ 2-3 句话
+  - （提示方向：CUDA context 初始化、cuBLAS/cuDNN autotune 首次选算法、内存分配器 cache 预热）
 
-      **保留你现有的 top-p（nucleus）实现**（`decoder.py:38-55`，那段 off-by-one 处理是对的），
-      要加 top_k 就自己写并用 `masked_fill_`。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 将 `decoder.py` 中的 `generate` 移动为 `TransformerLM` 的类实例方法，并打上了 `@torch.no_grad()`。
-    - [x] **签名对齐**：完全对齐了目标签名 `generate(self, x, max_new_tokens, temperature=1.0, top_k=None, top_p=None, eos_token_id=None)`。移除了原有的 `model`、`context_length`、`device` 等冗余传参。
-    - [x] **Mask 解耦**：内部删除了 `build_attention_mask` 的调用，直接复用 `self(x)`，由第一步重构的 `forward` 自动生成全共享的因果 mask。
-    - [x] **Top-K 修复**：没有照抄官方失效的代码，而是手工实现了真正的 Top-K，利用 `next_token_logits[next_token_logits < v] = float('-inf')` 安全截断。
-    - [x] **Top-P 保留**：保留了原有的“智能旋转门” off-by-one 处理，并把负无穷大填充改为了正确生效的就地操作 `masked_fill_`。
-    - [x] 同步更新了 `decoder.py` 下游调用侧的传参名。
-- [x]  **🔴 统一推理侧的模型重建路径（三份拷贝，其中两份会静默载错架构）**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：`decoder.py:109-129`、`interactive.py:53-67`、`scratch_eval.py:12-26`
-    - **问题**：同一段"读 yaml → 构造 `TransformerLM` → `torch.load` → 判断有没有
-      `model_state_dict` 包一层"抄了三遍，而且**只有 `decoder.py` 传全了消融开关**。
-      `interactive.py` 和 `scratch_eval.py` 都只传 `vocab_size/context_length/d_model/ num_layers/num_heads/d_ff/rope_theta`，**丢掉了 `no_rope` / `norm` / `ffn` / `tie_embeddings`**。
-      实测哪些会被拦下、哪些会静默通过：
+### 2.2 `nsys_profile` — 5 分 `[写作]` `[图]` ⚠️需要 nsys
 
-      ```
-      no_rope (rope_theta=None) -> 载入成功（静默！）  ← 真正的坑
-      tie_embeddings            -> 载入成功（静默，但数值无害）
-      norm=post                 -> 报错拦住（缺 ln_final.weight）
-      ffn=silu                  -> 报错拦住（缺 w3 + 形状不符）
-      ```
+- [ ] 选 **2 个 model size × 3 个 2 的幂次 context length（>128，最大取显存能装下的极限）** 做 profile
+  ```bash
+  uv run nsys profile --trace=cuda,cudnn,cublas,osrt,nvtx \
+    --pytorch=functions-trace,autograd-shapes-nvtx --gpu-metrics-devices=0 -- python benchmark.py
+  ```
+  （`--cudabacktrace=all --python-backtrace=cuda` 开销很大，不需要 traceback 时关掉）
+- [ ] **给代码加 NVTX 标注**：用 `@nvtx.range(...)` / `with nvtx.range(...)` 圈出
+  warm-up（好用 `--nvtx-capture` 过滤掉）、forward/backward、以及 attention 内部的
+  "attention scores" / "softmax" / "final matmul" 三段
+  - 做法：写 `annotated_scaled_dot_product_attention`，再
+    `cs336_basics.model.scaled_dot_product_attention = annotated_版本` 猴补丁
+- [ ] (a) forward 总时间，和 §2.1 用 Python 标准库测的对不对得上？→ 1-2 句
+- [ ] (b) forward 里累计 GPU 时间最长的 CUDA kernel 是哪个？单次 forward 调用几次？
+  加上 backward 之后还是它吗？→ 1-2 句
+- [ ] (c) 除了矩阵乘，还有哪些 kernel 占了不可忽略的时间？→ 1-2 句
+- [ ] (d) 完整训练步（含自己的 AdamW）里矩阵乘占比相对纯推理怎么变？其它 kernel 呢？→ 1-2 句
+- [ ] (e) attention 内部 softmax vs 矩阵乘的**运行时间比** 和 **FLOPs 比** 差多少？→ 1-2 句
+  - （这题是后面 FlashAttention 的动机：softmax 的 FLOPs 占比极小但耗时占比不小 = memory-bound）
 
-      RoPE 的 cos/sin 是 `persistent=False` 的 buffer，不进 state_dict，所以
-      NoPE 的权重能原样装进一个带 RoPE 的模型 —— 不报错，只是生成乱码。
-      这正是你自己在 `decoder.py:116-118` 写下的那句警告，但另外两个脚本没照做。
-    - **附带**：`interactive.py:45-46` 把词表路径硬编码成 `tinystories_*`，
-      而 `decoder.py:99` 会按 `vocab_size` 自动在 tinystories/owt 之间选。
-      拿 OWT 的 checkpoint 跑 `interactive.py` → id 对不上 → 静默乱码。
-    - **目标**：`TransformerLM.__init__` 里用 `locals()` 存 `self.config`（照官方
-      `model.py:191-193`，必须覆盖全部消融开关），配 `from_pretrained(cls, path)` 类方法，
-      然后让三个脚本都改成一行 `TransformerLM.from_pretrained(...)`，把重复的重建代码全删掉。
-    - **注意（修正 Gemini 初稿 + 我第一轮的判断）**：这**不是**"架构信息会丢"的问题。
-      `train.py:246-249` 已经把 `vars(args)` 全量 dump 到 `checkpoint_dir/config.yaml`，
-      `train.py:206-212` 的 `--resume` 还会自动去 checkpoint 同级目录找 `config.yaml`/`config.json`。
-      训练侧的恢复链路是完整的。真正的问题是**推理侧三份手抄的重建代码会走散**，
-      `from_pretrained` 解决的是这个。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 在 `TransformerLM.__init__` 的开头添加了 `self.config = {k: v for k, v in locals().items() if k not in ["self", "__class__"]}`，完整存储了构造参数。
-    - [x] 在 `TransformerLM` 中新增了 `@classmethod def from_pretrained`，它会自动读取 checkpoint 同级目录的 `config.yaml` 或 `config.json`，带上所有消融开关（尤其是容易静默漏掉的 `no_rope`、`norm`、`ffn` 等）安全且严谨地重建出完全一致的模型实例。
-    - [x] 大幅清理了 `decoder.py`、`interactive.py` 和 `scratch_eval.py` 中的重复样板代码，把几十行的反序列化逻辑全部替换成了极简的单行 `TransformerLM.from_pretrained(path)`。
-    - [x] 修复了 `interactive.py` 中硬编码 `tinystories` 词表的问题，抄回了 `decoder.py` 中根据 `vocab_size > 20000` 自动适配 OWT 或 Tinystories 的健壮逻辑，彻底根除了词表越界乱码的隐患。
-- [x]  **🟢 `load_checkpoint` 顺手剥掉 `_orig_mod.` 前缀（防御性，非阻塞）**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **位置**：`checkpoint.py:31-33`
-    - **⚠️ 我第一轮把这条标成 🔴"hw2 全程 compile，载入必炸"，那是错的** ——
-      读完 `train.py` 才发现你已经处理好了：`train.py:296-302` 用
-      `raw_model = model` 保留未编译的引用，`torch.compile` 只赋给 `model`，
-      存盘（`train.py:453`）和 resume（`train.py:307`）全程走 `raw_model`，
-      旁边还写了注释解释为什么。**这条链路没有 bug，不用改。**
-    - **仍值得做的**：`load_checkpoint` 加一个前缀剥离，纯粹是为了能吃下**别人**
-      （或将来某个忘了用 raw_model 的脚本）存出来的 compile 版 checkpoint：
+### 2.3 `mixed_precision_accumulation` — 1 分 `[写作]`
 
-      ```python
-      for k in list(sd):
-          if k.startswith("_orig_mod."): sd[k[len("_orig_mod."):]] = sd.pop(k)
-      ```
+- [ ] 跑题面给的 4 段累加代码（fp32 累加 / fp16 累加 / fp32 累加器加 fp16 值 /
+  显式 `.type(torch.float32)` 后累加），解释精度差异。→ 2-3 句
+  - 纯送分题，10 分钟能做完，建议第一个做
 
-      优先级低，排在 §4 后面都行。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 在 `cs336_basics/checkpoint.py` 的 `load_checkpoint` 中，增加了对 `state_dict` 字典 key 的安全清理。
-    - [x] 加入了前缀剥离逻辑：遍历 `state_dict`，如果 key 以 `_orig_mod.` 开头，就切掉前缀再放回字典。
-    - [x] 成功实现了兼容性兜底，即使以后不小心把 `torch.compile` 编译后的模型直接存盘，载入时也不会因为 key 不匹配而崩溃。
-- [x]  **新建 `nn_utils.py`，把损失和裁剪搬过去**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - **目标**：`softmax`（现在在 `transformer.py:189`）、`cross_entropy`、`gradient_clipping`
-      （现在都在 `optimizer.py`）→ 新建 `cs336_basics/nn_utils.py`，与官方文件划分对齐。
-    - **⚠️ `get_lr_cosine_schedule` 留在 `optimizer.py`**（Gemini 初稿说要一起搬走，这是错的）。
-      学习率调度就是优化器职责，官方 `get_cosine_lr` 也放在 `optimizer.py:9`。
-    - `transformer.py` 改为从 `nn_utils` import `softmax`，避免同族函数分居两个文件。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 新建了 `cs336_basics/nn_utils.py`。
-    - [x] 将 `softmax` 从 `transformer.py` 移入 `nn_utils.py`，并按第 12 项要求为其 `dim` 参数增加了默认值 `-1`，并在 `transformer.py` 头部添加了导入。
-    - [x] 将 `cross_entropy` 和 `gradient_clipping` 从 `optimizer.py` 移出，完美留下了 `AdamW` 和 `get_lr_cosine_schedule` 在原来的位置（与官方职责划分严格对齐）。
-    - [x] 更新了下游脚本（`train.py`、`scratch_eval.py`）的导入路径，实测编译通过。
-- [x]  **可观测性小项（打包一次做完）**
-  - **🔍 问题分析 (Problem Analysis)**：
-    - `Linear` / `Embedding` / `RMSNorm` / `RoPE` 加 `extra_repr()`：
-      现在 `print(model)` 只显示 `Linear()`，看不到形状（官方每个模块都有）。
-    - `TransformerLM` 加 `get_num_params()`，`__init__` 末尾 `logger.info` 参数量（官方 `model.py:220`）。
-    - `softmax(x, dim)` 给 `dim=-1` 默认值，与官方签名一致。
-    - `scaled_dot_product_attention` 的 `mask` 给 `None` 默认值（随 §1 第一条一起改）。
-    - `masked_fill(~mask, ...)` 每层每步物化一份 `~mask`：让 `build_attention_mask`
-      直接返回取反后的 bool，或改成一次造好的加性 float mask。
-  - **🔧 修复日志 (Fix Log)**：
-    - [x] 为 `Linear`、`Embedding`、`RMSNorm` 和 `RoPE` 增加了 `extra_repr()` 方法，现在 `print(model)` 能清晰地看到各层的维度和关键超参。
-    - [x] 为 `TransformerLM` 增加了 `get_num_params(non_embedding=True)` 方法（并正确处理了 `tie_embeddings` 的去重），并在 `__init__` 结尾用 `logging` 打印出模型初始化的参数量。
-    - [x] `softmax` 的 `dim=-1` 和 `mask=None` 已在前面步骤分别完成。
-    - [x] 修改了 `build_attention_mask`，直接返回语义反转后的布尔掩码（`True` 表示遮蔽），并在 `scaled_dot_product_attention` 中去除了 `~mask` 操作，每步节约一次不必要的 GPU 张量内存分配。
-    - [x] 精确修复了测试桩（`adapters.py`），使修改后的模型能完美向下兼容原有的全部快照测试。
+### 2.4 `benchmarking_mixed_precision` — 2 分 `[写作]`
+
+- [ ] **(a)** 给定 `ToyModel`（fc1 → relu → LayerNorm → fc2），在 fp16 autocast 下写出六个 dtype：
+  模型参数 / fc1 输出 / LayerNorm 输出 / logits / loss / 梯度
+- [ ] **(b)** LayerNorm 的哪些部分对低精度敏感？换成 **BF16** 之后还需要特殊对待吗？为什么？→ 2-3 句
+  - （方向：均值/方差是累加归约，动态范围；BF16 指数位和 FP32 一样宽）
+- [ ] **(c)** 给 benchmark 脚本加 `--dtype bfloat16` 开关，5 个 size 各测有/无混合精度，
+  说明随规模变化的趋势。→ 2-3 句 + 计时表
+  - hw1 的 `train.py` 已经有 `torch.autocast` + `nullcontext` 的写法，可以直接搬
+
+### 2.5 `memory_profiling` — 4 分 `[写作]` `[图]` ⚠️大显存
+
+- [ ] **(a)** 给脚本加 memory profiler 开关：
+  ```python
+  torch.cuda.memory._record_memory_history(max_entries=1000000)
+  ...
+  torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+  torch.cuda.memory._record_memory_history(enabled=None)
+  ```
+  拖进 pytorch.org/memory_viz 看 Active memory timeline。
+  **交两张图**：xl 纯 forward / xl 完整训练步 + 2-3 句
+- [ ] **(b)** context length 128 和 2048 各自的峰值显存（forward / 完整训练步）→ 2×2 表格
+- [ ] **(c)** 混合精度下的峰值显存，影响大吗？→ 2-3 句
+- [ ] **(d)** xl 残差流上单个激活张量多大（MiB，除 1024²）？要写推导 → 1-2 句
+- [ ] **(e)** memory_viz 里把 Detail 调低，最大的那几笔分配是多大、从哪来的（看 stack trace）→ 1-2 句
+- [ ] **(f)** 用 nsys 的内存 profiling flag + PyTorch 的 NVTX 标签，算出**单个 TransformerBlock
+  为 backward 存了多少激活**，列出贡献最大的 5 个操作及占比；再结合 backward 时每个 block
+  的显存变化，算出梯度张量占多少，和预期对得上吗？→ 截图 + 1-2 段
+- ⚠️ xl 完整训练步需要 54.5 G，本机放不下。见开头的"决策项"
 
 ---
 
-## ✅ 5. 每条改完必做的验证
+## §3 Single-GPU Memory（4 分）
 
-- [ ]  `cd hw1 && ./.venv/bin/python -m pytest tests/ -q` —— 基线是 **19 passed**，不许回归。
-  - **🔍 问题分析 (Problem Analysis)**：
-  - **🔧 修复日志 (Fix Log)**：
-    - [等待修复]...
-- [ ]  交叉验证仍成立：官方权重 `load_state_dict` 进你的模型 → logits 差仍在 `1e-6` 量级。
-  - **🔍 问题分析 (Problem Analysis)**：
-  - **🔧 修复日志 (Fix Log)**：
-    - [等待修复]...
-- [X]  §1 两条改完后，专门补一个 **B>1 且 token_positions 为 `[B, S]`** 的用例
-  - **🔍 问题分析 (Problem Analysis)**：
-    （现有测试全是 B=1，抓不到这个 bug）。
-  - **🔧 修复日志 (Fix Log)**：
-    - [等待修复]...
-- [ ]  §2 的两条性能项（pin_memory / clamp）用 `train.py` 的 step time 实测确认，
-  - **🔍 问题分析 (Problem Analysis)**：
-    没测出收益就别写进 notes。
-  - **🔧 修复日志 (Fix Log)**：
+> 背景：一个 xl 的 TransformerBlock 光 backward 要存的激活就 **3.6 GiB**，32 层 = **114 GiB**。
+> 先用 `torch.compile` 做算子融合（RMSNorm 从存 5 个张量降到 3 个），再上激活检查点。
 
-    - [等待修复]...
+### 3.1 `gradient_checkpointing` — 4 分 `[写作]`
+
+- [ ] **(a)** N 个相同 block 顺序堆叠，**忽略计算开销**时峰值激活显存最小的检查点策略是什么？
+  给出策略描述 + 代码草图 + 渐近峰值显存和计算量（关于 N 的函数）→ 3-5 句 + 代码草图
+  - （方向：递归/嵌套 checkpoint，经典结论是 O(log N) 显存 / O(N log N) 计算，
+    或 √N 划分给出 O(√N) 显存 / O(N) 计算——要自己论证清楚）
+- [ ] **(b)** xl + batch 4 + seq 2048，**只允许一层重算（不能嵌套）**时最优的 checkpoint
+  块大小是多少？**实测峰值显存验证**，并和相邻的更大/更小块大小对比。→ 3-5 句 + 实测数字
+- 工具：`torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False)`，
+  以及 `torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook)` 来统计存了多少字节
 
 ---
 
-## 修订说明（相对 Gemini 初稿）
+## §4 GPU Kernels — FlashAttention-2（29 分，本作业最大头）
 
-**新增（初稿完全遗漏，且其中一条是 hw2 的头号阻塞）**
+### 4.1 `pytorch_attention` — 2 分 `[写作]`
 
-- 🔴 `forward(x)` 单参数接口 —— 不修则 hw2 的 DDP/FSDP/compile/benchmark 全部用不了。
-- 🔴 `_orig_mod.` 前缀剥离 —— hw2 全程 compile，checkpoint 载入必炸。
-- 🟠 RoPE cache 每层复制 N 份 → 共享单实例。
-- 🟠 `gradient_clipping` 的 `if` 造成每步 GPU 同步（且原注释对 PyTorch 行为的描述有误）。
-- 🔵 `save_checkpoint` 也要存 config（初稿只让模型记 config，checkpoint 侧没动）。
-- 🟢 `extra_repr` / `get_num_params` / logging / `softmax` 默认 dim / SDPA mask 可选。
-- ✅ 整个验证章节。
+- [ ] 写 attention 微基准脚本：
+  - batch=8，**不带 head 维**（单头）
+  - `d_model ∈ {16, 32, 64, 128}` × `seq_len ∈ {256, 1024, 4096, 8192, 16384}` 全组合
+  - 随机 Q/K/V；计时 100 次 forward；**记录 backward 开始前的显存**；计时 100 次 backward
+  - warm-up + 每次 `torch.cuda.synchronize()`
+- [ ] 报表格（含 OOM 的格子）。在哪个规模开始 OOM？对最小的那个 OOM 配置**做显存核算**
+  （用 hw1 的 Transformer 显存公式）。存给 backward 的显存怎么随 seq_len 变？怎么消掉这笔开销？
+  → 表 + 计算过程 + 1-2 段
 
-**修正**
+### 4.2 `torch_compile` — 2 分 `[写作]`
 
-- RoPE 修复**位置**从 `RoPE` 内部移到 `MultiHeadSelfAttention`。初稿建议的
-  `cos.unsqueeze(-4)` 会让独立调用 RoPE + 2D positions 时静默产出 `[2,2,6,4,2]`，
-  不报错，比原 bug 更难查。
-- `get_lr_cosine_schedule` 不搬去 `nn_utils`。
-- `rsqrt` 是速度优化不是精度优化。
-- `generate` 保留自己的 top-p，不要照抄官方那个失效的 top_k。
+- [ ] **(a)** 给 attention 基准加一个 `torch.compile` 版本，同配置对比 → 表
+- [ ] **(b)** 编译**整个 Transformer**，对比 forward / forward+backward+optimizer → 表
 
-**删除**
+### 4.3 `flash_forward` — **15 分** `[代码]`
 
-- ~~`get_batch` 改连续切片~~ —— 实测现状快 1.6–4.5×，初稿方向搞反了。
+- [ ] **(a) 纯 PyTorch 的 tiled 版本**（不用 Triton，给 Triton 版当对照）
+  - `torch.autograd.Function` 子类，`def forward(ctx, Q, K, V, is_causal=False)`
+  - 返回 O，同时算出 logsumexp `L`；`ctx` 里存 `L, Q, K, V, O`
+  - `backward` 先 `raise NotImplementedError`
+  - 这一步**可以忽略 is_causal**
+  - tile 至少 16×16；测试保证所有维度是 ≥16 的 2 的幂，不用管越界
+  - → `adapters.get_flashattention_autograd_function_pytorch`
+  - → `uv run pytest -k test_flash_forward_pass_pytorch`
+- [ ] **(b) Triton kernel 版 forward**（Algorithm 1，在线 softmax）
+  - launch grid = `(T_q, batch_size)`；**只有一层循环**，遍历 key tile `j`
+  - 用 `tl.make_block_ptr` + `ptr.advance(...)`（在循环末尾推进）；`tl.dot` 做矩阵乘
+  - 片上 buffer `O_i, l, m` 必须 **`tl.float32`**；累加用 `acc=` 参数：`acc = tl.dot(..., acc=acc)`
+  - `P̃` 要先 cast 成 V 的 dtype 再相乘；写回前把 `O_i` cast 成目标 dtype
+    （`ptr.type.element_ty` 拿 dtype）
+  - 函数签名按题面给的 `flash_fwd_kernel(...)` 照抄
+  - → `adapters.get_flashattention_autograd_function_triton`
+  - → `uv run pytest -k test_flash_forward_pass_triton`
+- [ ] **(c) causal masking**
+  - autograd.Function 末尾加 `is_causal` 参数，**默认 False**（否则 (a)(b) 的测试会挂）
+  - Triton kernel 加 `is_causal: tl.constexpr`（这个类型标注是必需的）
+  - 在 kernel 里构造 query/key 的索引向量，比较出 `B_q × B_k` 的 mask，
+    被 mask 的位置**给 S 加 -1e6**（不是设 -inf）
+  - `ctx.is_causal = is_causal` 存给 backward
+- 调试建议：`tl.device_print`；`TRITON_INTERPRET=1` 可在 CPU 跑解释器（题面说"我们发现它有 bug"）；
+  逐个算子和 (a) 的 PyTorch 版对数
 
-**第二轮补审（读完 `train.py` 全文 + `interactive.py` / `scratch_eval.py` 之后）**
+### 4.4 `flash_backward` — 5 分 `[代码]`
 
-- 🔴 **新增**：`interactive.py` / `scratch_eval.py` 丢消融开关，`no_rope` 会静默载错架构；
-  `interactive.py` 还硬编码了 tinystories 词表。前两轮都没发现，因为只看了包内代码。
-- 🟠 **新增**：因果 mask 在梯度累积内循环里重复构造。
-- ❗ **自我修正**：`_orig_mod.` 前缀从 🔴 降为 🟢 —— `train.py` 已用 `raw_model` 正确规避，
-  我第一轮说的"hw2 全程 compile，checkpoint 载入必炸"不成立。
-- ❗ **自我修正**：`from_pretrained` 的理由改写 —— `train.py` 已经把 config.yaml 全量
-  dump 到 checkpoint 目录且 `--resume` 会自动找回，训练侧恢复链路是完整的；
-  要解决的是推理侧三份手抄代码。
+- [ ] 用 **PyTorch + `torch.compile`**（不用 Triton）实现 backward
+  - 输入 Q, K, V, O, dO, L → 输出 dQ, dK, dV
+  - **先算 `D = rowsum(O ∘ dO)`**，然后按式 (13)–(19) 重算 S、P，全程**不需要 softmax**
+  - 关键点：P 从 Q、K、L 重算出来，所以 forward 不用把 S/P 存进 HBM
+- [ ] → `uv run pytest -k test_flash_backward`
+- 注：`tests/test_attention.py` 里还有 `test_flash_backward_pytorch` 和
+  `test_flash_backward_triton`（带 `is_causal` 参数化），两个都要过
 
-**明确不动（现状优于官方，别顺手"对齐"掉）**
+### 4.5 `flash_benchmarking` — 5 分 `[写作]` ⚠️理想在 B200
 
-- RoPE 输出用交错序（官方是 split-half 置换序，靠"Q/K 同置换不改点积"蒙对，
-  单独看 RoPE 输出是错的，过不了 `run_rope` 快照测试）。
-- 支持任意多前导 batch 维（官方 `rearrange("batch heads seq d_v -> ...")` 写死一维，
-  `[2,3,8,32]` 输入直接 EinopsError）。
-- AdamW 的 `@torch.no_grad` + `mul_`/`addcmul_`/`addcdiv_` 原地融合。
-- 因果 mask 在 forward 外造一次而非每层重建。
-- `cross_entropy` 绕开 `einx.get_at` 的 int32 摊平溢出。
-- 所有模块支持构造时指定 device/dtype。
-- weight tying 及配套的 `std=d^-0.5` init 修正（官方注释掉了没做）。
-- `get_batch(rng=...)` 可注入随机源。
-- 消融支持：post/none norm、FFNSiLU 对照组、NoPE、document mask。
-- （脚本层，第二轮补充）`raw_model` + `torch.compile` 的存取盘处理；
-  weight decay 只打 2D+ 参数、RMSNorm gain 不衰减；checkpoint 先写 `.tmp` 再
-  `os.replace` 的原子落盘 + 按步数轮转；`np.random.default_rng([seed, it, micro])`
-  让数据流可复现且 resume 接得上；`check_vocab_range` 启动即校验；
-  `model_flops_per_token` 精确 MFU 口径（不用 6P 近似）。这些官方参考实现里一样都没有。
+- [ ] 用 `triton.testing.do_bench` 对比 Triton FA2 与普通 PyTorch attention
+  - **batch=1，永远开 causal**
+  - `seq_len` = 128 … 65536 的 2 的幂 × `d` = 16 … 128 的 2 的幂 × `{bfloat16, float32}`
+  - 报 forward / backward / 端到端三个延迟
+  - tile 大小需要随输入规模调
+- [ ] → 表格
+
+### 4.6 【可选】Triton 版 backward — 0 分，但对 leaderboard 有用
+
+- [ ] Algorithm 2：外层循环 key tile `j`，内层循环 query tile `i`，
+  **P 算两遍**（一遍给 dQ，一遍给 dK/dV），以此避开跨 thread block 的同步和 atomics
+
+---
+
+## §5 Distributed Data Parallel（21 分）
+
+### 5.1 `distributed_communication_single_node` — 5 分 `[写作]` ⚠️多卡
+
+- [ ] benchmark all-reduce 耗时：
+  - 数据量 fp32 张量 **1MB / 10MB / 100MB / 1GB**
+  - 进程数（GPU 数）**2 / 4 / 6**
+- [ ] 注意事项：warm-up ≥5 次（NCCL 尤其需要）；每次 `torch.cuda.synchronize()`
+  （**即使 `async_op=False` 也必须同步**，它只保证入队不保证完成）；
+  用 `dist.all_gather_object` 聚合各 rank 的计时
+- [ ] → 图/表 + 2-3 句
+- ⚠️ 需要最多 6 张 GPU；本机只有 1 张。可以先用 gloo/CPU 把脚本跑通，数字留到云上补
+
+### 5.2 `naive_ddp` — 5 分 `[代码]`
+
+- [ ] 实现最朴素的 DDP：backward 之后对**每个参数的梯度**单独 all-reduce 求平均
+  - 训练开始前用 `broadcast` 把 rank 0 的参数发给所有 rank
+  - batch 切分：n 个样本切成 n/d 份（d 必须整除 n）
+- [ ] → `adapters.get_ddp` +（可选）`adapters.ddp_on_after_backward`
+- [ ] → `uv run pytest tests/test_ddp.py`（用 gloo/CPU，world_size=2，本机可跑）
+
+### 5.3 `naive_ddp_benchmarking` — 3 分 `[写作]` ⚠️多卡 ⚠️大显存
+
+- [ ] 测**每步总时间**和**通信占比**，配置：1 node × 2 GPU，**xl**
+- [ ] → 描述 setup + 数字
+
+### 5.4 `minimal_ddp_flat_benchmarking` — 2 分 `[代码]` `[写作]` ⚠️多卡
+
+- [ ] 改成**把所有梯度拼成一个扁平张量**再做一次 all-reduce
+  - 用 `torch._utils._flatten_dense_tensors` / `_unflatten_dense_tensors`
+- [ ] 同条件（1×2 GPU, xl）对比逐参数 all-reduce → 数字 + 1-2 句
+
+### 5.5 `ddp_overlap_individual_parameters` — 5 分 `[代码]`
+
+- [ ] 写 DDP 容器类，**梯度通信与 backward 计算重叠**
+  - `__init__(self, module)`：包住任意 `nn.Module`，广播初始权重
+  - `forward(self, *inputs, **kwargs)`：转发给被包的 module
+  - `finish_gradient_synchronization(self)`：等所有异步通信完成
+  - 机制：`param.register_post_accumulate_grad_hook(...)`，在每个参数梯度算好的瞬间
+    发起 `dist.all_reduce(..., async_op=True)`，把 handle 收起来；
+    `optimizer.step()` 之前调 `finish_gradient_synchronization()` 逐个 `handle.wait()`
+- [ ] → `uv run pytest tests/test_ddp.py`，**建议重复跑 5 次**排查竞态
+
+### 5.6 `ddp_overlap_individual_parameters_benchmarking` — 1 分 `[写作]` `[图]` ⚠️多卡
+
+- [ ] **(a)** 同条件（1×2 GPU, xl）和前两种 DDP 对比每步耗时 → 数字 + 1-2 句
+- [ ] **(b)** 用 nsys 分别 profile 朴素版和重叠版，**两张截图**直观证明一个重叠了、一个没有
+
+---
+
+## §6 Optimizer State Sharding（20 分）
+
+### 6.1 `optimizer_state_sharding` — **15 分** `[代码]`
+
+- [ ] 写优化器状态分片的包装类（简化版 ZeRO-1）
+  - `__init__(self, params, optimizer_cls, **kwargs)`：params 可以是参数列表**也可以是
+    param group 列表**（要支持不同 lr）；把参数分给各 rank（约 1/world_size）；
+    **必须调用 `torch.optim.Optimizer` 超类构造函数**
+  - `step(self, closure, **kwargs)`：调被包优化器的 step，**之后把自己更新的那份参数
+    broadcast 给其它 rank**
+  - `add_param_group(self, param_group)`：超类构造时会调它，训练中也可能调
+    （比如逐步解冻），所以**参数分配的逻辑要写在这里**
+- [ ] → `adapters.get_sharded_optimizer`
+- [ ] → `uv run pytest tests/test_sharded_optimizer.py`，**重复跑 5 次**
+- ⚠️ 坑：`add_param_group` 在 `super().__init__()` 里就被调用，此时你自己的属性可能还没初始化
+
+### 6.2 `optimizer_state_sharding_accounting` — 5 分 `[写作]` ⚠️多卡 ⚠️大显存
+
+- [ ] **(a)** 有/无分片时的峰值显存（1×2 GPU, xl），报三个时刻：模型初始化后、
+  optimizer step 之前、optimizer step 之后。**拆解**各部分（参数/梯度/优化器状态/激活）→ 2-3 句
+- [ ] **(b)** 分片对训练速度的影响 → 2-3 句 + 计时
+- [ ] **(c)** 我们的实现和 **ZeRO stage 1（ZeRO-DP $P_{os}$）** 有什么区别？
+  重点讲**显存**和**通信量**的差异 → 2-3 句
+  - （方向：我们是 all-reduce 全梯度 + broadcast 参数；ZeRO-1 是 reduce-scatter 梯度 +
+    all-gather 参数，通信量更省）
+
+---
+
+## §7 Fully-Sharded Data Parallel（20 分）
+
+### 7.1 `fsdp` — **15 分** `[代码]`
+
+- [ ] 写 FSDP 容器类，包住整个模型，hook 或 wrap 其中**每个 Linear 和 Embedding**
+  - `__init__(self, module, compute_dtype=None)`
+  - **哪些层要分片**：Linear + Embedding。**norm 不分片**（太小，传输延迟不划算）
+  - forward：权重要**提前** all-gather 好，题面明确要求
+    「**只在往前数第二层完成 forward 之后**才开始 gather」（prefetch 深度 = 2，控制显存）
+  - backward：同样 all-gather 拿回权重；梯度就绪后 **reduce-scatter** 到对应 rank
+  - **用完立刻释放 gather 出来的完整权重**
+  - `compute_dtype` 给定时：**通信前就 cast 成低精度**（省带宽），
+    但 **master weights 和优化器更新保持 FP32**
+  - `forward(self, *inputs, **kwargs)` / `finish_gradient_synchronization(self)`
+  - 每个分片必须能配 hw1 的 AdamW 直接用
+- [ ] → `adapters.get_fsdp`、`adapters.fsdp_on_after_backward`、`adapters.fsdp_gather_full_params`
+- [ ] → `uv run pytest tests/test_fsdp.py`，**重复跑 5 次**抓竞态
+  - 测试有 `compute_dtype` 的参数化，两种都要过
+
+### 7.2 `fsdp_accounting` — 5 分 `[写作]` `[图]` ⚠️多卡 ⚠️大显存
+
+- [ ] **(a)** 基于 §6 的分析，预期 FSDP 能从峰值省下多少显存？
+  （可以忽略 all-gather 的预分配 buffer）→ 2-3 句
+- [ ] **(b)** profile xl 在两卡上的运行，**盯着权重的 all-gather**：通信赶得上 forward 吗？
+  → 2-3 句 + nsys 截图
+
+---
+
+## §8 并行策略分析（17 分，纯推导，无需 GPU）
+
+> **这 17 分不需要任何硬件，建议最先做完。** 统一设定：N 个设备两两互连，
+> 每设备出口带宽 W bytes/s，加速器算力 C FLOP/s，**权重和激活都是 FP16（2 字节）**，
+> 矩阵乘 (A,B)(B,C) 算 2ABC FLOPs，只算 matmul 忽略逐元素算子。
+> 已知：ring all-gather 和 ring reduce-scatter 都是 $\frac{N-1}{N}\frac{S}{W}$，
+> ring all-reduce = 两者串联 = $2\frac{N-1}{N}\frac{S}{W}$。
+
+### 8.1 `alternate_ring_all_reduce` — 1 分 `[写作]`
+
+- [ ] 题面给了另一种 all-reduce 算法（每步直接传完整的 $x^{(i)}$ 而不是分块）。
+  用 S、N、W 表示它的耗时 + 一句话论证
+  - （提示：每步传的是整个 S 而不是 S/N，所以是 $(N-1)\frac{S}{W}$，比 ring 版差 N/2 倍）
+
+### 8.2 `data_parallel_calcs` — 3 分 `[写作]`
+
+FFN 前向：$x_1=xW_1$，$x_2=xW_2$，$z=f(x_1)*x_2$，$y=zW_3$；
+x 是 (B,D)，$W_1,W_2$ 是 (D,D_ff)，$W_3$ 是 (D_ff,D)。反向式 (24)–(30) 题面已给。
+
+- [ ] **(a)** $N_{DP}$ 数据并行下 backward 的 FLOPs（用 B, D, D_ff, N_DP 表示）+ 一句论证
+- [ ] **(b)** backward 的通信时间（B, D, D_ff, N_DP, W 的子集）+ 一句论证
+- [ ] **(c)** 其它参数固定时，$N_{DP}$ 能开到多大才不被通信卡住？给不等式 + 一句论证
+
+### 8.3 `fsdp_calcs` — 3 分 `[写作]`
+
+- [ ] **(a)** $N_{FSDP}$ 下 forward 和 backward 各多少 FLOPs（两个答案）
+- [ ] **(b)** forward 和 backward 各多少通信时间（两个答案）
+  - forward：3 次 all-gather；backward：3 次 all-gather + 3 次 reduce-scatter
+- [ ] **(c)** forward 和 backward 各自的 $N_{FSDP}$ 上界（两个不等式）
+
+### 8.4 `tp_calcs` — 4 分 `[写作]`
+
+配置：$W_1, W_2$ **column parallel**（切输出维），$W_3$ **row parallel**（切输入维），
+所以 column 之后不用 all-gather，只在最后对 y 做一次 all-reduce。
+
+- [ ] **(a)** 写出这个 TP 配置的**完整反向传播公式**：给定 dy (B,D)，
+  用分片权重、前向存下的激活、通信原语，推出 $dW_1^{(i)}, dW_2^{(i)}, dW_3^{(i)}$ 和 dx
+- [ ] **(b)** forward / backward 各多少 FLOPs（两个答案）
+- [ ] **(c)** forward / backward 各多少通信时间（两个答案）
+- [ ] **(d)** forward / backward 各自的 $N_{TP}$ 上界（两个不等式）
+
+### 8.5 `fsdp_tp_calcs` — **6 分** `[写作]`
+
+2D 网格：TP rank i × FSDP rank j，$N = N_{TP} N_{FSDP}$。
+每个设备持有 $W_1^{(i,j)}, W_2^{(i,j)}$ 形状 $(\frac{D}{N_{FSDP}}, \frac{D_{ff}}{N_{TP}})$，
+$W_3^{(i,j)}$ 形状 $(\frac{D_{ff}}{N_{TP}}, \frac{D}{N_{FSDP}})$。
+
+- [ ] **(a)** forward 的 FLOPs（B, D, D_ff, N_FSDP, N_TP）
+- [ ] **(b)** forward 的通信时间。**假设两个轴的通信可以重叠** →
+  答案应该是两个量的 **max**（FSDP 侧 vs TP 侧）
+- [ ] **(c)** 最优 $N_{TP}, N_{FSDP}$ 配置下，$N$ 能开到多大？不等式 + 推导
+- [ ] **(d)** 同上，但**两轴通信不能重叠**（共享网络资源）时的 $N$ 上界
+  （不用管 N_TP / N_FSDP 取整）
+
+---
+
+## §9 Leaderboard（10 分）⚠️两张 B200
+
+目标：**8B 模型完整训练步（forward + loss + backward + AdamW）的墙钟时间**。
+
+```python
+ctx_len=32768, vocab_size=151936, d_model=4096, d_ff=11008,
+num_layers=34, num_heads=32, bfloat16, is_causal=True, batch_size=2
+```
+（实算 **8.13B 参数**，光 bf16 权重就 16.3 GB。题面直言"故意做得很难塞进显存"。）
+
+**硬性约束**
+- 不能改模型的输入/输出行为；要用 `cs336_basics` 里的模型；必须通过和常规实现相同的测试
+- 必须自己写，不能抄现成实现
+- **从空的 PyTorch/Triton cache 起算，整个 benchmark 必须 10 分钟内跑完**
+  → torch.compile 和 Triton autotune 不能太激进
+- 基线是 10 秒，要打赢它
+
+**优化清单**
+- [ ] Triton autotune 调 tile 大小
+- [ ] 调 Triton / torch.compile 的其它配置
+- [ ] **fused AdamW**
+- [ ] **融合 LM head + cross-entropy**（当前实现会物化完整的
+  `[batch, seq_len, vocab_size]` logits：2×32768×151936×2B = **19.9 GB**，这是最大的一块）
+  甚至可以让它顺手把 backward 一起融进去
+- [ ] FlashAttention 改进：
+  - [ ] backward 也用 Triton 写（不只 torch.compile）
+  - [ ] backward 分两趟：一趟 dQ、一趟 dK/dV，避开 atomics 和跨 block 同步
+  - [ ] causal 时**提前终止** program instance，跳过必然全零的 tile
+  - [ ] 把非对角 tile 和对角 tile 分开：前者完全不比较索引，后者只比一次
+  - [ ] Hopper 以后的架构用 **TMA**
+- [ ] 实在放不下再上激活检查点（拿速度换显存）
+
+---
+
+## 建议执行顺序
+
+| 阶段 | 内容 | 分值 | 硬件 |
+|---|---|---:|---|
+| **1** | §8 全部推导（5 题）+ §2.3 累加精度 | **18** | 无需 GPU |
+| **2** | §0 前置 + §2.1 benchmark 脚本 + §2.4 混合精度 | 6 | 单卡够 |
+| **3** | §4.1 attention 微基准 + §4.2 torch.compile | 4 | 单卡够 |
+| **4** | §4.3/4.4 FlashAttention forward + backward | **20** | 单卡够 |
+| **5** | §5.2 naive DDP + §5.5 overlap DDP | 10 | gloo/CPU 可测 |
+| **6** | §6.1 optimizer sharding | **15** | gloo/CPU 可测 |
+| **7** | §7.1 FSDP | **15** | gloo/CPU 可测 |
+| **8** | §3 gradient checkpointing | 4 | 单卡够（xl 要换 large） |
+| **9** | §2.2 nsys + §2.5 memory profiling | 9 | 要 nsys，xl 要大显存 |
+| **10** | 所有 benchmark 类题目（§4.5、§5.1/5.3/5.4/5.6、§6.2、§7.2） | 26 | **要多卡** |
+| **11** | §9 leaderboard | 10 | **要两张 B200** |
+
+阶段 1–8 合计 **92 分**，全部能在本机（单卡 5090 + gloo/CPU）完成，其中判分测试全过。
+剩下 45 分几乎全卡在多卡/大显存上，需要先做开头那两个决策项。
