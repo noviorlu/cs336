@@ -368,18 +368,24 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
     `nsys` 会**静默回退到 `/usr/bin/nsys` 那个 2022 坏版本**——不报错，只是又给你一个
     `.qdstrm`。而且 `.venv` 是 gitignore 的，**换机器/上 Modal 都不会带过去**。
     → 每次正式 profile 前先跑验收脚本，别裸奔。
-  - **验收脚本已固化**：`hw2/scripts/nsys_check.sh`（+ `nsys_check.py` 的小工作负载）。
-    ```sh
-    cd hw2 && bash scripts/nsys_check.sh
-    ```
-    四步断言，**`nsys --version` 通过不算数**，要的是这四样全绿：
-    1. 版本 ≥ 2024（Blackwell/sm_120 的门槛）并打印实际解析到的路径
-    2. 能生成 **`.nsys-rep`**（旧版就死在这步，只吐 `.qdstrm`）
+  - **验收标准：`nsys --version` 通过不算数**，旧版也能打印版本、也认得出 5090，
+    它是在收尾时才失败的。要验的是 §2.2 实际要用的四样能力，缺一不可：
+    1. 版本 ≥ 2024（Blackwell/sm_120 的门槛），并确认解析到的**路径**是 `.venv/bin/nsys`
+    2. 能生成 **`.nsys-rep`** —— 旧版就死在这步，只吐 `.qdstrm`
     3. `nsys stats --report nvtx_sum` 能出 NVTX 汇总 —— §2.2 靠它把 warmup 过滤掉
-    4. `--filter-nvtx="scaled dot product attention"` 能把 kernel 归因到 range 内
-       —— **§2.2(b)(e) 的核心能力**，PDF 的 hint 说的就是这个
-    2026-08-30 实测四步全绿（annotated attention 调用 20 次 = 4 层 ×(2 warmup+3 step)，
-    猴补丁同时被验证）。**上 Modal 时把这个脚本塞进闸 4 的冒烟跑**（见 §B.3）
+    4. `nsys stats --report cuda_gpu_kern_sum --filter-nvtx="<range 名>"`
+       能把 kernel 归因到某个 range 内 —— **§2.2(b)(e) 的核心能力**，PDF 的 hint 说的就是这个
+    ```sh
+    uv run which nsys && uv run nsys --version          # 1
+    uv run nsys profile -o /tmp/chk --force-overwrite true -t cuda,nvtx python <带 NVTX 的脚本>
+    ls /tmp/chk.nsys-rep                                 # 2
+    uv run nsys stats --force-export=true --report nvtx_sum /tmp/chk.nsys-rep          # 3
+    uv run nsys stats --force-export=true --report cuda_gpu_kern_sum \
+           --filter-nvtx="scaled dot product attention" /tmp/chk.nsys-rep              # 4
+    ```
+    **2026-08-30 用一个 4 层 TransformerLM + §2.2 的 annotated attention 实测四步全绿**
+    （patch 被调用 20 次 = 4 层 ×(2 warmup + 3 step)，顺带确认改名 `model.py` 后猴补丁生效）。
+    →**做 §2.2 时把这四步并进正式实现**，不另留脚本；**上 Modal 时也要再验一遍**（见 §B.3 闸 4）
   - 踩到的两个小坑：`nsys stats` 复用旧的 `.sqlite` 会报
     `File is older than input file` 然后直接退出 → 加 `--force-export=true`；
     旧版还不认 `--force-overwrite`（报 option is ambiguous）
