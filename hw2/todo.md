@@ -188,14 +188,59 @@ Modal 每月 $30 免费额度 ≈ **4.8 B200·小时**，够覆盖阶段 9 + 10a
     ```toml
     cs336-basics = { path = "../hw1", editable = true }
     ```
-  - **用自己的实现需要先补三处兼容**（我们刚做完的重构已经解决了接口和权重层面的问题——
-    `model(x)` 单参数可调用、state_dict 与官方逐 key 一致、logits 差 6e-07——但命名还没对齐）：
-    - [ ] 类名：官方 `BasicsTransformerLM` vs 我们的 `TransformerLM`
-    - [ ] 模块路径：官方 `cs336_basics.model` vs 我们的 `cs336_basics.transformer`
-      （§2.1.4 要求 `cs336_basics.model.scaled_dot_product_attention = annotated_版本`，
-      §9 leaderboard 的测试代码也直接 import 这两个名字）
-    - [ ] 最省事的做法：在 `cs336_basics/model.py` 建一个转发模块 +
-      `BasicsTransformerLM = TransformerLM` 别名，而不是改动已经测试通过的代码
+  - 接口和权重层面**已经通了**（2026-08-29 的重构）：`model(x)` 单参数可调用、
+    state_dict 与官方逐 key 一致、同权重同输入 logits 差 6e-07。剩下的只有命名问题。
+
+  **判分测试实际卡在哪（`grep -rn cs336_basics tests/` 的结果）**
+
+  hw2 四个测试文件里**只有 `test_fsdp.py` 引用 cs336_basics**，且只要三个类：
+  ```
+  tests/test_fsdp.py:27   from cs336_basics.model import Embedding, Linear, RMSNorm
+  tests/test_fsdp.py:53   from cs336_basics.model import Embedding, Linear
+  tests/test_fsdp.py:204  from cs336_basics.model import Embedding, Linear
+  ```
+  `test_ddp.py` / `test_sharded_optimizer.py` / `test_attention.py` **零引用**（自带 toy model）。
+  这三个类我们**名字完全相同、`weight` 布局也相同**（`[out, in]`，实测 `Linear(4,8).weight` 是
+  `[8, 4]`，和官方一致）。**唯一差异是模块路径**：官方在 `cs336_basics/model.py`，我们在
+  `cs336_basics/transformer.py`。
+
+  - [ ] **建 `cs336_basics/model.py` 转发模块**（判分层面只需要这一件事）
+    ```python
+    from .transformer import *            # noqa: F403
+    from .transformer import TransformerLM as BasicsTransformerLM
+    from .transformer import RoPE as RotaryEmbedding   # 给 PDF 示例代码用
+    ```
+
+  - [ ] **⚠️ 记住：猴补丁不能打在转发模块上，会静默失效**
+
+    PDF §2.1.4（L241）让你这样插 NVTX 注解：
+    ```python
+    cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+    ```
+    实测（转发模块 + 我们的实现）：
+    ```
+    patch cs336_basics.model.*        → 被调用 0 次   ✗ 完全没生效
+    patch cs336_basics.transformer.*  → 被调用 1 次   ✓
+    ```
+    原因：官方的 `scaled_dot_product_attention` 和调用它的
+    `CausalMultiHeadSelfAttention.forward` 在**同一个模块**里，改 `model` 的模块全局变量方法就能查到；
+    而我们的 `MultiHeadSelfAttention.forward` 是在 **`cs336_basics.transformer` 的全局命名空间**
+    里查这个名字的，转发模块里的绑定它根本不看。
+    **危险在于不报错**——nsys 照跑，只是 NVTX 里永远没有 "computing softmax" 那几个 range，
+    §2.2 的 (b)(c)(e) 三问答不出来，还会以为是 nsys 配置错了。
+    **正确写法：`cs336_basics.transformer.scaled_dot_product_attention = 注解版`**
+
+  - [ ] **PDF 示例代码的名字对不上（不判分，抄的时候会报错）**
+
+    | PDF 用的 | 我们的 | 出处 |
+    |---|---|---|
+    | `RotaryEmbedding` | `RoPE` | §3.2 示例（L608） |
+    | `BasicsTransformerLM` | `TransformerLM` | §9 leaderboard（L2618） |
+    | `TransformerBlock(..., positional_encoder=...)` | `TransformerBlock(..., rope=...)` | §3.2 示例（L608） |
+
+    前两个上面的转发模块里已经加了别名；`TransformerBlock` 的关键字名不同，抄 §3.2
+    示例时手改一下即可。
+
   - 用官方实现的好处：leaderboard 和所有题面示例代码开箱即用；坏处：hw1 的消融开关
     （norm/ffn/tie/doc-mask）用不上
 - [ ] **确认 `uv` 工作流**：`uv run pytest`、`uv run nsys profile -- python ...`
@@ -250,8 +295,10 @@ Modal 每月 $30 免费额度 ≈ **4.8 B200·小时**，够覆盖阶段 9 + 10a
 - [ ] **给代码加 NVTX 标注**：用 `@nvtx.range(...)` / `with nvtx.range(...)` 圈出
   warm-up（好用 `--nvtx-capture` 过滤掉）、forward/backward、以及 attention 内部的
   "attention scores" / "softmax" / "final matmul" 三段
-  - 做法：写 `annotated_scaled_dot_product_attention`，再
-    `cs336_basics.model.scaled_dot_product_attention = annotated_版本` 猴补丁
+  - 做法：写 `annotated_scaled_dot_product_attention`，再猴补丁替换掉原实现
+  - **⚠️ 用自己的 hw1 实现时，必须 patch `cs336_basics.transformer.scaled_dot_product_attention`，
+    不是 PDF 写的 `cs336_basics.model.*`** —— 打在转发模块上会静默失效（实测 0 次调用），
+    NVTX range 一个都不会出现。详见 §0
 - [ ] (a) forward 总时间，和 §2.1 用 Python 标准库测的对不对得上？→ 1-2 句
 - [ ] (b) forward 里累计 GPU 时间最长的 CUDA kernel 是哪个？单次 forward 调用几次？
   加上 backward 之后还是它吗？→ 1-2 句
