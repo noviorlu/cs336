@@ -1,38 +1,22 @@
 # CS336 Assignment 2 (Systems) — 完整 TODO
 
-> 依据 `cs336_assignment2_systems.pdf`（Version 26.1.3, Spring 2026, 48 页）逐节梳理。
-> 27 个 Problem，**总分 137**。hw1 重构相关的清单已移到同目录的 [todo-hw1-refactor.md](todo-hw1-refactor.md)。
->
-> **图例**：`[代码]` 有 pytest 判分 · `[文字]` 产出博客正文 · `[图]` 产出截图/表格/曲线 ·
-> `⚠️多卡` 需要 >1 GPU（→ Modal，计划内支出） · `⚠️大显存` 单卡 32G 放不下
->
-> **怎么读**：先看「读我先」的四个前提（一屏）→ 需要什么再跳：
-> **A** 谁写什么 · **B** 卡从哪来、钱怎么花 · **§0–§9** 逐题清单 ·
-> 末尾是**博客产出规划**和**建议执行顺序**（"现在该做哪一步"看那张阶段表）
+> **来源**：依据 `cs336_assignment2_systems.pdf`（Version 26.1.3, 48 页）梳理。
+> **规模**：27 个 Problem，总分 137。hw1 重构清单详见 [todo-hw1-refactor.md](todo-hw1-refactor.md)。
+> 
+> **图例**：`[代码]` 有 pytest 判分 · `[文字]` 产出博客正文 · `[图]` 产出截图/表格/曲线
+> `⚠️多卡` 需 >1 GPU (Modal 支出) · `⚠️大显存` 5090 32G 单卡放不下
+> 
+> **四大基本前提（本计划的核心决策基石）：**
+> 1. **不提交 Gradescope，终极产出为知乎博客**。不打 ZIP 包，直接依赖自己 hw1 的干净代码。
+> 2. **多卡是花钱买的体验，不是要绕开的障碍**。§5-7 必须上 Modal 跑真实通信，不用 gloo/CPU 糊弄。
+> 3. **降维只为防 OOM，不为省钱砍内容**。省钱靠挑卡型（不必非租 B200），不砍作业核心逻辑。
+> 4. **花钱上云前，必须在本地 5090 跑通**。云端按秒计费的算力只用来跑数据出图，绝不用于 Debug。
+> 
+> **导航**：紧接着往下看 **[分值分布与执行路线]**，然后是 **[A 协作模式]** · **[B 算力规划]** · **[§0–§9 逐题清单]**。
 
 ---
 
-## 读我先：这份计划的四个前提
-
-这四条决定了后面所有取舍，A / B / C 三节都是它们的展开。
-
-1. **不提交 Gradescope，产出是知乎博客**（→ 下面「交付物」）。
-   `writeup.pdf` / `code.zip` / leaderboard 提交全不做，**分值只当工作量参考**。
-   连带的好处：`test_and_make_submission.sh` 的打包顾虑消失，
-   §0 可以直接把 `cs336-basics` 指向自己的 hw1 实现，走最干净的方案。
-2. **多卡是花钱买的体验，不是要绕开的障碍**（→ §B.3）。
-   §5/§6/§7 的目的是**亲手感受写多卡代码的难度**，这在 gloo/CPU 的 `world_size=2` 上
-   体会不到——那里没有真实通信带宽、也没有 CUDA stream，通信占比恒等于噪声。
-   平台已定 **Modal**，这部分是**计划内支出**。
-   失去强制性的只是 **B200 这个型号**（§4.5、§9 点名它是为了全班数字可比），**不是多卡本身**。
-3. **降规模只适用于"单卡装不下"的题**（§2.5 xl、§4.5 长 seq）。
-   §5–§7 不在此列——那几题降的不是规模，是这门课的核心内容。
-   省钱靠**挑便宜卡型**（计划内那 11 GPU·h 不需要 B200），不是砍内容。
-4. **花钱前必须在 5090 上跑通**（→ §B.3）。
-   gloo/CPU 因此从"省钱的替代品"升级成**上云的准入门槛**：
-   租来的每一分钟只用来**跑数字**，不用来发现 import 写错了。
-
-### 交付物
+## 交付物
 
 **在家自学，不提交 Gradescope**。所以 `writeup.pdf`、`code.zip`、
 `./test_and_make_submission.sh`、leaderboard 提交**全部不做**。
@@ -44,24 +28,31 @@
 | **知乎博客** | 记录实现步骤。取代 writeup.pdf —— 但要求不同：writeup 要的是"1-2 句作答"，博客要的是**为什么这么做、踩了什么坑、数字长什么样** |
 | 代码 | `cs336_systems/` 里的实现，跑通 `uv run pytest tests/` 即可，不需要打包 |
 
-### 分值分布
+## 分值分布与执行路线
 
-| 章节 | 主题 | 题数 | 分值 |
-|---|---|---:|---:|
-| §2 | Profiling & Benchmarking | 5 | 16 |
-| §3 | Single-GPU Memory（激活检查点） | 1 | 4 |
-| §4 | GPU Kernels（FlashAttention-2 / Triton） | 5 | **29** |
-| §5 | Distributed Data Parallel | 6 | 21 |
-| §6 | Optimizer State Sharding | 2 | 20 |
-| §7 | Fully-Sharded Data Parallel | 2 | 20 |
-| §8 | 并行策略分析（纯推导） | 5 | 17 |
-| §9 | Leaderboard | 1 | 10 |
-| | | **27** | **137** |
+这份作业**总分 137**。与其按章节顺序做，不如按**“先单卡开发，再上云跑数”**的物理约束重新排布。
+以下路线图展示了如何**先用单卡 5090 和本地 gloo/CPU 拿下 97 分**（阶段 1–8 的 80 分 + 阶段 11 的 §8 推导 17 分），
+然后再花钱上 Modal 冲刺剩下的 40 分（阶段 9 的 30 + 阶段 10 leaderboard 的 10）。
 
-分值集中在三块：**FlashAttention (29)**、**FSDP (20)**、**Optimizer Sharding (20)**，
-合计 69 分（占一半）且全部有 pytest 判分 —— 也就是**这三块最值得写进博客**，
-既有硬核实现又有客观正确性验证。§8 的 17 分是纯纸面推导、不需要任何硬件，
-本可以最先动手，但**已定为放到最后**——理由见文末「建议执行顺序」。
+| 阶段 | 对应章节 | 内容 | 分值 | 硬件要求 |
+|---|---|---|---:|---|
+| | **▸ 纯单卡：跑通前向与内核** | | | |
+| **1** | §0 + §2 | 环境配置、benchmark 脚本、混合精度 | 7 | 单卡 5090 |
+| **2** | §4.1 + §4.2 | Attention 微基准与 `torch.compile` | 4 | 单卡 5090 |
+| **3** | §4.3 + §4.4 | FlashAttention 前后向（Triton/纯 PyTorch） | **20** | 单卡 5090 |
+| | **▸ 多进程：单机分布式逻辑** | | | |
+| **4** | §5.2 + §5.5 | 朴素 DDP 与 通信重叠 DDP | 10 | 本机 gloo/CPU (无需 GPU) |
+| **5** | §6.1 | Optimizer State Sharding | **15** | 本机 gloo/CPU (无需 GPU) |
+| **6** | §7.1 | Fully-Sharded Data Parallel (FSDP) | **15** | 本机 gloo/CPU (无需 GPU) |
+| | **▸ 单卡：深度性能剖析** | | | |
+| **7** | §2.2 | Nsys Profile | 5 | 单卡 5090 |
+| **8** | §3 | 激活检查点 (Gradient Checkpointing) | 4 | 单卡 5090 (大显存要求可降维) |
+| | **▸ 上云：真实通信与极限测试** | | | **先办 §B.3 的 ⏸ 清单，过完四道闸** |
+| **9a** | §5.1/5.3/5.4/5.6 + §6.2 + §7.2 | 多卡 benchmark（通信占比、显存账、nsys 重叠图） | 21 | **Modal 多卡**（计划内支出） |
+| **9b** | §2.5 + §4.5 | 大显存单卡 benchmark（xl 显存 timeline、FA2 长 seq 打榜） | 9 | **单卡大显存**（可降维留本机，或顺手上云补） |
+| **10** | §9 | Leaderboard 优化打榜 | 10 | 开放式 (云上或单卡) |
+| | **▸ 纸面：理论收束** | | | |
+| **11** | §8 | 并行策略推导分析 | **17** | 纯纸面推导 |
 
 ---
 
@@ -94,7 +85,7 @@
 
 **② 脚手架 / 非核心 —— Claude 可以写**
 
-- §0 环境配置：`pyproject` 指向、`transformer.py` → `model.py` 改名、类别名
+- §1 环境配置：`pyproject` 指向、`transformer.py` → `model.py` 改名、类别名
 - §2.1 benchmark 脚本骨架：CLI 参数、warmup/measure 循环、`cuda.synchronize()`、均值±标准差
 - §2.2 nsys 封装、NVTX range 的包装层（**被包的 attention 实现是用户的**）
 - §2.5 memory profiler 开关、snapshot dump
@@ -138,13 +129,22 @@
 **这条不放宽代码的边界**：①里列的核心实现（Triton kernel、
 分布式逻辑、§8 推导）仍然由用户自己写。放宽的只有"把已有的东西写成文章"这一步。
 
+
+
+**写作时要坚守的“博客质量基线”：**
+- [ ] 代码片段要**可独立运行**（作业只要答案，博客读者要能抄走就跑）
+- [ ] 每张表/图注明**硬件、torch 版本、warmup/measure 步数**（可复现性）
+- [ ] 中文术语统一（kernel / 算子、residual / 激活、shard / 分片……开篇定好）
+- [ ] 把"踩坑"单独写出来 —— 比如已经遇到的「猴补丁打在转发模块上静默失效」，这类内容比正确答案更有阅读价值
+
 ---
 
 ## B. 算力
 
 - 本机 **单卡 RTX 5090 / 32 GB**；题面默认 **B200（180 GB）**，多处要求 **2–6 张卡**
 - **判分测试一分钱不用花**：四个测试文件全是 `mp.spawn` + gloo/CPU 起 `world_size=2`
-- **本机能做完 93 分**（FlashAttention 20 + §6.1 15 + §7.1 15 + §8 17 + §5.2/5.5 10 + §2/§4 杂项）
+- **本机能做完 97 分**（§4.3/4.4 的 20 + §6.1 15 + §7.1 15 + §8 17 + §5.2/5.5 10 +
+  §2.1/2.3/2.4 的 7 + §2.2 的 5 + §4.1/4.2 的 4 + §3.1 的 4；其中 §3.1(b) 要降维）
 - **真要花钱的只有一档**：§5.1 + §5.3/5.4/5.6 + §6.2 + §7.2，约 **11 GPU·h**，
   平台 **Modal**，属于计划内支出（理由见「读我先」前提 2）
 - **可省的只有** §2.5 / §3.1(b) 的 xl（用 large 替代）和 §4.5 的长 seq（扫到哪算哪）
@@ -335,109 +335,34 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
 
 ---
 
-## §0 前置准备
+## §0 前置准备（本文档自编号；PDF 的 §1 是 Assignment Overview）
 
-- [ ] **决定用官方 basics 还是自己的 hw1 实现**
-  - `pyproject.toml:35` 现在指向 `./cs336-basics`（官方参考实现）。改成自己的 hw1：
-    ```toml
-    cs336-basics = { path = "../hw1", editable = true }
-    ```
-  - 接口和权重层面**已经通了**（2026-08-29 的重构）：`model(x)` 单参数可调用、
-    state_dict 与官方逐 key 一致、同权重同输入 logits 差 6e-07。剩下的只有命名问题。
+### Action
 
-  **判分测试实际卡在哪（`grep -rn cs336_basics tests/` 的结果）**
-
-  hw2 四个测试文件里**只有 `test_fsdp.py` 引用 cs336_basics**，且只要三个类：
+- [ ] **Action 1**: 执行重命名命令：`git mv hw1/cs336_basics/transformer.py hw1/cs336_basics/model.py`
+  - **为什么必须真改名、不能留个转发模块**：§2.2 要求 `cs336_basics.model.scaled_dot_product_attention = 注解版`。
+    如果 `model.py` 只是 `from .transformer import *`，这个赋值改的是 `model` 模块的全局绑定，而
+    `MultiHeadSelfAttention.forward` 是在 `transformer` 的命名空间里查这个名字的——**patch 不到，实测 0 次调用，且不报错**，
+    只是 NVTX range 全部消失，§2.2 的 (b)(c)(e) 直接答不出来。
+- [ ] **Action 2**: 批量替换引用路径。把 `hw1/` 目录下（包括 `__init__.py` 和各测试脚本）共计约 11 处的 `cs336_basics.transformer` 替换为 `cs336_basics.model`。
+- [ ] **Action 3**: 在改名后的 `model.py` 底部加上两行别名代码，以兼容 PDF 后续要求：
+  ```python
+  BasicsTransformerLM = TransformerLM
+  RotaryEmbedding = RoPE
   ```
-  tests/test_fsdp.py:27   from cs336_basics.model import Embedding, Linear, RMSNorm
-  tests/test_fsdp.py:53   from cs336_basics.model import Embedding, Linear
-  tests/test_fsdp.py:204  from cs336_basics.model import Embedding, Linear
+- [ ] **Action 4**: 修改 `hw2/pyproject.toml:35`，把官方库替换为本地路径：
+  ```toml
+  cs336-basics = { path = "../hw1", editable = true }
   ```
-  `test_ddp.py` / `test_sharded_optimizer.py` / `test_attention.py` **零引用**（自带 toy model）。
-  这三个类我们**名字完全相同、`weight` 布局也相同**（`[out, in]`，实测 `Linear(4,8).weight` 是
-  `[8, 4]`，和官方一致）。**唯一差异是模块路径**：官方在 `cs336_basics/model.py`，我们在
-  `cs336_basics/transformer.py`。
 
-  **两个方案，因为不提交，选后者**
+- [ ] **Action 5**: 系统级安装 `nsys` (Nsight Systems CLI)，这是后面所有性能抓图的刚需。
+- [ ] **Action 6**: 跑一次空转的 `uv run pytest tests/`，验证依赖全部贯通（此时 `adapters.py` 里的 8 个 hook 还是 NotImplementedError，必然报错，但只要不是 import 报错就说明环境通了）。
 
-  - [ ] ~~方案 A：建 `cs336_basics/model.py` 转发模块~~
-    ```python
-    from .transformer import *            # noqa: F403
-    ```
-    判分够用，但会踩下面那个猴补丁的坑（转发出来的名字 patch 不到）。
+### Tips
 
-  - [ ] **方案 B（推荐）：`pyproject` 指向 hw1 + 把 `transformer.py` 改名成 `model.py`**
-    ```toml
-    # hw2/pyproject.toml:35
-    cs336-basics = { path = "../hw1", editable = true }
-    ```
-    ```bash
-    git mv hw1/cs336_basics/transformer.py hw1/cs336_basics/model.py
-    # 再 sed 掉 10 处 import（decoder/interactive/scratch_eval/train/
-    # tests/adapters.py ×3 / tests/test_causality.py ×2 / tests/test_rope.py）
-    ```
-    末尾加两行类别名（类别名不受命名空间问题影响）：
-    ```python
-    BasicsTransformerLM = TransformerLM
-    RotaryEmbedding = RoPE
-    ```
-    **为什么更好**：改名后 `scaled_dot_product_attention` 和调用它的
-    `MultiHeadSelfAttention.forward` 真的在同一个模块里，和官方结构一致，
-    **下面那个猴补丁的坑直接消失**，PDF 的写法原样可用。
-    可行性已核对：hw1 的 pyproject 本来就是 `name = "cs336_basics"` +
-    `package = true` 的可安装包（规范化后 == `cs336-basics`）；
-    两边都是 `torch~=2.11.0` / `python >=3.12,<3.14`，依赖不冲突；
-    `notes.md` 和 `EXPERIMENTS.md` **零处**提到 `transformer.py`，没有文档要跟着改。
-    README L38-40 自己也写了这条路："edit the outer `pyproject.toml` file to point to
-    your own implementation"。
-    **原本唯一的顾虑（提交打包时 `zip -r .` 抓不到 `../hw1`）因为不提交而消失。**
-
-  - [ ] **⚠️ 只在选了方案 A 时才有的坑：猴补丁打在转发模块上会静默失效**
-
-    PDF §2.1.4（L241）让你这样插 NVTX 注解：
-    ```python
-    cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
-    ```
-    实测（转发模块 + 我们的实现）：
-    ```
-    patch cs336_basics.model.*        → 被调用 0 次   ✗ 完全没生效
-    patch cs336_basics.transformer.*  → 被调用 1 次   ✓
-    ```
-    原因：官方的 `scaled_dot_product_attention` 和调用它的
-    `CausalMultiHeadSelfAttention.forward` 在**同一个模块**里，改 `model` 的模块全局变量方法就能查到；
-    而我们的 `MultiHeadSelfAttention.forward` 是在 **`cs336_basics.transformer` 的全局命名空间**
-    里查这个名字的，转发模块里的绑定它根本不看。
-    **危险在于不报错**——nsys 照跑，只是 NVTX 里永远没有 "computing softmax" 那几个 range，
-    §2.2 的 (b)(c)(e) 三问答不出来，还会以为是 nsys 配置错了。
-    **正确写法：`cs336_basics.transformer.scaled_dot_product_attention = 注解版`**
-
-  - [ ] **PDF 示例代码的名字对不上（不判分，抄的时候会报错）**
-
-    | PDF 用的 | 我们的 | 出处 |
-    |---|---|---|
-    | `RotaryEmbedding` | `RoPE` | §3.2 示例（L608） |
-    | `BasicsTransformerLM` | `TransformerLM` | §9 leaderboard（L2618） |
-    | `TransformerBlock(..., positional_encoder=...)` | `TransformerBlock(..., rope=...)` | §3.2 示例（L608） |
-
-    前两个上面的转发模块里已经加了别名；`TransformerBlock` 的关键字名不同，抄 §3.2
-    示例时手改一下即可。
-
-  - 用官方实现的好处：leaderboard 和所有题面示例代码开箱即用；坏处：hw1 的消融开关
-    （norm/ffn/tie/doc-mask）用不上
-- [ ] **装 `nsys`**（Nsight Systems CLI）——§2.1.4、§2.1.6(f)、§5.3.2(b)、§7 accounting(b)
-  都要它，没得选，直接装。云镜像不一定自带，到时候镜像里也要装一份
-- [ ] **确认 `uv` 工作流**：`uv run pytest`、`uv run nsys profile -- python ...`
-- [ ] **建 `cs336_systems/` 的骨架**（现在只有一个空 `__init__.py`，题面明确说"从零随便写"）
-- [ ] **`tests/adapters.py` 的 8 个 hook**，全部还是 `raise NotImplementedError`：
-  `get_flashattention_autograd_function_pytorch` / `get_flashattention_autograd_function_triton` /
-  `get_ddp` / `ddp_on_after_backward` / `get_fsdp` / `fsdp_on_after_backward` /
-  `fsdp_gather_full_params` / `get_sharded_optimizer`
-  - ⚠️ PDF 里写的是 `adapters.get_flash_autograd_function_triton`，**实际文件里叫
-    `get_flashattention_autograd_function_triton`**，以文件为准
-  - ⚠️ `fsdp_on_after_backward` 和 `fsdp_gather_full_params` 在 PDF 的 fsdp 题面里**没提**，
-    但 adapters.py 里有，别漏
-- [ ] **表格自动化**：题面强烈建议用代码生成表格（`pandas.DataFrame.to_latex()` /
-  `.to_typst()`），这份作业要交的表非常多。先把这个基础设施搭好，后面每题省一大截时间
+1. **PDF 命名不一预警**：抄 PDF 示例时，注意官方管我们的 `rope` 参数叫 `positional_encoder`。
+2. **Hook 盘点**：`tests/adapters.py` 里留了 8 个空接头（如 `get_ddp`）等着后面填。注意 PDF 里写的 `get_flash_autograd_function_triton` 在实际文件里叫 `get_flashattention_autograd_function_triton`。
+3. **💡 表格自动化 Tip**：写 benchmark 时，顺手用 pandas 将结果存成 DataFrame 并调 `.to_markdown()`，方便直接贴进知乎。
 
 **统一模型配置**（vocab_size=10000，batch_size=4，除非特别说明 context_length=512）
 
@@ -453,450 +378,281 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
 
 ## §2 Profiling and Benchmarking（16 分）
 
-### 2.1 `benchmarking_script` — 4 分 `[代码基建]` `[文字]`
+### 2.1 `benchmarking_script` (4分)
+**Actions:**
+- [ ] 编写 `benchmark.py`，支持 CLI 参数（超参组合、三种执行模式：仅前向/前向反向/完整训练步、warm-up/measure 步数）。
+- [ ] 确保在测试循环中每步结束后严格调用 `torch.cuda.synchronize()`。
 
-- [ ] **(a) 写 benchmark 脚本**（这是后面一切的地基，命令行参数要设计好）
-  - 按超参初始化模型 / 造随机 batch（随机权重随机数据即可，只测速度和显存）
-  - 支持三种模式：只 forward / forward+backward / forward+backward+optimizer step
-  - `w` 步 warm-up 后计时 `n` 步；用 `timeit.default_timer()`（比 `time.time()` 分辨率高）
-  - **每步之后 `torch.cuda.synchronize()`** —— CUDA 调用是异步的，不同步就测的是"提交耗时"
-  - 后面会不断往这个脚本上加开关：混合精度、memory profiler、torch.compile、NVTX、DDP……
-    **一开始就按"可组合的 flag"来设计**
-- [ ] **(b)** 对 §0 表里全部 5 个 size 测 forward / backward / optimizer step，
-  5 warmup + 10 measurement，报**均值和标准差**。→ 1-2 句话
-- [ ] **(c)** 去掉 warm-up 重测；再试 1 步、2 步 warm-up。解释为什么结果还是不同。→ 2-3 句话
-  - （提示方向：CUDA context 初始化、cuBLAS/cuDNN autotune 首次选算法、内存分配器 cache 预热）
+**Blog:**
+- [ ] 测 §0 那张模型配置表里的 5 个 size（= PDF Table 1，在 PDF §2.1.2） (5 warmup + 10 measure)，记录均值和标准差。（⚠️ 10B 本地必爆 OOM，记录报错现象或仅测前向即可）。
+- [ ] 对比 0 步、1-2 步、5 步 warm-up 的结果差异并解释原因（提示：CUDA 上下文/内存池预热等）。
 
-### 2.2 `nsys_profile` — 5 分 `[文字]` `[图]` ⚠️需要 nsys
+### 2.2 `nsys_profile` (5分)
+**Actions:**
+- [ ] 编写 `annotated_scaled_dot_product_attention`，用 `cs336_basics.model.scaled_dot_product_attention = ...` 替换原函数打上 NVTX 猴补丁。
+- [ ] 使用 `nvtx.range` 圈出 warm-up、前向/反向、以及 Attention 内的 "scores"、"softmax"、"final matmul"。
+- [ ] 选 2 个 model size × 3 个 >128 的 seq_len (选显存极限下的最大值)，跑 `nsys profile` 抓取数据。
 
-- [ ] 选 **2 个 model size × 3 个 2 的幂次 context length（>128，最大取显存能装下的极限）** 做 profile
-  ```bash
-  uv run nsys profile --trace=cuda,cudnn,cublas,osrt,nvtx \
-    --pytorch=functions-trace,autograd-shapes-nvtx --gpu-metrics-devices=0 -- python benchmark.py
-  ```
-  （`--cudabacktrace=all --python-backtrace=cuda` 开销很大，不需要 traceback 时关掉）
-- [ ] **给代码加 NVTX 标注**：用 `@nvtx.range(...)` / `with nvtx.range(...)` 圈出
-  warm-up（好用 `--nvtx-capture` 过滤掉）、forward/backward、以及 attention 内部的
-  "attention scores" / "softmax" / "final matmul" 三段
-  - 做法：写 `annotated_scaled_dot_product_attention`，再猴补丁替换掉原实现
-  - **⚠️ 若 §0 选了方案 A（转发模块）**：必须 patch
-    `cs336_basics.transformer.scaled_dot_product_attention`，不是 PDF 写的
-    `cs336_basics.model.*` —— 打在转发模块上会静默失效（实测 0 次调用），
-    NVTX range 一个都不会出现。**选方案 B（改名）则无此问题**，PDF 写法原样可用
-- [ ] (a) forward 总时间，和 §2.1 用 Python 标准库测的对不对得上？→ 1-2 句
-- [ ] (b) forward 里累计 GPU 时间最长的 CUDA kernel 是哪个？单次 forward 调用几次？
-  加上 backward 之后还是它吗？→ 1-2 句
-- [ ] (c) 除了矩阵乘，还有哪些 kernel 占了不可忽略的时间？→ 1-2 句
-- [ ] (d) 完整训练步（含自己的 AdamW）里矩阵乘占比相对纯推理怎么变？其它 kernel 呢？→ 1-2 句
-- [ ] (e) attention 内部 softmax vs 矩阵乘的**运行时间比** 和 **FLOPs 比** 差多少？→ 1-2 句
-  - （这题是后面 FlashAttention 的动机：softmax 的 FLOPs 占比极小但耗时占比不小 = memory-bound）
+**Blog:**
+- [ ] (a) 前向总时间是否与 2.1 脚本测试出的时间对齐？
+- [ ] (b) 找出前向累计耗时最长的 CUDA kernel 及单次前向的调用次数；加上反向之后，最长 kernel 是否发生变化？
+- [ ] (c) 指出除矩阵乘外的其他不可忽略耗时的 kernel。
+- [ ] (d) 完整训练步中矩阵乘耗时占比对比纯前向有何变化？其他 kernel 呢？
+- [ ] (e) 对比 Attention 内 softmax vs 矩阵乘的运行时间差距与理论 FLOPs 差距的对比关系。
 
-### 2.3 `mixed_precision_accumulation` — 1 分 `[文字]`
+### 2.3 `mixed_precision_accumulation` (1分)
+**Actions:**
+- [ ] 跑题面指定的 4 段累加实验代码（fp32、fp16、混合、显式 cast type）。
 
-- [ ] 跑题面给的 4 段累加代码（fp32 累加 / fp16 累加 / fp32 累加器加 fp16 值 /
-  显式 `.type(torch.float32)` 后累加），解释精度差异。→ 2-3 句
-  - 纯送分题，10 分钟能做完，建议第一个做
+**Blog:**
+- [ ] 用 2-3 句话解释这 4 种写法产生精度差异的原因。
 
-### 2.4 `benchmarking_mixed_precision` — 2 分 `[文字]`
+### 2.4 `benchmarking_mixed_precision` (2分)
+**Actions:**
+- [ ] 为 `benchmark.py` 加 `--dtype bfloat16` 开关，结合 `torch.autocast` 上下文实现混合精度测试。
 
-- [ ] **(a)** 给定 `ToyModel`（fc1 → relu → LayerNorm → fc2），在 fp16 autocast 下写出六个 dtype：
-  模型参数 / fc1 输出 / LayerNorm 输出 / logits / loss / 梯度
-- [ ] **(b)** LayerNorm 的哪些部分对低精度敏感？换成 **BF16** 之后还需要特殊对待吗？为什么？→ 2-3 句
-  - （方向：均值/方差是累加归约，动态范围；BF16 指数位和 FP32 一样宽）
-- [ ] **(c)** 给 benchmark 脚本加 `--dtype bfloat16` 开关，5 个 size 各测有/无混合精度，
-  说明随规模变化的趋势。→ 2-3 句 + 计时表
-  - hw1 的 `train.py` 已经有 `torch.autocast` + `nullcontext` 的写法，可以直接搬
+**Blog:**
+- [ ] (a) 写出 `ToyModel` 在 fp16 autocast 下 6 个组件的实际 dtype (模型参数/fc1输出/LN输出/logits/loss/梯度)。
+- [ ] (b) 解释 LayerNorm 的哪些部分对低精度敏感，以及换成 BF16 后是否还需要特殊对待及原因。
+- [ ] (c) 给出 5 个 size 在有/无 BF16 混合精度下的前向+反向耗时趋势对比表并解释规律。
 
-### 2.5 `memory_profiling` — 4 分 `[文字]` `[图]` ⚠️大显存
+### 2.5 `memory_profiling` (4分)
+**Actions:**
+- [ ] 给脚本加入 PyTorch Memory Profiler (`_record_memory_history` 与 `_dump_snapshot`) 导出开关。
 
-- [ ] **(a)** 给脚本加 memory profiler 开关：
-  ```python
-  torch.cuda.memory._record_memory_history(max_entries=1000000)
-  ...
-  torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
-  torch.cuda.memory._record_memory_history(enabled=None)
-  ```
-  拖进 pytorch.org/memory_viz 看 Active memory timeline。
-  **交两张图**：xl 纯 forward / xl 完整训练步 + 2-3 句
-- [ ] **(b)** context length 128 和 2048 各自的峰值显存（forward / 完整训练步）→ 2×2 表格
-- [ ] **(c)** 混合精度下的峰值显存，影响大吗？→ 2-3 句
-- [ ] **(d)** xl 残差流上单个激活张量多大（MiB，除 1024²）？要写推导 → 1-2 句
-- [ ] **(e)** memory_viz 里把 Detail 调低，最大的那几笔分配是多大、从哪来的（看 stack trace）→ 1-2 句
-- [ ] **(f)** 用 nsys 的内存 profiling flag + PyTorch 的 NVTX 标签，算出**单个 TransformerBlock
-  为 backward 存了多少激活**，列出贡献最大的 5 个操作及占比；再结合 backward 时每个 block
-  的显存变化，算出梯度张量占多少，和预期对得上吗？→ 截图 + 1-2 段
-- ⚠️ xl 完整训练步需要 54.5 G，本机放不下。见开头的"决策项"
+**Blog:**
+- [ ] (a) 提交 xl 纯前向与完整训练步的 2 张 Active memory timeline 截图（⚠️ xl 完整步会 OOM，可留待上云跑或在此直接展示 OOM 报错）。
+- [ ] (b) 用表格展示 seq=128 与 2048 时，纯前向与完整训练步的峰值显存 (共 4 个数据点)。
+- [ ] (c) 测量并说明混合精度对 xl 纯前向和完整训练步峰值显存的具体影响。
+- [ ] (d) 手算推导 xl 残差流上单个激活张量的大小 (以 MiB 为单位，除以 1024^2)。
+- [ ] (e) 降低 pytorch.org/memory_viz 中的 Detail 级别，指出最大的那几笔显存分配分别是多大，以及它们的来源 (看 stack trace)。
+- [ ] (f) 结合 nsys 内存 flag，记录单层 TransformerBlock 为反向保存了多少激活 (列出 Top 5 贡献操作及占比)；并核对反向时新产生的梯度张量内存大小是否符合理论预期。
 
----
+- [ ] 📝 **收口**：把 §2 的素材填进 [blog.md](blog.md) 的「§2 素材卡」→ **第 1 篇**。
+      **做完这一节立刻做，不要攒**（三步流程见 blog.md 顶部）。
+      角度：作为开篇，展示 5090 的显存极限与 nsys 读法，定下“先量再找瓶颈”的基调。
 
 ## §3 Single-GPU Memory（4 分）
 
-> 背景：一个 xl 的 TransformerBlock 光 backward 要存的激活就 **3.6 GiB**，32 层 = **114 GiB**。
-> 先用 `torch.compile` 做算子融合（RMSNorm 从存 5 个张量降到 3 个），再上激活检查点。
+### 3.1 `gradient_checkpointing` (4分)
+**Actions:**
+- [ ] 编写一层不嵌套重算的 checkpointing 策略代码，对 xl 模型 (batch 4, seq 2048) 进行 1 步前/反向。
+- [ ] 测试相邻的更大和更小的 checkpoint 块大小的峰值显存。
+- 💡 **工程陷阱**：`torch.utils.checkpoint.checkpoint` 默认重算包裹的整个 block。为准确控制“单层重算”并测量峰值显存，建议写个 `dummy_forward` 脚手架配合 `torch.cuda.max_memory_allocated()`。
 
-### 3.1 `gradient_checkpointing` — 4 分 `[文字]`
+**Blog:**
+- [ ] (a) 纯纸面推导：N 个相同 block 堆叠时，忽略计算开销、最小化峰值显存的检查点策略是什么？(提供代码草图、关于 N 的峰值显存和计算量的渐近复杂度)。
+- [ ] (b) 解释 xl 实测的最优检查点块大小，并列出实测验证的显存数字。
 
-- [ ] **(a)** N 个相同 block 顺序堆叠，**忽略计算开销**时峰值激活显存最小的检查点策略是什么？
-  给出策略描述 + 代码草图 + 渐近峰值显存和计算量（关于 N 的函数）→ 3-5 句 + 代码草图
-  - （方向：递归/嵌套 checkpoint，经典结论是 O(log N) 显存 / O(N log N) 计算，
-    或 √N 划分给出 O(√N) 显存 / O(N) 计算——要自己论证清楚）
-- [ ] **(b)** xl + batch 4 + seq 2048，**只允许一层重算（不能嵌套）**时最优的 checkpoint
-  块大小是多少？**实测峰值显存验证**，并和相邻的更大/更小块大小对比。→ 3-5 句 + 实测数字
-- 工具：`torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False)`，
-  以及 `torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook)` 来统计存了多少字节
+- [ ] 📝 **收口**：把 §3 的素材填进 [blog.md](blog.md) 的「§3 素材卡」→ **第 2 篇**。
+      **做完这一节立刻做，不要攒**（三步流程见 blog.md 顶部）。
+      角度：大模型在单卡 OOM 边缘的挣扎，以及激活检查点把显存换成了什么。
 
 ---
 
-## §4 GPU Kernels — FlashAttention-2（29 分，本作业最大头）
+## §4 GPU Kernels — FlashAttention-2（29 分）
 
-### 4.1 `pytorch_attention` — 2 分 `[文字]`
+### 4.1 `pytorch_attention` (2分)
+**Actions:**
+- [ ] 编写原生 attention 测试脚本：batch=8，单头（无 head 维）。
+- [ ] 遍历 `d_model` ∈ [16, 32, 64, 128] × `seq_len` ∈ [256, 1024, 4096, 8192, 16384]。
+- [ ] 对每组跑 100 次前向测速，记录反向开始前的峰值显存，再跑 100 次反向测速（需 synchronize）。
 
-- [ ] 写 attention 微基准脚本：
-  - batch=8，**不带 head 维**（单头）
-  - `d_model ∈ {16, 32, 64, 128}` × `seq_len ∈ {256, 1024, 4096, 8192, 16384}` 全组合
-  - 随机 Q/K/V；计时 100 次 forward；**记录 backward 开始前的显存**；计时 100 次 backward
-  - warm-up + 每次 `torch.cuda.synchronize()`
-- [ ] 报表格（含 OOM 的格子）。在哪个规模开始 OOM？对最小的那个 OOM 配置**做显存核算**
-  （用 hw1 的 Transformer 显存公式）。存给 backward 的显存怎么随 seq_len 变？怎么消掉这笔开销？
-  → 表 + 计算过程 + 1-2 段
+**Blog:**
+- [ ] 给出全组合耗时与显存表格（包含 OOM 的格子）。指出在什么规模开始 OOM。
+- [ ] 对导致 OOM 的最小规模配置进行显存使用量数学核算。
+- [ ] 解释保存的反向激活显存如何随序列长度变化，以及你将如何消除这笔开销。
 
-### 4.2 `torch_compile` — 2 分 `[文字]`
+### 4.2 `torch_compile` (2分)
+**Actions:**
+- [ ] 用 `torch.compile(layer)` 包装 Attention，测速。
+- [ ] 编译整个 Transformer 模型，测速。
 
-- [ ] **(a)** 给 attention 基准加一个 `torch.compile` 版本，同配置对比 → 表
-- [ ] **(b)** 编译**整个 Transformer**，对比 forward / forward+backward+optimizer → 表
+**Blog:**
+- [ ] (a) 表格对比编译与未编译的 Attention 在 4.1 配置下的耗时。
+- [ ] (b) 表格对比编译与未编译的完整 Transformer 模型（前向 vs 完整训练步）的耗时。
 
-### 4.3 `flash_forward` — **15 分** `[代码]`
+### 4.3 `flash_forward` (15分)
+**Actions:**
+- [ ] (a) 纯 PyTorch 的 Tiled 版本：实现 `autograd.Function.forward`，算出 `O` 与 logsumexp `L`，
+      **`ctx` 里存 L,Q,K,V,O，但只 `return O`**；`backward` 这一步先 `raise NotImplementedError`。
+      接口 `def forward(ctx, Q, K, V, is_causal=False)`，本小问可忽略 `is_causal`。Tile 至少 16×16。
+- **判分**：`adapters.get_flashattention_autograd_function_pytorch` → `uv run pytest -k test_flash_forward_pass_pytorch`
+- [ ] (b) Triton 版 Forward：严格按 PDF Algorithm 1 实现 `flash_fwd_kernel`，launch grid `(T_q, batch_size)`，
+      **单层** key tile 循环，循环末尾 advance block pointer；片上 buffer（O_i, l, m）用 `tl.float32`，
+      累加进输出 buffer 时用 `tl.dot(..., acc=acc)`。
+- **判分**：`adapters.get_flash_autograd_function_triton`（⚠️ 文件里实际叫 `get_flashattention_autograd_function_triton`）
+      → `uv run pytest -k test_flash_forward_pass_triton`
+- [ ] (c) 因果掩码：为 PyTorch 和 Triton 版加入 `is_causal` 标志（默认为 False）。Triton 中对被 mask 的元素加 `-1e6`。
 
-- [ ] **(a) 纯 PyTorch 的 tiled 版本**（不用 Triton，给 Triton 版当对照）
-  - `torch.autograd.Function` 子类，`def forward(ctx, Q, K, V, is_causal=False)`
-  - 返回 O，同时算出 logsumexp `L`；`ctx` 里存 `L, Q, K, V, O`
-  - `backward` 先 `raise NotImplementedError`
-  - 这一步**可以忽略 is_causal**
-  - tile 至少 16×16；测试保证所有维度是 ≥16 的 2 的幂，不用管越界
-  - → `adapters.get_flashattention_autograd_function_pytorch`
-  - → `uv run pytest -k test_flash_forward_pass_pytorch`
-- [ ] **(b) Triton kernel 版 forward**（Algorithm 1，在线 softmax）
-  - launch grid = `(T_q, batch_size)`；**只有一层循环**，遍历 key tile `j`
-  - 用 `tl.make_block_ptr` + `ptr.advance(...)`（在循环末尾推进）；`tl.dot` 做矩阵乘
-  - 片上 buffer `O_i, l, m` 必须 **`tl.float32`**；累加用 `acc=` 参数：`acc = tl.dot(..., acc=acc)`
-  - `P̃` 要先 cast 成 V 的 dtype 再相乘；写回前把 `O_i` cast 成目标 dtype
-    （`ptr.type.element_ty` 拿 dtype）
-  - 函数签名按题面给的 `flash_fwd_kernel(...)` 照抄
-  - → `adapters.get_flashattention_autograd_function_triton`
-  - → `uv run pytest -k test_flash_forward_pass_triton`
-- [ ] **(c) causal masking**
-  - autograd.Function 末尾加 `is_causal` 参数，**默认 False**（否则 (a)(b) 的测试会挂）
-  - Triton kernel 加 `is_causal: tl.constexpr`（这个类型标注是必需的）
-  - 在 kernel 里构造 query/key 的索引向量，比较出 `B_q × B_k` 的 mask，
-    被 mask 的位置**给 S 加 -1e6**（不是设 -inf）
-  - `ctx.is_causal = is_causal` 存给 backward
-- 调试建议：`tl.device_print`；`TRITON_INTERPRET=1` 可在 CPU 跑解释器（题面说"我们发现它有 bug"）；
-  逐个算子和 (a) 的 PyTorch 版对数
+### 4.4 `flash_backward` (5分)
+**Actions:**
+- [ ] 使用纯 PyTorch + `torch.compile`（**不用 Triton**）实现 FA2 的 backward：输入 Q,K,V,O,dO,L，
+      返回 dQ,dK,dV；先算 `D = rowsum(O ∘ dO)`，再按 PDF Eq.13–19 重算 P（不需要在线技巧）。
+- **判分**：`uv run pytest -k test_flash_backward`
 
-### 4.4 `flash_backward` — 5 分 `[代码]`
+### 4.5 `flash_benchmarking` (5分)
+**Actions:**
+- [ ] 编写 `triton.testing.do_bench` 脚本打榜，对比你的（部分 Triton 的）FA2 与 PyTorch 原生 Attention 的前向/反向/端到端延迟。
+- ⚠️ **这是单卡题**：PDF 原文是 “run the benchmark on a **single** B200”。不提交 → 型号不再约束；
+  但**别把它和 §5–§7 的多卡需求混在一起**，它要的只是一张大显存卡（或就在 5090 上扫到哪算哪）。
+- [ ] 配置：batch=1，is_causal=True，`seq_len` ∈ [128...65536] (2的幂) × `d_model` ∈ [16...128] (2的幂) × [bf16, fp32]。动态调整 tile size。
 
-- [ ] 用 **PyTorch + `torch.compile`**（不用 Triton）实现 backward
-  - 输入 Q, K, V, O, dO, L → 输出 dQ, dK, dV
-  - **先算 `D = rowsum(O ∘ dO)`**，然后按式 (13)–(19) 重算 S、P，全程**不需要 softmax**
-  - 关键点：P 从 Q、K、L 重算出来，所以 forward 不用把 S/P 存进 HBM
-- [ ] → `uv run pytest -k test_flash_backward`
-- 注：`tests/test_attention.py` 里还有 `test_flash_backward_pytorch` 和
-  `test_flash_backward_triton`（带 `is_causal` 参数化），两个都要过
+**Blog:**
+- [ ] 提交一张极具冲击力的表格，展示前向、反向、端到端在庞大序列下的耗时对比。
 
-### 4.5 `flash_benchmarking` — 5 分 `[文字]` ⚠️理想在 B200
+### 4.6 Triton 版 backward (可选，但防坑必做)
+**Actions:**
+- [ ] 💡 **排雷提醒（这是我们的判断，不是 PDF 要求）**：PDF 的 §4.5 原话就是拿
+      “your (**partially**) Triton implementation” 去比，即它默认你用的是 §4.4 那个 `torch.compile` backward。
+      但超长序列下它很可能被 PyTorch 原生内核打爆，出来的表不好看。**想要漂亮的 §4.5 表就先写 Triton backward**；
+      只想按 PDF 走则可以跳过。
+- [ ] 按 Algorithm 2 实现 Triton Backward：算两遍 `P` 以避开 atomics 同步。
 
-- [ ] 用 `triton.testing.do_bench` 对比 Triton FA2 与普通 PyTorch attention
-  - **batch=1，永远开 causal**
-  - `seq_len` = 128 … 65536 的 2 的幂 × `d` = 16 … 128 的 2 的幂 × `{bfloat16, float32}`
-  - 报 forward / backward / 端到端三个延迟
-  - tile 大小需要随输入规模调
-- [ ] → 表格
-
-### 4.6 【可选】Triton 版 backward — 0 分，但对 leaderboard 有用
-
-- [ ] Algorithm 2：外层循环 key tile `j`，内层循环 query tile `i`，
-  **P 算两遍**（一遍给 dQ，一遍给 dK/dV），以此避开跨 thread block 的同步和 atomics
+- [ ] 📝 **收口**：把 §4 的素材填进 [blog.md](blog.md) 的「§4 素材卡」→ **第 3 篇（系列重点）**。
+      **做完这一节立刻做，不要攒**（三步流程见 blog.md 顶部）。
+      角度：从在线 softmax 推导一路到 Triton kernel 落地，再到延迟打榜的完整链条。
 
 ---
 
 ## §5 Distributed Data Parallel（21 分）
 
-### 5.1 `distributed_communication_single_node` — 5 分 `[文字]` ⚠️多卡
+### 5.1 `distributed_communication_single_node` (5分)
+**Actions:**
+- [ ] 编写 all-reduce 测速脚本：数据量 [1MB, 10MB, 100MB, 1GB] × GPU数 [2, 4, 6]（每轮不超过5分钟，需 warmup 并通过 `dist.all_gather_object` 汇总）。
 
-- [ ] benchmark all-reduce 耗时：
-  - 数据量 fp32 张量 **1MB / 10MB / 100MB / 1GB**
-  - 进程数（GPU 数）**2 / 4 / 6**
-- [ ] 注意事项：warm-up ≥5 次（NCCL 尤其需要）；每次 `torch.cuda.synchronize()`
-  （**即使 `async_op=False` 也必须同步**，它只保证入队不保证完成）；
-  用 `dist.all_gather_object` 聚合各 rank 的计时
-- [ ] → 图/表 + 2-3 句
-- ⚠️ 需要最多 6 张 GPU；本机只有 1 张 → **这是计划里的第一次正式上云**（Modal，见 §B.3）。
-  失败成本最低：不依赖模型代码、每次 <5 分钟。**先过完四道闸**（见 §B.3），
-  尤其闸 2——这题全是集合通信，NCCL 路径必须先在本机 `world_size=1` 上验过
+**Blog:**
+- [ ] 给出图表对比不同设置的耗时，用 2-3 句话评论因素间的相互作用。
 
-### 5.2 `naive_ddp` — 5 分 `[代码]`
+### 5.2 `naive_ddp` (5分)
+**Actions:**
+- [ ] 实现朴素 DDP：训练前 `broadcast` rank0 的参数；每次反向后对**每个参数梯度**分别 all-reduce 求平均。
+      batch 切 n/d 份（d 必须整除 n）。
+- **判分**：`adapters.get_ddp` +（可选）`adapters.ddp_on_after_backward` → `uv run pytest tests/test_ddp.py`
 
-- [ ] 实现最朴素的 DDP：backward 之后对**每个参数的梯度**单独 all-reduce 求平均
-  - 训练开始前用 `broadcast` 把 rank 0 的参数发给所有 rank
-  - batch 切分：n 个样本切成 n/d 份（d 必须整除 n）
-- [ ] → `adapters.get_ddp` +（可选）`adapters.ddp_on_after_backward`
-- [ ] → `uv run pytest tests/test_ddp.py`（用 gloo/CPU，world_size=2，本机可跑）
+### 5.3 `naive_ddp_benchmarking` (3分)
+**Actions:**
+- [ ] 测速：1 node x 2 GPUs, `xl` 模型。记录总步耗时与通信时间。
 
-### 5.3 `naive_ddp_benchmarking` — 3 分 `[文字]` ⚠️多卡 ⚠️大显存
+**Blog:**
+- [ ] 描述跑表配置，列出总耗时与通信占比。（⚠️ 真多卡上云测试，gloo 测试出的时间无效）。
 
-- [ ] 测**每步总时间**和**通信占比**，配置：1 node × 2 GPU，**xl**
-- [ ] → 描述 setup + 数字
-- ⚠️ **通信占比这个数只有真多卡才有意义**——gloo/CPU 上量出来的是噪声，不能拿来写博客。
-  上云前先在本机把闸 3 过掉（xl 或替代档在单卡上一步不 OOM）
+### 5.4 `minimal_ddp_flat_benchmarking` (2分)
+**Actions:**
+- [ ] 修改为 Flat DDP：用 `_flatten_dense_tensors` 将全模型梯度拼成一个大张量，执行 1 次 all-reduce 后反拼。
 
-### 5.4 `minimal_ddp_flat_benchmarking` — 2 分 `[代码]` `[文字]` ⚠️多卡
+**Blog:**
+- [ ] 对比 Flat DDP 与朴素 DDP 在 1x2 GPU xl 上的速度与通信时间差异（1-2句）。
 
-- [ ] 改成**把所有梯度拼成一个扁平张量**再做一次 all-reduce
-  - 用 `torch._utils._flatten_dense_tensors` / `_unflatten_dense_tensors`
-- [ ] 同条件（1×2 GPU, xl）对比逐参数 all-reduce → 数字 + 1-2 句
+### 5.5 `ddp_overlap_individual_parameters` (5分)
+**Actions:**
+- [ ] 实现 Overlap DDP 容器类（`__init__` 包住任意 `nn.Module` 并广播初始权重 / `forward` 转发 /
+      `finish_gradient_synchronization`）：用 `register_post_accumulate_grad_hook` 在每个梯度就绪时
+      异步发 `all_reduce(async_op=True)`，`optimizer.step()` 前逐个 `handle.wait()`。
+- **判分**：`uv run pytest tests/test_ddp.py`，**PDF 建议重复跑 5 次**排查竞态
 
-### 5.5 `ddp_overlap_individual_parameters` — 5 分 `[代码]`
+### 5.6 `ddp_overlap_individual_parameters_benchmarking` (1分)
+**Actions:**
+- [ ] 测速，并使用 Nsight profiler 抓取 Overlap 与朴素版的 timeline 对比图。
 
-- [ ] 写 DDP 容器类，**梯度通信与 backward 计算重叠**
-  - `__init__(self, module)`：包住任意 `nn.Module`，广播初始权重
-  - `forward(self, *inputs, **kwargs)`：转发给被包的 module
-  - `finish_gradient_synchronization(self)`：等所有异步通信完成
-  - 机制：`param.register_post_accumulate_grad_hook(...)`，在每个参数梯度算好的瞬间
-    发起 `dist.all_reduce(..., async_op=True)`，把 handle 收起来；
-    `optimizer.step()` 之前调 `finish_gradient_synchronization()` 逐个 `handle.wait()`
-- [ ] → `uv run pytest tests/test_ddp.py`，**建议重复跑 5 次**排查竞态
+**Blog:**
+- [ ] (a) 给出 Overlap 版每步耗时，与朴素版和 Flat 版横评。
+- [ ] (b) 贴出 2 张 Nsight 截图，直观证明通信与计算是否成功重叠。
 
-### 5.6 `ddp_overlap_individual_parameters_benchmarking` — 1 分 `[文字]` `[图]` ⚠️多卡
-
-- [ ] **(a)** 同条件（1×2 GPU, xl）和前两种 DDP 对比每步耗时 → 数字 + 1-2 句
-- [ ] **(b)** 用 nsys 分别 profile 朴素版和重叠版，**两张截图**直观证明一个重叠了、一个没有
+- [ ] 📝 **收口**：把 §5 的素材填进 [blog.md](blog.md) 的「§5 素材卡」→ **第 4 篇**。
+      **做完这一节立刻做，不要攒**（三步流程见 blog.md 顶部）。
+      角度：多卡上云初体验 + Modal 租卡避坑，并用 nsys 证明通信真的藏进了 backward。
 
 ---
 
 ## §6 Optimizer State Sharding（20 分）
 
-### 6.1 `optimizer_state_sharding` — **15 分** `[代码]`
+### 6.1 `optimizer_state_sharding` (15分)
+**Actions:**
+- [ ] 实现简易 ZeRO-1 包装类。重写 `__init__(params, optimizer_cls, **kwargs)`（**必须调 super 构造函数**）、
+      `step(closure, **kwargs)`（更新后把自己那份参数 broadcast 出去）、
+      `add_param_group(param_group)`（把参数分配到各 rank）。
+- **判分**：`adapters.get_sharded_optimizer` → `uv run pytest tests/test_sharded_optimizer.py`，**跑 5 次**
 
-- [ ] 写优化器状态分片的包装类（简化版 ZeRO-1）
-  - `__init__(self, params, optimizer_cls, **kwargs)`：params 可以是参数列表**也可以是
-    param group 列表**（要支持不同 lr）；把参数分给各 rank（约 1/world_size）；
-    **必须调用 `torch.optim.Optimizer` 超类构造函数**
-  - `step(self, closure, **kwargs)`：调被包优化器的 step，**之后把自己更新的那份参数
-    broadcast 给其它 rank**
-  - `add_param_group(self, param_group)`：超类构造时会调它，训练中也可能调
-    （比如逐步解冻），所以**参数分配的逻辑要写在这里**
-- [ ] → `adapters.get_sharded_optimizer`
-- [ ] → `uv run pytest tests/test_sharded_optimizer.py`，**重复跑 5 次**
-- ⚠️ 坑：`add_param_group` 在 `super().__init__()` 里就被调用，此时你自己的属性可能还没初始化
+### 6.2 `optimizer_state_sharding_accounting` (5分)
+**Actions:**
+- [ ] 在 1x2 GPU xl 跑分，精确抓取三个时刻的峰值显存：模型初始化后、optimizer step 前、optimizer step 后。测定步耗时。
 
-### 6.2 `optimizer_state_sharding_accounting` — 5 分 `[文字]` ⚠️多卡 ⚠️大显存
+**Blog:**
+- [ ] (a) 报告 3 个时刻的峰值显存，并精准拆解显存构成（参数/梯度/优化器状态/激活各占多少）。
+- [ ] (b) 给出有/无 sharding 的耗时对比。
+- [ ] (c) 说明我们的实现与 ZeRO-DP stage 1 在显存与通信量上的区别。
 
-- [ ] **(a)** 有/无分片时的峰值显存（1×2 GPU, xl），报三个时刻：模型初始化后、
-  optimizer step 之前、optimizer step 之后。**拆解**各部分（参数/梯度/优化器状态/激活）→ 2-3 句
-- [ ] **(b)** 分片对训练速度的影响 → 2-3 句 + 计时
-- [ ] **(c)** 我们的实现和 **ZeRO stage 1（ZeRO-DP $P_{os}$）** 有什么区别？
-  重点讲**显存**和**通信量**的差异 → 2-3 句
-  - （方向：我们是 all-reduce 全梯度 + broadcast 参数；ZeRO-1 是 reduce-scatter 梯度 +
-    all-gather 参数，通信量更省）
+- [ ] 📝 **收口**：把 §6 的素材填进 [blog.md](blog.md) 的「§6 素材卡」→ **第 5 篇（上半）**。
+      **做完这一节立刻做，不要攒**（三步流程见 blog.md 顶部）。
+      角度：算一笔 optimizer sharding 的显存账，并和 ZeRO-1 对照通信量。
 
 ---
 
 ## §7 Fully-Sharded Data Parallel（20 分）
 
-### 7.1 `fsdp` — **15 分** `[代码]`
+### 7.1 `fsdp` (15分)
+**Actions:**
+- [ ] 实现 FSDP Wrapper，接管 `Linear` 与 `Embedding`。
+- [ ] 实现预取策略：前向时 all-gather。反向时 all-gather，算完立即 reduce-scatter 并释放权重。支持 `compute_dtype`。
+- **判分**：`adapters.get_fsdp` → `uv run pytest tests/test_fsdp.py`，**跑 5 次**排查竞态
+  - ⚠️ `adapters.py` 里还有 PDF 没提的 `fsdp_on_after_backward` 和 `fsdp_gather_full_params`，别漏
+- 💡 **工程难点**：PDF 要求“只在往前数第二层完成 forward 之后才开始 gather”（prefetch depth = 2）。
+  标准 PyTorch hook 无法跨层感知，需要自己做 Layer 调度。另：norm 太小不值得分片，只包 `Linear`/`Embedding`；
+  master 权重留 FP32，`compute_dtype` 只作用于通信和计算
 
-- [ ] 写 FSDP 容器类，包住整个模型，hook 或 wrap 其中**每个 Linear 和 Embedding**
-  - `__init__(self, module, compute_dtype=None)`
-  - **哪些层要分片**：Linear + Embedding。**norm 不分片**（太小，传输延迟不划算）
-  - forward：权重要**提前** all-gather 好，题面明确要求
-    「**只在往前数第二层完成 forward 之后**才开始 gather」（prefetch 深度 = 2，控制显存）
-  - backward：同样 all-gather 拿回权重；梯度就绪后 **reduce-scatter** 到对应 rank
-  - **用完立刻释放 gather 出来的完整权重**
-  - `compute_dtype` 给定时：**通信前就 cast 成低精度**（省带宽），
-    但 **master weights 和优化器更新保持 FP32**
-  - `forward(self, *inputs, **kwargs)` / `finish_gradient_synchronization(self)`
-  - 每个分片必须能配 hw1 的 AdamW 直接用
-- [ ] → `adapters.get_fsdp`、`adapters.fsdp_on_after_backward`、`adapters.fsdp_gather_full_params`
-- [ ] → `uv run pytest tests/test_fsdp.py`，**重复跑 5 次**抓竞态
-  - 测试有 `compute_dtype` 的参数化，两种都要过
+### 7.2 `fsdp_accounting` (5分)
+**Actions:**
+- [ ] 测速 1x2 GPU xl，用 Nsight 抓 all-gather。
 
-### 7.2 `fsdp_accounting` — 5 分 `[文字]` `[图]` ⚠️多卡 ⚠️大显存
+**Blog:**
+- [ ] (a) 基于 §6 的分析，计算 FSDP 预期能再省下多少峰值显存？
+- [ ] (b) 附上 Nsight 截图，证明 all-gather 是否赶上了 forward pass。
 
-- [ ] **(a)** 基于 §6 的分析，预期 FSDP 能从峰值省下多少显存？
-  （可以忽略 all-gather 的预分配 buffer）→ 2-3 句
-- [ ] **(b)** profile xl 在两卡上的运行，**盯着权重的 all-gather**：通信赶得上 forward 吗？
-  → 2-3 句 + nsys 截图
+- [ ] 📝 **收口**：把 §7 的素材填进 [blog.md](blog.md) 的「§7 素材卡」→ **第 5 篇（下半）**。
+      **做完这一节立刻做，不要攒**（三步流程见 blog.md 顶部）。
+      角度：FSDP 省了多少显存，以及 all-gather 预取有没有真的把通信藏住。
 
 ---
 
-## §8 并行策略分析（17 分，纯推导，无需 GPU）
+## §8 Analyzing Parallelism Strategies（17 分）
 
-> **这 17 分不需要任何硬件，建议最先做完。** 统一设定：N 个设备两两互连，
-> 每设备出口带宽 W bytes/s，加速器算力 C FLOP/s，**权重和激活都是 FP16（2 字节）**，
-> 矩阵乘 (A,B)(B,C) 算 2ABC FLOPs，只算 matmul 忽略逐元素算子。
-> 已知：ring all-gather 和 ring reduce-scatter 都是 $\frac{N-1}{N}\frac{S}{W}$，
-> ring all-reduce = 两者串联 = $2\frac{N-1}{N}\frac{S}{W}$。
+*(纯纸面推导，无需 GPU。设带宽 W，算力 C，FP16，matmul (A,B)(B,C) 取 2ABC flops)*
 
-### 8.1 `alternate_ring_all_reduce` — 1 分 `[文字]`
+### 8.1 `alternate_ring_all_reduce` (1分)
+**Blog:** 评估完整全传 all-reduce 算法的时间 (S, N, W) 并附一句话解释。
 
-- [ ] 题面给了另一种 all-reduce 算法（每步直接传完整的 $x^{(i)}$ 而不是分块）。
-  用 S、N、W 表示它的耗时 + 一句话论证
-  - （提示：每步传的是整个 S 而不是 S/N，所以是 $(N-1)\frac{S}{W}$，比 ring 版差 N/2 倍）
+### 8.2 `data_parallel_calcs` (3分)
+**Blog:** (a) DP反向 FLOPs。 (b) DP反向通信时间。 (c) 给出 DP 不被通信卡脖子的最大数量不等式。
 
-### 8.2 `data_parallel_calcs` — 3 分 `[文字]`
+### 8.3 `fsdp_calcs` (3分)
+**Blog:** (a) FSDP 前/反向 FLOPs。 (b) FSDP 前/反向通信时间。 (c) FSDP 的最大数量不等式。
 
-FFN 前向：$x_1=xW_1$，$x_2=xW_2$，$z=f(x_1)*x_2$，$y=zW_3$；
-x 是 (B,D)，$W_1,W_2$ 是 (D,D_ff)，$W_3$ 是 (D_ff,D)。反向式 (24)–(30) 题面已给。
+### 8.4 `tp_calcs` (4分)
+**Blog:** (a) 写出行列混合 TP（W1/W2 列并行、W3 行并行的 FFN）完整的反向传播公式，
+要产出每个设备的 `dW1(i)`、`dW2(i)`、`dW3(i)` 和反向输出 `dx`（**不是 attention 的 dQ/dK/dV**）。 (b) TP 前/反向 FLOPs。 (c) TP 前/反向通信时间。 (d) TP 的最大数量不等式。
 
-- [ ] **(a)** $N_{DP}$ 数据并行下 backward 的 FLOPs（用 B, D, D_ff, N_DP 表示）+ 一句论证
-- [ ] **(b)** backward 的通信时间（B, D, D_ff, N_DP, W 的子集）+ 一句论证
-- [ ] **(c)** 其它参数固定时，$N_{DP}$ 能开到多大才不被通信卡住？给不等式 + 一句论证
+### 8.5 `fsdp_tp_calcs` (6分)
+**Blog:** (a) FSDP+TP 前向 FLOPs。 (b) 前向通信时间 (重叠双轴)。 (c) 可重叠时最大数量 N 不等式。 (d) 不可重叠时最大数量 N 不等式。
 
-### 8.3 `fsdp_calcs` — 3 分 `[文字]`
-
-- [ ] **(a)** $N_{FSDP}$ 下 forward 和 backward 各多少 FLOPs（两个答案）
-- [ ] **(b)** forward 和 backward 各多少通信时间（两个答案）
-  - forward：3 次 all-gather；backward：3 次 all-gather + 3 次 reduce-scatter
-- [ ] **(c)** forward 和 backward 各自的 $N_{FSDP}$ 上界（两个不等式）
-
-### 8.4 `tp_calcs` — 4 分 `[文字]`
-
-配置：$W_1, W_2$ **column parallel**（切输出维），$W_3$ **row parallel**（切输入维），
-所以 column 之后不用 all-gather，只在最后对 y 做一次 all-reduce。
-
-- [ ] **(a)** 写出这个 TP 配置的**完整反向传播公式**：给定 dy (B,D)，
-  用分片权重、前向存下的激活、通信原语，推出 $dW_1^{(i)}, dW_2^{(i)}, dW_3^{(i)}$ 和 dx
-- [ ] **(b)** forward / backward 各多少 FLOPs（两个答案）
-- [ ] **(c)** forward / backward 各多少通信时间（两个答案）
-- [ ] **(d)** forward / backward 各自的 $N_{TP}$ 上界（两个不等式）
-
-### 8.5 `fsdp_tp_calcs` — **6 分** `[文字]`
-
-2D 网格：TP rank i × FSDP rank j，$N = N_{TP} N_{FSDP}$。
-每个设备持有 $W_1^{(i,j)}, W_2^{(i,j)}$ 形状 $(\frac{D}{N_{FSDP}}, \frac{D_{ff}}{N_{TP}})$，
-$W_3^{(i,j)}$ 形状 $(\frac{D_{ff}}{N_{TP}}, \frac{D}{N_{FSDP}})$。
-
-- [ ] **(a)** forward 的 FLOPs（B, D, D_ff, N_FSDP, N_TP）
-- [ ] **(b)** forward 的通信时间。**假设两个轴的通信可以重叠** →
-  答案应该是两个量的 **max**（FSDP 侧 vs TP 侧）
-- [ ] **(c)** 最优 $N_{TP}, N_{FSDP}$ 配置下，$N$ 能开到多大？不等式 + 推导
-- [ ] **(d)** 同上，但**两轴通信不能重叠**（共享网络资源）时的 $N$ 上界
-  （不用管 N_TP / N_FSDP 取整）
+- [ ] 📝 **收口**：把 §8 的素材填进 [blog.md](blog.md) 的「§8 素材卡」→ **第 6 篇**。
+      **做完这一节立刻做，不要攒**（三步流程见 blog.md 顶部）。
+      角度：把前面攒下的多卡体感，收束成 DP/FSDP/TP 的通信量推导。
 
 ---
 
-## §9 Leaderboard（10 分）⚠️两张 B200
+## §9 Leaderboard（10 分）
 
-目标：**8B 模型完整训练步（forward + loss + backward + AdamW）的墙钟时间**。
+**Actions:**
+- [ ] 在 2 张 B200（或等效）上跑 8B 模型极限。batch=2, seq=32768, bf16, causal。
+      判定：`triton.testing.do_bench(train_step, rep=30_000, warmup=10_000)` 的墙钟时间，
+      **从空 PyTorch/Triton cache 起 10 分钟内要跑完**（所以别开太猛的 `torch.compile` / autotune），
+      目标是**打掉 10 秒的朴素基线**。配置：vocab 151936 / d_model 4096 / d_ff 11008 / 34 层 / 32 头
+- [ ] **爆改清单**：Triton autotune 调参、实现 Fused AdamW、融合 LM head + cross entropy (省显存大头)、Triton 版 Backward 替换、Causal 掩码跳过 0-tile、分离非对角线/对角线、TMA (Hopper 架构起)、上激活检查点。
 
-```python
-ctx_len=32768, vocab_size=151936, d_model=4096, d_ff=11008,
-num_layers=34, num_heads=32, bfloat16, is_causal=True, batch_size=2
-```
-（实算 **8.13B 参数**，光 bf16 权重就 16.3 GB。题面直言"故意做得很难塞进显存"。）
+**Blog:**
+- [ ] 记录这极限打榜拿下的墙钟时间。
 
-**硬性约束**
-- 不能改模型的输入/输出行为；要用 `cs336_basics` 里的模型；必须通过和常规实现相同的测试
-- 必须自己写，不能抄现成实现
-- **从空的 PyTorch/Triton cache 起算，整个 benchmark 必须 10 分钟内跑完**
-  → torch.compile 和 Triton autotune 不能太激进
-- 基线是 10 秒，要打赢它
-
-**优化清单**
-- [ ] Triton autotune 调 tile 大小
-- [ ] 调 Triton / torch.compile 的其它配置
-- [ ] **fused AdamW**
-- [ ] **融合 LM head + cross-entropy**（当前实现会物化完整的
-  `[batch, seq_len, vocab_size]` logits：2×32768×151936×2B = **19.9 GB**，这是最大的一块）
-  甚至可以让它顺手把 backward 一起融进去
-- [ ] FlashAttention 改进：
-  - [ ] backward 也用 Triton 写（不只 torch.compile）
-  - [ ] backward 分两趟：一趟 dQ、一趟 dK/dV，避开 atomics 和跨 block 同步
-  - [ ] causal 时**提前终止** program instance，跳过必然全零的 tile
-  - [ ] 把非对角 tile 和对角 tile 分开：前者完全不比较索引，后者只比一次
-  - [ ] Hopper 以后的架构用 **TMA**
-- [ ] 实在放不下再上激活检查点（拿速度换显存）
-
----
-
-## 博客产出规划（知乎）
-
-作业本身的章节结构就是一条不错的叙事线：**先量，再找瓶颈，再优化，再量一次**。
-按这个拆成 6 篇，每篇都能独立成文：
-
-| # | 文章 | 覆盖 | 素材类型 | 本机能否写完 |
-|---|---|---|---|:--:|
-| 1 | **怎么知道时间花在哪** | §2.1–§2.5 | 计时表、nsys timeline 截图、显存 timeline | ✓（size 自选） |
-| 2 | **一层激活 3.6 GiB：激活检查点** | §3 | `saved_tensors_hooks` 打印、峰值显存对比 | ✓（用 large） |
-| 3 | **FlashAttention-2 从零到 Triton** ⭐ | §4 | 在线 softmax 推导、kernel 代码、延迟对比表 | ✓ |
-| 4 | **把通信藏进 backward：DDP 三步走** | §5 | 通信占比、nsys 重叠对比截图 | 代码 ✓ / 数字要 2 卡 |
-| 5 | **显存账本：ZeRO 与 FSDP** | §6–§7 | 分片前后显存拆解、all-gather 时序 | 代码 ✓ / 数字要 2 卡 |
-| 6 | **什么时候会被通信卡住：DP/FSDP/TP 的数学** | §8 | 纯推导 + 不等式 | ✓ 不需要 GPU |
-
-**第 3 篇是重点**：29 分、有客观正确性验证（pytest）、从数学推导到 Triton kernel 全链条，
-知乎上这个题材受众最好。
-
-**一条贯穿全系列的副线**：*「单卡 5090 + 按需租的多卡，跟着 CS336 A2 能做到哪一步」*。
-课程默认 B200 + 8 卡，绝大多数读者没有。副线有两半，**别只写前一半**：
-
-1. **单卡能做到哪**（§2.5、§3.1(b)、§4.5）：哪些能在 32G 上跑、哪些必须降规模、
-   降了之后结论变没变——如实写出来，比照抄 xl 的数字更有价值
-2. **要多卡时怎么办**（§5–§7）：我是**真去 Modal 上租了卡**跑的，不是用 gloo/CPU 糊过去。
-   这一半对读者更实用——"我也没有多卡"的人最想知道的恰恰是
-   *花多少钱、怎么起、哪些坑是容器/云特有的*。**把账单和踩的坑一起写出来**
-
-**leaderboard（§9）虽然不提交，但仍是最好的博客素材**：
-从 10 秒基线往下优化，每一步（fused AdamW、融合 LM head + cross-entropy、
-Triton 版 backward、causal 提前终止）都有可量化的收益，天然是一篇"优化日志"。
-配置降到单卡能跑的规模照样成立。
-
-**写作时要额外做、但作业不要求的事**
-
-- [ ] 代码片段要**可独立运行**（作业只要答案，博客读者要能抄走就跑）
-- [ ] 每张表/图注明**硬件、torch 版本、warmup/measure 步数**（可复现性）
-- [ ] 中文术语统一（kernel / 算子、residual / 激活、shard / 分片……开篇定好）
-- [ ] 把"踩坑"单独写出来 —— 比如已经遇到的
-      「猴补丁打在转发模块上静默失效」，这类内容比正确答案更有阅读价值
-
-## 建议执行顺序
-
-**先做单卡 Triton kernel，多卡整段后置**（2026-08-30 用户定）。阶段 1–3 是纯单卡的
-benchmark + FlashAttention，也是博客第 1、3 篇的素材；这段做完之前，Modal 的账号、
-报价、镜像都不用碰（见 §B.3 末尾的 ⏸ 清单）。
-
-| 阶段 | 内容 | 分值 | 硬件 |
-|---|---|---:|---|
-| | **▸ 单卡 kernel —— 当前就在这一段** | | |
-| **1** | §0 环境配置 + §2.1 benchmark 脚本 + §2.3 累加精度 + §2.4 混合精度 | 7 | 单卡（xl/10B 那两档留到阶段 9） |
-| **2** | §4.1 attention 微基准 + §4.2 torch.compile | 4 | 单卡够 |
-| **3** | §4.3/4.4 FlashAttention forward + backward | **20** | 单卡够 |
-| | **▸ 分布式代码（单机多进程，仍然 0 元）** | | |
-| **4** | §5.2 naive DDP + §5.5 overlap DDP | 10 | 本机 gloo/CPU（闸 1） |
-| **5** | §6.1 optimizer sharding | **15** | 本机 gloo/CPU（闸 1） |
-| **6** | §7.1 FSDP | **15** | 本机 gloo/CPU（闸 1） |
-| | **▸ 单卡收尾** | | |
-| **7** | §2.2 nsys profile（自选两个 size，按显存自适应） | 5 | 单卡 + 要装 nsys |
-| **8** | §3 gradient checkpointing | 4 | (a) 本机推导 / (b) 要大显存 |
-| | **💸 从这里开始才要花钱 —— 先办 §B.3 的 ⏸ 清单、过完四道闸** | | |
-| **9** | benchmark 类（§2.5、§4.5、§5.1/5.3/5.4/5.6、§6.2、§7.2） | 30 | **Modal 多卡**（计划内） |
-| **10** | §9 leaderboard（当"优化日志"写，不提交） | 10 | 开放式 |
-| | **▸ 纸面收束** | | |
-| **11** | **§8 全部推导（5 题）** | **17** | 无需 GPU |
-
-**§8 为什么排到最后**（2026-08-30 用户定）：原来排第一是因为它不需要硬件。
-改到最后的好处是——DP / FSDP / TP 的通信量推导，在**亲手实现过 §5 的 all-reduce、
-§6 的参数分片、§7 的 all-gather + reduce-scatter 之后**再做，公式里的每一项都有对应的
-代码记忆，而不是纯符号操作。博客第 6 篇也因此变成整个系列的收束，而不是开篇。
-
-阶段 **1–7 合计 76 分**，全部在本机（单卡 5090 + gloo/CPU）完成。
-阶段 8（§3，4 分）里 (a) 是本机推导、(b) 要大显存。
-再加上排在最后的 §8 推导（17 分），**共 93 分不花一分钱**。
-
-**但"不花钱"不是目标**——剩下的 44 分里，`§5.1/5.3/5.4/5.6 + §6.2 + §7.2` 那一档
-（约 11 GPU·h）是**计划内支出**：多卡的手感就是要花钱买的，
-gloo/CPU 上跑出来的通信占比是噪声，写进博客等于编数字。
-真正可省的只有 §2.5 / §3.1(b) 的 xl（用 large 替代）和 §4.5 的 B200 长 seq。
-
-**阶段 1–8 的真正作用因此变了**：它不只是"先把免费的分拿掉"，
-更是**上云的准入准备**——每一份要在 Modal 上跑的代码，都先在本机过完四道闸
-（见 §B.3）。省钱靠的是**挑卡型 + 不在云上 debug**，不是砍内容。
+- [ ] 📝 **收口**：把 §9 的素材填进 [blog.md](blog.md) 的「§9 素材卡」→ **番外**。
+      **做完这一节立刻做，不要攒**（三步流程见 blog.md 顶部）。
+      角度：融合算子 + FA 优化的极限压榨日志，每一步都要有优化前/后的数字。
