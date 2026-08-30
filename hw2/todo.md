@@ -6,6 +6,65 @@
 > **图例**：`[代码]` 有 pytest 判分 · `[文字]` 产出博客正文 · `[图]` 产出截图/表格/曲线 ·
 > `⚠️多卡` 需要 >1 GPU · `⚠️大显存` 单卡 32G 放不下
 
+## 协作模式（2026-08-30 定）
+
+`hw2/CLAUDE.md` 是**课程官方给选课学生的 AI 使用规范**（只讲解、只 review，不写代码、
+不给解法）。用户不是选课学生、不提交、不参与评分，但**博客要记录的是"我自己的实现步骤"**，
+代写会掏空文章本身。所以取折中：
+
+| | 谁来写 | 范围 |
+|---|---|---|
+| **核心实现** | **用户自己写** | Triton kernel、分布式逻辑、所有数学推导 |
+| **脚手架 / 非核心** | Claude 可以写 | benchmark 脚本、表格生成、nsys 封装、画图、环境配置 |
+| **review & debug** | Claude | 见下面的边界 |
+
+### 逐题归属
+
+**用户自己写（Claude 不给可粘贴的实现）**
+
+- §3.1(a) 递归 checkpoint 策略推导
+- §4.3 `flash_forward`（PyTorch tiled 版 + Triton kernel + causal masking）
+- §4.4 `flash_backward`
+- §4.6【可选】Triton 版 backward
+- §5.2 `naive_ddp`、§5.4 的 flat-gradient DDP 变体、§5.5 `ddp_overlap`
+- §6.1 `optimizer_state_sharding`
+- §7.1 `fsdp`
+- §8.1–§8.5 全部推导（DP / FSDP / TP / 2D 的 FLOPs、通信时间、瓶颈不等式）
+- §9 leaderboard 的 kernel 优化（fused AdamW、融合 LM head + cross-entropy、FA 改进）
+
+**Claude 可以写**
+
+- §0 环境配置：`pyproject` 指向、`transformer.py` → `model.py` 改名、类别名
+- §2.1 benchmark 脚本骨架：CLI 参数、warmup/measure 循环、`cuda.synchronize()`、均值±标准差
+- §2.2 nsys 封装、NVTX range 的包装层（**被包的 attention 实现是用户的**）
+- §2.5 memory profiler 开关、snapshot dump
+- §4.1 / §4.2 attention 微基准的 sweep 骨架（含 OOM 捕获）
+- §4.5 `triton.testing.do_bench` 的封装（**被测的 kernel 是用户的**）
+- §5.1 all-reduce 基准脚本、`mp.spawn` 样板、`all_gather_object` 聚合计时
+- §5.3 / §5.4 / §5.6 / §6.2 / §7.2 的 benchmark harness：计时、通信占比统计、显存快照
+- 所有表格生成（markdown / `to_latex` / `to_typst`）和画图
+- 博客用的对照表、可复现性脚注（硬件、torch 版本、warmup/measure 步数）
+
+### review & debug 的边界
+
+用户明确要 Claude 做 review 和 debug，**所以不必用苏格拉底式提问绕圈子**：
+
+- ✅ 直接指出哪一行错了、为什么错、会以什么现象暴露
+- ✅ 给验证手段：toy input、shape 断言、和参考实现对拍、profiler 检查点
+- ✅ 讲清算法思路、指 PDF 的 Algorithm 1/2 和公式编号
+- ❌ 不直接贴出正确的核心实现代码替换掉
+- ❌ 不代填 `tests/adapters.py` 里那 8 个 hook 背后的实现
+
+用户卡住时的降级顺序：**指出症状 → 给验证方法 → 讲清思路 → 高层伪代码**，
+到伪代码为止，不落到可粘贴的成品。
+
+### 博客本身
+
+正文由用户写（那是产出）。Claude 负责表格、图、以及**技术准确性 review**
+（数字对不对、术语用得对不对、结论是否被数据支持）。
+
+---
+
 ## 交付物
 
 **在家自学，不提交 Gradescope**。所以 `writeup.pdf`、`code.zip`、
