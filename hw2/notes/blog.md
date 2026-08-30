@@ -53,7 +53,7 @@
 不靠手写：
 
 ```
-硬件: RTX 5090 32GB (本机)  |  torch 2.11.0+cu130, triton 3.6.0
+硬件: RTX 5090 32GB (本机)  |  py3.13.9, torch 2.11.0+cu130, triton 3.6.0
 配置: xl, batch=4, seq=512, dtype=bf16
 测法: warmup 5 / measure 10, 每步 torch.cuda.synchronize()
 日期: 2026-09-xx
@@ -84,7 +84,8 @@
 | 项 | 值 |
 |---|---|
 | GPU | NVIDIA RTX 5090 / 32 GB |
-| torch | 2.11.0+cu130 |
+| Python | 3.13.9（hw2/.venv；**hw1 那边是 3.12.12，别混**） |
+| torch | 2.11.0+cu130（CUDA 13.0） |
 | triton | 3.6.0 |
 | 多卡实验 | Modal 按需租用（单容器多卡，single-node）｜卡型、卡数、单价每篇分别标注 |
 | 模型实现 | 自己的 assignment 1 实现（不是官方参考解） |

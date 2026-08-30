@@ -378,6 +378,30 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
 1. **PDF 命名不一预警**：抄 PDF 示例时，注意官方管我们的 `rope` 参数叫 `positional_encoder`。
 2. **Hook 盘点**：`tests/adapters.py` 里留了 8 个空接头（如 `get_ddp`）等着后面填。注意 PDF 里写的 `get_flash_autograd_function_triton` 在实际文件里叫 `get_flashattention_autograd_function_triton`。
 3. **💡 表格自动化 Tip**：写 benchmark 时，顺手用 pandas 将结果存成 DataFrame 并调 `.to_markdown()`，方便直接贴进知乎。
+4. **hw2 没有"安装步骤"**。README 的安装指令藏在 Setup 末尾编号 `0.` 的代码块里，容易漏。
+   要点是 **`uv run` 会按 `pyproject.toml` 自动装依赖**——第一次跑任何 `uv run ...` 就地建出
+   `hw2/.venv` 并装好。所以：
+   - 不需要 `uv sync` / `pip install -e` / `conda activate`
+   - §0 Action 4 改完 `pyproject.toml` 后**不用再执行安装命令**，下次 `uv run` 自己重建
+     （`uv.lock` 的 diff 就是证据）
+5. **两个项目的 `.venv` 各自独立，底座还不一样**（2026-08-30 查明）：
+   ```
+   hw1/.venv  ← /home/yc/miniconda3/envs/genai   Python 3.12.12
+   hw2/.venv  ← /home/yc/miniconda3 (base)       Python 3.13.9
+   ```
+   `uv run` **主动忽略当前 conda 环境**（会警告 `VIRTUAL_ENV ... will be ignored`），
+   只认项目目录下的 `.venv`，所以**不需要也不该 `conda activate genai`**。
+   两边 torch 都是 2.11.0+cu130 / CUDA 13.0，`cs336_basics` 都解析到 `LLM/hw1/cs336_basics/`。
+   - **A2 的数字全部出自 hw2 那个 3.13.9 环境**，可复现性脚注要记 Python 版本，
+     别和 hw1 笔记里 3.12 环境下的数字混账
+   - **风险**：hw1 的 61 个测试在 3.12 上跑，hw2 用 3.13 导入同一份源码。纯 Python +
+     editable 路径安装所以能跨版本共用，但**只有 hw2 侧才会暴露 3.13 不兼容的写法**。
+     已在 3.13 下验过 `Embedding/Linear/RMSNorm/TransformerBlock/MultiHeadSelfAttention.forward`
+     和猴补丁路径；**以后每引入一个新类，第一次要在 hw2 侧也跑一遍**
+6. **README 的目录树对我们已经失效**：它画的是 `cs336_basics/` 在 hw2 根下，
+   而我们按 README 给的另一条路子（"edit the outer pyproject.toml to point to your own
+   implementation"）指向了 `../hw1`。`hw2/cs336-basics/` 那份官方参考实现还在原地，
+   但**已经不被引用**——照 README 的树找文件会找错地方。留着它当对拍基准，别删。
 
 **统一模型配置**（vocab_size=10000，batch_size=4，除非特别说明 context_length=512）
 
