@@ -75,34 +75,84 @@ tests/test_attention.py             单卡即可（Triton kernel）
 
 ### 每道题实际需要什么卡
 
-**全文只有 2 处硬性要求 B200**（`grep -n B200` 核对过）：
+按章节顺序排；`本机` 一列指单卡 RTX 5090 / 32 G。**全文只有 2 处硬性指定 B200**
+（`grep -n B200` 核过：L1560、L2593/L2661），其余只写"1 node x 2 GPUs"或"最多 6 张"，**不限型号**。
 
-| 题目 | 卡数 | 型号 | 原文 |
-|---|---|---|---|
-| §4.5 `flash_benchmarking` | 1 | **B200 强制** | "run the benchmark on a single B200"（L1560） |
-| §9 `leaderboard` | 2 | **B200 强制** | "measured on two B200 GPUs"（L2593/L2661） |
-| §5.1 `distributed_communication` | **最多 6** | 不限 | "Up to 6 GPUs. Each benchmarking run should take less than 5 minutes."（L1800） |
-| §5.3 / §5.4 / §5.6 | 2 | 不限 | "1 node x 2 GPUs, xl"（L1887/L2006/L2011） |
-| §6.2 `..._accounting` | 2 | 不限 | "1 node, 2 GPUs, xl"（L2079/L2088） |
-| §7.2 `fsdp_accounting` | 2 | 不限 | "Profile the xl model on two GPUs"（L2156） |
-| §2.2 nsys / §2.5 memory / §3(b) | 1 | 不限，但要 **>55 G 显存**跑 xl 完整训练步 | |
+**§2 Profiling & Benchmarking**
 
-也就是说除了那两道，其余用 A100-80G / H100 / H200 都行，只要在 writeup 里写清楚跑在什么硬件上。
-**唯一需要 6 张卡的是 §5.1，而且每次运行 <5 分钟** —— 这题最适合 Modal 的按秒计费。
+| 题目 | 卡 | 型号 | 本机 | 说明 |
+|---|:--:|---|:--:|---|
+| 2.1 `benchmarking_script` | 1 | 不限 | 部分 | 要跑全部 5 个 size；small/medium/large ✓，xl/10B ✗ |
+| 2.2 `nsys_profile` | 1 | 不限 | **✓** | 原文是"**自选**两个 size""**你显存装得下的**最长 ctx"（L252-254），按硬件自适应 |
+| 2.3 `mixed_precision_accumulation` | 0 | — | ✓ | CPU 即可 |
+| 2.4 `benchmarking_mixed_precision` | 1 | 不限 | 部分 | 同 2.1，xl/10B 受限 |
+| 2.5 `memory_profiling` | 1 | 不限 | ✗ | **点名 xl**，ctx 128/2048，完整训练步要 >55 G |
+
+**§3 Single-GPU Memory**
+
+| 题目 | 卡 | 型号 | 本机 | 说明 |
+|---|:--:|---|:--:|---|
+| 3.1(a) 最优检查点策略 | 0 | — | ✓ | 纯推导 |
+| 3.1(b) 实测验证 | 1 | 不限 | ✗ | **点名 xl** + batch 4 + seq 2048（L757） |
+
+**§4 GPU Kernels**
+
+| 题目 | 卡 | 型号 | 本机 | 说明 |
+|---|:--:|---|:--:|---|
+| 4.1 `pytorch_attention` | 1 | 不限 | **✓** | OOM 本身就是要回答的内容，小显存反而更早看到现象 |
+| 4.2 `torch_compile` | 1 | 不限 | **✓** | 未点名 size |
+| 4.3 `flash_forward` | 1 | 不限 | **✓** | 判分测试规模很小 |
+| 4.4 `flash_backward` | 1 | 不限 | **✓** | 同上 |
+| 4.5 `flash_benchmarking` | 1 | **B200 强制** | ✗ | "run the benchmark on a single B200"（L1560）；seq 扫到 65536 |
+
+**§5 Distributed Data Parallel**
+
+| 题目 | 卡 | 型号 | 本机 | 说明 |
+|---|:--:|---|:--:|---|
+| 5.1 `distributed_communication` | **2/4/6** | 不限 | ✗ | "Up to 6 GPUs. Each run < 5 minutes"（L1800）—— 唯一要 6 张的题，且每次极短 |
+| 5.2 `naive_ddp` | 0 | — | **✓** | 判分测试走 gloo/CPU（test_ddp.py:40） |
+| 5.3 `naive_ddp_benchmarking` | 2 | 不限 | ✗ | "1 node x 2 GPUs, xl"（L1887） |
+| 5.4 `minimal_ddp_flat_benchmarking` | 2 | 不限 | ✗ | 同上条件对比（L1887） |
+| 5.5 `ddp_overlap_individual_parameters` | 0 | — | **✓** | gloo/CPU 判分 |
+| 5.6 `ddp_overlap_..._benchmarking` | 2 | 不限 | ✗ | "1 node, 2 GPUs, xl"（L2006/L2011）+ 要 nsys 截图 |
+
+**§6 / §7 Sharding & FSDP**
+
+| 题目 | 卡 | 型号 | 本机 | 说明 |
+|---|:--:|---|:--:|---|
+| 6.1 `optimizer_state_sharding` | 0 | — | **✓** | gloo/CPU 判分（test_sharded_optimizer.py:31） |
+| 6.2 `..._accounting` | 2 | 不限 | ✗ | "1 node, 2 GPUs, xl"（L2079/L2088） |
+| 7.1 `fsdp` | 0 | — | **✓** | gloo/CPU 判分（test_fsdp.py:120） |
+| 7.2 `fsdp_accounting` | 2 | 不限 | ✗ | "Profile the xl model on two GPUs"（L2156）+ nsys 截图 |
+
+**§8 / §9**
+
+| 题目 | 卡 | 型号 | 本机 | 说明 |
+|---|:--:|---|:--:|---|
+| 8.1–8.5 全部 | 0 | — | **✓** | 纯纸面推导，17 分 |
+| 9 `leaderboard` | 2 | **B200 强制** | ✗ | "two B200 GPUs"（L2593/L2661），且空 cache 起 10 分钟内跑完 |
+
+**归纳**
+
+- **本机能拿满**：§4.3/4.4 FlashAttention（20）、§6.1（15）、§7.1（15）、§5.2+5.5（10）、
+  §8 全部（17）、§2.2（5）、§2.3（1）、§4.1+4.2（4）、§3.1(a) —— **合计 87 分以上**
+- **必须 B200**：只有 §4.5（5 分）和 §9 leaderboard（10 分）
+- **要 2 张卡但不限型号**：§5.3、§5.4、§5.6、§6.2、§7.2（共 16 分）—— A100-80G 就够
+- **要 6 张卡**：只有 §5.1（5 分），且每次运行 <5 分钟
 
 ### 粗略预算
 
 按"1 GPU·小时"计（含调试和重跑的余量，非精确）：
 
-| 阶段 | 内容 | 卡数 × 时长 | GPU·h | RunPod $4.99 | Nebius 抢占 $3.05 |
-|---|---|---|---:|---:|---:|
-| 9 | §2.2 nsys + §2.5 memory（xl） | 1 × ~3 h | 3 | $15 | $9 |
-| 8′ | §3(b) checkpointing（xl） | 1 × ~1 h | 1 | $5 | $3 |
-| 10a | §4.5 flash benchmark（80 组配置） | 1 × ~2 h | 2 | $10 | $6 |
-| 10b | §5.1 all-reduce（2/4/6 进程） | 6 × ~0.5 h | 3 | $15 | $9 |
-| 10c | §5.3/5.4/5.6 + §6.2 + §7.2（全是 2 卡 xl） | 2 × ~4 h | 8 | $40 | $24 |
-| | **小计（不含 leaderboard）** | | **17** | **~$85** | **~$52** |
-| 11 | §9 leaderboard（迭代优化，开放式） | 2 × ? | ? | ? | ? |
+| 题目 | 卡数 × 时长 | GPU·h | RunPod $4.99 | Nebius 抢占 $3.05 |
+|---|---|---:|---:|---:|
+| §2.5 `memory_profiling`（xl） | 1 × ~2 h | 2 | $10 | $6 |
+| §3.1(b) checkpointing（xl） | 1 × ~1 h | 1 | $5 | $3 |
+| §4.5 `flash_benchmarking`（**B200**，80 组配置） | 1 × ~2 h | 2 | $10 | $6 |
+| §5.1 all-reduce（2/4/6 进程） | 6 × ~0.5 h | 3 | $15 | $9 |
+| §5.3 + §5.4 + §5.6 + §6.2 + §7.2（全是 2 卡 xl） | 2 × ~4 h | 8 | $40 | $24 |
+| **小计（不含 leaderboard）** | | **16** | **~$80** | **~$49** |
+| §9 leaderboard（迭代优化，开放式） | 2 × ? | ? | ? | ? |
 
 Modal 每月 $30 免费额度 ≈ **4.8 B200·小时**，够覆盖阶段 9 + 10a + 10b（8 GPU·h 里的一部分）。
 
@@ -538,18 +588,20 @@ num_layers=34, num_heads=32, bfloat16, is_causal=True, batch_size=2
 
 | 阶段 | 内容 | 分值 | 硬件 |
 |---|---|---:|---|
-| **1** | §8 全部推导（5 题）+ §2.3 累加精度 | **18** | 无需 GPU |
-| **2** | §0 前置 + §2.1 benchmark 脚本 + §2.4 混合精度 | 6 | 单卡够 |
+| **1** | §8 全部推导（5 题）+ §2.3 累加精度 + §3.1(a) 检查点策略推导 | **18** | 无需 GPU |
+| **2** | §0 前置 + §2.1 benchmark 脚本 + §2.4 混合精度 | 6 | 单卡（xl/10B 那两档留到阶段 10） |
 | **3** | §4.1 attention 微基准 + §4.2 torch.compile | 4 | 单卡够 |
 | **4** | §4.3/4.4 FlashAttention forward + backward | **20** | 单卡够 |
 | **5** | §5.2 naive DDP + §5.5 overlap DDP | 10 | gloo/CPU 可测 |
 | **6** | §6.1 optimizer sharding | **15** | gloo/CPU 可测 |
 | **7** | §7.1 FSDP | **15** | gloo/CPU 可测 |
-| **8** | §3 gradient checkpointing | 4 | 单卡够（xl 要换 large） |
-| **9** | §2.2 nsys + §2.5 memory profiling | 9 | 要 nsys，xl 要大显存 |
-| **10** | 所有 benchmark 类题目（§4.5、§5.1/5.3/5.4/5.6、§6.2、§7.2） | 26 | **要多卡** |
+| **8** | §2.2 nsys profile（自选两个 size，按显存自适应） | 5 | 单卡 + 要装 nsys |
+| **9** | §3.1(b) checkpointing 实测（xl） | 4 | **要大显存** |
+| **10** | benchmark 类（§2.5、§4.5、§5.1/5.3/5.4/5.6、§6.2、§7.2） | 30 | **要多卡 / B200** |
 | **11** | §9 leaderboard | 10 | **要两张 B200** |
 
-阶段 1–8 合计 **92 分**，全部能在本机（单卡 5090 + gloo/CPU）完成，其中判分测试全过。
-剩下 45 分几乎全卡在多卡/大显存上。按开头的预算表，**不含 leaderboard 约 17 GPU·小时、
-$52–85**（Modal 每月 $30 免费额度能抵掉一部分），其中只有 §4.5 一道必须用 B200。
+阶段 1–8 合计 **93 分**，全部能在本机（单卡 5090 + gloo/CPU）完成，其中判分测试全过。
+剩下 44 分卡在大显存/多卡上。按上面的预算表，**不含 leaderboard 约 16 GPU·小时、$49–80**
+（Modal 每月 $30 免费额度约合 4.8 B200·小时，能抵掉相当一部分）。
+其中**只有 §4.5（5 分）和 §9 leaderboard（10 分）硬性要求 B200**，
+§5.3/5.4/5.6/6.2/7.2 那 16 分用 A100-80G 就够。
