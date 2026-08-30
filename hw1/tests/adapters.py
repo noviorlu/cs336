@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 import cs336_basics.bpe_tokenizer as bpe_tokenizer
-from cs336_basics.transformer import *
+from cs336_basics.model import *
 from cs336_basics.nn_utils import *
 from cs336_basics.optimizer import *
 from cs336_basics.data import *
@@ -207,7 +207,7 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    from cs336_basics.transformer import RoPE
+    from cs336_basics.model import RoPE
     rope = RoPE(theta=theta, d_k=d_model // num_heads, max_seq_len=max_seq_len)
     mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, rope=rope)
     state_dict = {
@@ -320,7 +320,7 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    from cs336_basics.transformer import RoPE
+    from cs336_basics.model import RoPE
     rope = RoPE(theta=theta, d_k=d_model // num_heads, max_seq_len=max_seq_len)
     block = TransformerBlock(
         d_model=d_model,

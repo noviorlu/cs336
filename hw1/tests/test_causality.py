@@ -8,7 +8,7 @@
 import pytest
 import torch
 
-from cs336_basics.transformer import TransformerLM, build_attention_mask
+from cs336_basics.model import TransformerLM, build_attention_mask
 
 
 def _model(vocab_size=50, seq=8, heads=4):
@@ -86,7 +86,7 @@ def test_lower_layers_require_mask():
     2026-08-29 的重构是第三次，所以在签名层面把它钉死。
     """
     import inspect
-    from cs336_basics.transformer import MultiHeadSelfAttention, TransformerBlock
+    from cs336_basics.model import MultiHeadSelfAttention, TransformerBlock
 
     for cls in (MultiHeadSelfAttention, TransformerBlock):
         param = inspect.signature(cls.forward).parameters["mask"]

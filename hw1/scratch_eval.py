@@ -1,6 +1,6 @@
 import torch
 import yaml
-from cs336_basics.transformer import TransformerLM
+from cs336_basics.model import TransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from train import evaluate_loss
 import numpy as np

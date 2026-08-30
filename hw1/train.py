@@ -9,7 +9,7 @@ import yaml
 import numpy as np
 import torch
 
-from cs336_basics.transformer import TransformerLM, build_attention_mask
+from cs336_basics.model import TransformerLM, build_attention_mask
 from cs336_basics.optimizer import AdamW, get_lr_cosine_schedule
 from cs336_basics.nn_utils import cross_entropy, gradient_clipping
 from cs336_basics.checkpoint import save_checkpoint, load_checkpoint

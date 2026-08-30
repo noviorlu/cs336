@@ -2,7 +2,7 @@ import torch
 import argparse
 import os
 import yaml
-from cs336_basics.transformer import TransformerLM
+from cs336_basics.model import TransformerLM
 from cs336_basics.bpe_tokenizer import Tokenizer
 
 def main():

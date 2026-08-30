@@ -23,7 +23,7 @@ import math
 import pytest
 import torch
 
-from cs336_basics.transformer import MultiHeadSelfAttention, RoPE
+from cs336_basics.model import MultiHeadSelfAttention, RoPE
 
 D_K, MAX_SEQ, THETA = 16, 32, 10000.0
 

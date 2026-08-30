@@ -339,24 +339,39 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
 
 ### Action
 
-- [ ] **Action 1**: 执行重命名命令：`git mv hw1/cs336_basics/transformer.py hw1/cs336_basics/model.py`
+- [x] **Action 1**: 执行重命名命令：`git mv hw1/cs336_basics/transformer.py hw1/cs336_basics/model.py`
   - **为什么必须真改名、不能留个转发模块**：§2.2 要求 `cs336_basics.model.scaled_dot_product_attention = 注解版`。
     如果 `model.py` 只是 `from .transformer import *`，这个赋值改的是 `model` 模块的全局绑定，而
     `MultiHeadSelfAttention.forward` 是在 `transformer` 的命名空间里查这个名字的——**patch 不到，实测 0 次调用，且不报错**，
     只是 NVTX range 全部消失，§2.2 的 (b)(c)(e) 直接答不出来。
-- [ ] **Action 2**: 批量替换引用路径。把 `hw1/` 目录下（包括 `__init__.py` 和各测试脚本）共计约 11 处的 `cs336_basics.transformer` 替换为 `cs336_basics.model`。
-- [ ] **Action 3**: 在改名后的 `model.py` 底部加上两行别名代码，以兼容 PDF 后续要求：
+- [x] **Action 2**: 批量替换引用路径。把 `hw1/` 目录下（包括 `__init__.py` 和各测试脚本）共计约 11 处的 `cs336_basics.transformer` 替换为 `cs336_basics.model`。
+- [x] **Action 3**: 在改名后的 `model.py` 底部加上两行别名代码，以兼容 PDF 后续要求：
   ```python
   BasicsTransformerLM = TransformerLM
   RotaryEmbedding = RoPE
   ```
-- [ ] **Action 4**: 修改 `hw2/pyproject.toml:35`，把官方库替换为本地路径：
+- [x] **Action 4**: 修改 `hw2/pyproject.toml:35`，把官方库替换为本地路径：
   ```toml
   cs336-basics = { path = "../hw1", editable = true }
   ```
 
-- [ ] **Action 5**: 系统级安装 `nsys` (Nsight Systems CLI)，这是后面所有性能抓图的刚需。
-- [ ] **Action 6**: 跑一次空转的 `uv run pytest tests/`，验证依赖全部贯通（此时 `adapters.py` 里的 8 个 hook 还是 NotImplementedError，必然报错，但只要不是 import 报错就说明环境通了）。
+- [ ] **Action 5**: `nsys` (Nsight Systems CLI)。**⚠️ 2026-08-30 实测：装了 ≠ 能用，这条还没完成。**
+  - `/usr/bin/nsys` 是 **2022.4.2**，比 Blackwell(sm_120) 早了三年。它能跑起来、能打印
+    `cuda ok: NVIDIA GeForce RTX 5090`，但**收尾时报 `Importer error status: The importer binary
+    and its dependencies were not found`，只吐出一个 32 MB 的 `.qdstrm`，生不成 `.nsys-rep`**。
+    → `nsys stats` 用不了，§2.2(b) 要的 "CUDA GPU Kernel Summary" 拿不到；
+    §5.6(b)/§7.2(b) 的 timeline 截图也出不来。它还不认 `--force-overwrite`（报 option is ambiguous）
+  - **已找到能用的**：conda 里带了一份 **2025.3.1**，实测在 5090 上跑通了全链路
+    （`.nsys-rep` 生成 + `nsys stats --report cuda_gpu_kern_sum` 出表）：
+    ```
+    /home/yc/miniconda3/envs/diff/nsight-compute-2025.3.1/host/target-linux-x64/nsys
+    ```
+  - **要定的**：把这个路径写进 benchmark 脚手架的 `NSYS` 变量（最省事），还是系统级装一份新的。
+    **上云时镜像里也要装新版**，别装到发行版仓库里的旧版
+  - 附带：`nsys status --environment` 显示 `perf_event_open` 不可用
+    （`Linux Kernel Paranoid Level = 4`）→ **CPU 采样和上下文切换追踪拿不到**，只有 CUDA/NVTX 能用。
+    §2.2 全部问题只需要 CUDA/NVTX，够用；真要 CPU 侧数据得降 paranoid 或加 root
+- [x] **Action 6**: 跑一次空转的 `uv run pytest tests/`，验证依赖全部贯通（此时 `adapters.py` 里的 8 个 hook 还是 NotImplementedError，必然报错，但只要不是 import 报错就说明环境通了）。
 
 ### Tips
 

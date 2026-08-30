@@ -594,3 +594,8 @@ class TransformerLM(nn.Module):
             model.load_state_dict(state_dict)
             
         return model
+
+# Aliases for hw2 compatibility
+BasicsTransformerLM = TransformerLM
+RotaryEmbedding = RoPE
+

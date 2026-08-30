@@ -249,4 +249,11 @@
    模块的全局绑定，而 `MultiHeadSelfAttention.forward` 是在 `transformer` 的命名空间里
    查这个名字的——**patch 不到，实测 0 次调用**。不报错，只是 NVTX range 全部消失。
    → 归第 1 篇。解决办法是直接把文件改名成 `model.py`，让函数和调用它的 forward 同模块
-2. （继续往下加）
+2. **`nsys` 装了不等于能用**。发行版仓库里的 `/usr/bin/nsys` 是 2022.4.2，比 Blackwell 早三年：
+   跑得起来、也认得出 RTX 5090，但收尾报 `Importer error status: The importer binary ... were not
+   found`，只留下一个几十 MB 的 `.qdstrm`，`.nsys-rep` 根本没生成，`nsys stats` 自然也就没得用。
+   **失败信号很弱**——脚本正常退出、GPU 名字打印正确，很容易以为 profile 成功了。
+   换 2025.3.1 后同一条命令直接出 `.nsys-rep` 和 kernel summary。
+   → 归第 1 篇。教训：profiler 这类工具要**先用一个 20 行的 toy 脚本验通全链路**（跑完还要能出表），
+   再拿去跑真实验；尤其上云前，别在按秒计费的机器上发现这个
+3. （继续往下加）
