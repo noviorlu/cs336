@@ -57,6 +57,8 @@
 ---
 
 ## A. 协作模式
+> **🚨 核心纪律**：**没有用户的明确指令，绝不越线抢跑！只有当用户明确许可并宣布开始下一个 Section 时，AI 才能执行该 Section 的任务。**
+
 
 `hw2/CLAUDE.md` 是**课程官方给选课学生的 AI 使用规范**（只讲解、只 review，不写代码、
 不给解法）。用户不是选课学生、不提交、不参与评分，但**博客要记录的是"我自己的实现步骤"**，
@@ -355,22 +357,32 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
   cs336-basics = { path = "../hw1", editable = true }
   ```
 
-- [ ] **Action 5**: `nsys` (Nsight Systems CLI)。**⚠️ 2026-08-30 实测：装了 ≠ 能用，这条还没完成。**
-  - `/usr/bin/nsys` 是 **2022.4.2**，比 Blackwell(sm_120) 早了三年。它能跑起来、能打印
-    `cuda ok: NVIDIA GeForce RTX 5090`，但**收尾时报 `Importer error status: The importer binary
-    and its dependencies were not found`，只吐出一个 32 MB 的 `.qdstrm`，生不成 `.nsys-rep`**。
-    → `nsys stats` 用不了，§2.2(b) 要的 "CUDA GPU Kernel Summary" 拿不到；
-    §5.6(b)/§7.2(b) 的 timeline 截图也出不来。它还不认 `--force-overwrite`（报 option is ambiguous）
-  - **已找到能用的**：conda 里带了一份 **2025.3.1**，实测在 5090 上跑通了全链路
-    （`.nsys-rep` 生成 + `nsys stats --report cuda_gpu_kern_sum` 出表）：
+- [x] **Action 5**: 配置 `nsys` (Nsight Systems CLI) —— **核心避坑：坚决不通过 apt 系统级安装**。
+  - **踩坑记录**：Ubuntu 默认源 `apt install nsight-systems` 只能拉到 `2022.4.2` 版。该版本过于老旧，无法解析 5090 (Blackwell/sm_120) 的硬件 trace，会导致静默失败（只生成 `qdstrm` 且报 `Importer error status`）。
+  - **最终解法**：直接复用本地 conda 环境 `diff` 中自带的较新版 (2025.3.1.0)，将其软链接到当前 hw2 项目专属的 `uv` 虚拟环境中：
+    `ln -sf /home/yc/miniconda3/envs/diff/nsight-compute-2025.3.1/host/target-linux-x64/nsys /home/yc/projects/LLM/hw2/.venv/bin/nsys`
+  - **收益**：既不污染全局、不引发系统级依赖地狱，又适配 `uv run nsys profile ...` 的调用方式。
+  - **⚠️ 这个方案有个必须防的失败模式**（2026-08-30 Claude 验证时发现）：
+    `uv run` 把 `.venv/bin` 排在 `PATH` **最前**，所以软链在就用新版；
+    **软链一旦消失**（uv 重建 venv、`diff` 那个 conda 环境被删/改名），
+    `nsys` 会**静默回退到 `/usr/bin/nsys` 那个 2022 坏版本**——不报错，只是又给你一个
+    `.qdstrm`。而且 `.venv` 是 gitignore 的，**换机器/上 Modal 都不会带过去**。
+    → 每次正式 profile 前先跑验收脚本，别裸奔。
+  - **验收脚本已固化**：`hw2/scripts/nsys_check.sh`（+ `nsys_check.py` 的小工作负载）。
+    ```sh
+    cd hw2 && bash scripts/nsys_check.sh
     ```
-    /home/yc/miniconda3/envs/diff/nsight-compute-2025.3.1/host/target-linux-x64/nsys
-    ```
-  - **要定的**：把这个路径写进 benchmark 脚手架的 `NSYS` 变量（最省事），还是系统级装一份新的。
-    **上云时镜像里也要装新版**，别装到发行版仓库里的旧版
-  - 附带：`nsys status --environment` 显示 `perf_event_open` 不可用
-    （`Linux Kernel Paranoid Level = 4`）→ **CPU 采样和上下文切换追踪拿不到**，只有 CUDA/NVTX 能用。
-    §2.2 全部问题只需要 CUDA/NVTX，够用；真要 CPU 侧数据得降 paranoid 或加 root
+    四步断言，**`nsys --version` 通过不算数**，要的是这四样全绿：
+    1. 版本 ≥ 2024（Blackwell/sm_120 的门槛）并打印实际解析到的路径
+    2. 能生成 **`.nsys-rep`**（旧版就死在这步，只吐 `.qdstrm`）
+    3. `nsys stats --report nvtx_sum` 能出 NVTX 汇总 —— §2.2 靠它把 warmup 过滤掉
+    4. `--filter-nvtx="scaled dot product attention"` 能把 kernel 归因到 range 内
+       —— **§2.2(b)(e) 的核心能力**，PDF 的 hint 说的就是这个
+    2026-08-30 实测四步全绿（annotated attention 调用 20 次 = 4 层 ×(2 warmup+3 step)，
+    猴补丁同时被验证）。**上 Modal 时把这个脚本塞进闸 4 的冒烟跑**（见 §B.3）
+  - 踩到的两个小坑：`nsys stats` 复用旧的 `.sqlite` 会报
+    `File is older than input file` 然后直接退出 → 加 `--force-export=true`；
+    旧版还不认 `--force-overwrite`（报 option is ambiguous）
 - [x] **Action 6**: 跑一次空转的 `uv run pytest tests/`，验证依赖全部贯通（此时 `adapters.py` 里的 8 个 hook 还是 NotImplementedError，必然报错，但只要不是 import 报错就说明环境通了）。
 
 ### Tips
