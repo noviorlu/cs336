@@ -1,7 +1,7 @@
 # CS336 Assignment 2 (Systems) — 完整 TODO
 
 > 依据 `cs336_assignment2_systems.pdf`（Version 26.1.3, Spring 2026, 48 页）逐节梳理。
-> 27 个 Problem，**总分 137**。hw1 重构相关的清单已移到 [todo-hw1-refactor.md](todo-hw1-refactor.md)。
+> 27 个 Problem，**总分 137**。hw1 重构相关的清单已移到同目录的 [todo-hw1-refactor.md](todo-hw1-refactor.md)。
 >
 > **图例**：`[代码]` 有 pytest 判分 · `[文字]` 产出博客正文 · `[图]` 产出截图/表格/曲线 ·
 > `⚠️多卡` 需要 >1 GPU · `⚠️大显存` 单卡 32G 放不下
@@ -779,19 +779,26 @@ Triton 版 backward、causal 提前终止）都有可量化的收益，天然是
 
 | 阶段 | 内容 | 分值 | 硬件 |
 |---|---|---:|---|
-| **1** | §8 全部推导（5 题）+ §2.3 累加精度 + §3.1(a) 检查点策略推导 | **18** | 无需 GPU |
-| **2** | §0 前置 + §2.1 benchmark 脚本 + §2.4 混合精度 | 6 | 单卡（xl/10B 那两档留到阶段 10） |
-| **3** | §4.1 attention 微基准 + §4.2 torch.compile | 4 | 单卡够 |
-| **4** | §4.3/4.4 FlashAttention forward + backward | **20** | 单卡够 |
-| **5** | §5.2 naive DDP + §5.5 overlap DDP | 10 | gloo/CPU 可测 |
-| **6** | §6.1 optimizer sharding | **15** | gloo/CPU 可测 |
-| **7** | §7.1 FSDP | **15** | gloo/CPU 可测 |
-| **8** | §2.2 nsys profile（自选两个 size，按显存自适应） | 5 | 单卡 + 要装 nsys |
-| **9** | §3.1(b) checkpointing 实测（xl） | 4 | **要大显存** |
-| **10** | benchmark 类（§2.5、§4.5、§5.1/5.3/5.4/5.6、§6.2、§7.2） | 30 | **要多卡 / B200** |
-| **11** | §9 leaderboard | 10 | **要两张 B200** |
+| **1** | §0 环境配置 + §2.1 benchmark 脚本 + §2.3 累加精度 + §2.4 混合精度 | 7 | 单卡（xl/10B 那两档留到阶段 9） |
+| **2** | §4.1 attention 微基准 + §4.2 torch.compile | 4 | 单卡够 |
+| **3** | §4.3/4.4 FlashAttention forward + backward | **20** | 单卡够 |
+| **4** | §5.2 naive DDP + §5.5 overlap DDP | 10 | gloo/CPU 可测 |
+| **5** | §6.1 optimizer sharding | **15** | gloo/CPU 可测 |
+| **6** | §7.1 FSDP | **15** | gloo/CPU 可测 |
+| **7** | §2.2 nsys profile（自选两个 size，按显存自适应） | 5 | 单卡 + 要装 nsys |
+| **8** | §3 gradient checkpointing | 4 | (a) 本机推导 / (b) 要大显存 |
+| **9** | benchmark 类（§2.5、§4.5、§5.1/5.3/5.4/5.6、§6.2、§7.2） | 30 | **要多卡 / B200** |
+| **10** | §9 leaderboard（当"优化日志"写，不提交） | 10 | 开放式 |
+| **11** | **§8 全部推导（5 题）** | **17** | 无需 GPU |
 
-阶段 1–8 合计 **93 分**，全部能在本机（单卡 5090 + gloo/CPU）完成，其中判分测试全过。
+**§8 为什么排到最后**（2026-08-30 用户定）：原来排第一是因为它不需要硬件。
+改到最后的好处是——DP / FSDP / TP 的通信量推导，在**亲手实现过 §5 的 all-reduce、
+§6 的参数分片、§7 的 all-gather + reduce-scatter 之后**再做，公式里的每一项都有对应的
+代码记忆，而不是纯符号操作。博客第 6 篇也因此变成整个系列的收束，而不是开篇。
+
+阶段 **1–7 合计 76 分**，全部能在本机（单卡 5090 + gloo/CPU）完成，其中判分测试全过。
+阶段 8（§3，4 分）里 (a) 是本机推导、(b) 要大显存。
+再加上排在最后的 §8 推导（17 分），**共 93 分不花一分钱**。
 剩下 44 分卡在大显存/多卡上。按上面的预算表，**不含 leaderboard 约 16 GPU·小时、$49–80**
 （Modal 每月 $30 免费额度约合 4.8 B200·小时，能抵掉相当一部分）。
 其中**只有 §4.5（5 分）和 §9 leaderboard（10 分）硬性要求 B200**，
