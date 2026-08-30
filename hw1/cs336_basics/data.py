@@ -36,7 +36,11 @@ def get_batch(
     # uint16 走完 PCIe，到显存里再转，传输量是 2 字节/token 而不是 4。
     # 只能转成 int32 或 int64：PyTorch 的索引 kernel 只按这两种类型特化，
     # int8/int16/uint* 一律 IndexError。取 int32 省一半。
-    x_tensor = torch.from_numpy(x).to(device).to(torch.int32)
-    y_tensor = torch.from_numpy(y).to(device).to(torch.int32)
+    if torch.device(device).type == "cuda":
+        x_tensor = torch.from_numpy(x).pin_memory().to(device, non_blocking=True).to(torch.int32)
+        y_tensor = torch.from_numpy(y).pin_memory().to(device, non_blocking=True).to(torch.int32)
+    else:
+        x_tensor = torch.from_numpy(x).to(device).to(torch.int32)
+        y_tensor = torch.from_numpy(y).to(device).to(torch.int32)
 
     return x_tensor, y_tensor

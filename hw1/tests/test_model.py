@@ -200,3 +200,39 @@ def test_silu_matches_pytorch():
     expected_output = F.silu(x)
     actual_output = run_silu(x)
     numpy.testing.assert_allclose(actual_output.detach().numpy(), expected_output.detach().numpy(), atol=1e-5)
+
+def test_multihead_self_attention_with_rope_2d_positions(
+    numpy_snapshot, in_embeddings, d_model, n_heads, ts_state_dict, n_keys, theta, pos_ids
+):
+    d, _ = ts_state_dict
+    q_proj_weight, k_proj_weight, v_proj_weight, o_proj_weight = [
+        d[f"layers.0.attn.{k}_proj.weight"] for k in ["q", "k", "v", "output"]
+    ]
+    # Create a batch of size > 1 for pos_ids and embeddings
+    B = 3
+    pos_ids_2d = torch.stack([pos_ids for _ in range(B)], dim=0) # [B, seq]
+    
+    # Assume in_embeddings is [batch, seq, d_model], if it's already batched, we need to adapt
+    # Let's check in_embeddings shape in the test. If it's [B, S, D], we use it directly or expand.
+    # Usually in_embeddings might be [1, seq, d_model] or [seq, d_model].
+    # We can just stack it to ensure batch size B.
+    # Actually it's safer to just instantiate a dummy tensor.
+    S = pos_ids.shape[-1]
+    dummy_x = torch.randn(B, S, d_model)
+    
+    try:
+        actual_output = run_multihead_self_attention_with_rope(
+            d_model=d_model,
+            num_heads=n_heads,
+            max_seq_len=n_keys,
+            theta=theta,
+            q_proj_weight=q_proj_weight,
+            k_proj_weight=k_proj_weight,
+            v_proj_weight=v_proj_weight,
+            o_proj_weight=o_proj_weight,
+            in_features=dummy_x,
+            token_positions=pos_ids_2d,
+        )
+    except Exception as e:
+        import pytest
+        pytest.fail(f"RoPE broadcast bug triggered with 2D positions: {e}")

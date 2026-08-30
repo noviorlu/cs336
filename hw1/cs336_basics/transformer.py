@@ -1,3 +1,5 @@
+from .nn_utils import softmax
+import logging
 import torch
 import torch.nn as nn
 import math
@@ -24,6 +26,11 @@ class Linear(nn.Module):
     def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... out_features"]:
         return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
 
+
+    def extra_repr(self):
+        # 这个 Linear 不带 bias；形状直接从 weight [out, in] 读，不额外存字段
+        return f"in_features={self.weight.shape[1]}, out_features={self.weight.shape[0]}"
+
 class Embedding(nn.Module):
     def __init__(
         self, 
@@ -40,6 +47,10 @@ class Embedding(nn.Module):
 
     def forward(self, x: Int[Tensor, "... seq_len"]) -> Float[Tensor, "... seq_len embedding_dim"]:
         return self.weight[x]
+
+
+    def extra_repr(self):
+        return f"num_embeddings={self.weight.shape[0]}, embedding_dim={self.weight.shape[1]}"
 
 class RMSNorm(nn.Module):
     def __init__(
@@ -58,9 +69,12 @@ class RMSNorm(nn.Module):
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         in_dtype = x.dtype
         x = x.to(torch.float32)
-        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        result = (x / rms) * self.weight
+        rrms = torch.rsqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        result = (x * rrms) * self.weight
         return result.to(in_dtype)
+
+    def extra_repr(self):
+        return f"d_model={self.weight.shape[0]}, eps={self.eps}"
 
 class SiLU(nn.Module):
     def forward(self, x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
@@ -113,6 +127,10 @@ class FFNSiLU(nn.Module):
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         return self.w2(self.silu(self.w1(x)))
 
+
+    def extra_repr(self):
+        return f"d_model={self.w1.weight.shape[1]}, d_ff={self.w1.weight.shape[0]}"
+
 class RoPE(nn.Module):
     """
     i:    position              0 .. max_seq_len-1    \n
@@ -128,6 +146,7 @@ class RoPE(nn.Module):
         device: torch.device | None = None
     ):
         super().__init__()
+        self.theta = theta
 
         # 2k, k=0..d_k/2-1 → 取值 0, 2, 4, ..., d_k-2
         dim_range = torch.arange(0, d_k, 2, device=device, dtype=torch.float32) # dim: [d_k // 2]
@@ -186,32 +205,54 @@ class RoPE(nn.Module):
         out = rearrange(x_reshaped * cos + x_rotate * sin, '... k xy -> ... (k xy)')
         return out
 
-def softmax(x: Float[Tensor, "..."], dim: int) -> Float[Tensor, "..."]:                      
-    # 1. 找到指定维度 dim 上的最大值                                                         
-    # keepdim=True 极其重要！它能保证找完最大值后形状不塌缩，从而可以和 x 完美相减           
-    x_max = torch.max(x, dim=dim, keepdim=True)[0]
+
+    def extra_repr(self):
+        return (f"d_k={self.cos_cached.shape[-1] * 2}, "
+                f"max_seq_len={self.cos_cached.shape[0]}, theta={self.theta}")
+
+def build_attention_mask(
+    seq_len: int,
+    device: torch.device | str,
+    x: Int[Tensor, "... seq_len"] | None = None,
+    doc_sep_id: int | None = None,
+) -> Bool[Tensor, "... 1 seq_len seq_len"]:
+    """构造注意力 mask，True 表示需要遮蔽 (blocked) 的位置。
+
+    始终包含因果 mask；传了 x 和 doc_sep_id 就再叠加一层 document mask，
+    挡住注意力跨越文档边界。
+
+    返回值多出的那个长度为 1 的轴是给 num_heads 留的位置：MHA 的打分矩阵是
+    [..., h, seq, seq]，而广播是右对齐的，不给 head 留位就会让 batch 撞上 h。
+    留 1 而不是 expand 成 h，是为了让下游 masked_fill 里的 mask 只物化一份。
+    """
+    causal_mask = torch.triu(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device), diagonal=1).view(1, 1, seq_len, seq_len)
     
-    # 2. 给所有的元素统一减去最大值（无损降维打击）
-    x_shifted = x - x_max
-    
-    # 3. 算分子：对减去最大值后的张量统一求 exp
-    nume = torch.exp(x_shifted)
-    
-    # 4. 算分母：沿着 dim 维度，把分子全部加起来（同样保持维度）
-    denomi = torch.sum(nume, dim=dim, keepdim=True)
-    
-    # 5. 张量直接相除（分子矩阵 / 分母矩阵）
-    return nume / denomi
+    if doc_sep_id is not None and x is not None:
+        # doc_id[i] = 位置 i 属于窗口内的第几篇文档。
+        # 减去 is_sep 这一项不能省：分隔符要归**它结束的那篇**，而不是下一篇。
+        # 只做 cumsum 的话 <|endoftext|> 会被划进后一篇，它就看不到自己刚刚
+        # 结束的那篇文档的内容了——不报错，只是静默换了一种打包语义。
+        # cumsum 对整型默认提升到 int64，必须显式给 dtype 才是 int32；
+        # bool 可以直接 cumsum，不用先 .long()。
+        is_sep = x == doc_sep_id
+        doc_id = is_sep.cumsum(dim=-1, dtype=torch.int32) - is_sep.to(torch.int32)
+        doc_mask = doc_id.unsqueeze(-1) != doc_id.unsqueeze(-2)  # 不同篇 → 阻断
+        final_mask = causal_mask | doc_mask.unsqueeze(-3)
+    else:
+        final_mask = causal_mask
+        
+    return final_mask
 
 def scaled_dot_product_attention(                                                            
     q: Float[Tensor, "b ... queries d_k"],                                                   
     k: Float[Tensor, "b ... keys d_k"],                                                   
     v: Float[Tensor, "b ... keys d_v"],                                                   
-    mask: Bool[Tensor, "b ... queries keys"],
+    mask: Bool[Tensor, "b ... queries keys"] | None = None,
 ) -> Float[Tensor, "b ... queries d_v"]:                                                     
     d_k = q.shape[-1] 
     QK = einsum(q, k, '... queries d_k, ... keys d_k -> ... queries keys') / math.sqrt(d_k)
-    QK = QK.masked_fill(~mask, float('-inf'))
+    if mask is not None:
+        QK = QK.masked_fill(mask, float('-inf'))
 
     softQK = softmax(QK, dim=-1)
     return einsum(softQK, v, '... queries keys, ... keys d_v -> ... queries d_v')
@@ -225,8 +266,7 @@ class MultiHeadSelfAttention(nn.Module):
         self,
         d_model: int,
         num_heads: int,
-        max_seq_len: int | None = None,
-        theta: float | None = None,
+        rope: nn.Module | None = None,
         device: torch.device | None = None, 
         dtype: torch.dtype | None = None
     ) -> None:
@@ -241,10 +281,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
 
-        if max_seq_len is not None and theta is not None:
-            self.rope = RoPE(theta=theta, d_k=d_model // num_heads, max_seq_len=max_seq_len, device=device)
-        else:
-            self.rope = None
+        self.rope = rope
 
     def forward(
         self,
@@ -252,6 +289,14 @@ class MultiHeadSelfAttention(nn.Module):
         mask: Bool[Tensor, "... seq_len seq_len"],
         token_positions: Int[Tensor, "... seq_len"] | None = None
     ) -> Float[Tensor, "... seq_len d_model"]:
+        # mask 在这一层是**必填**的，故意不给 None 默认值。
+        # 这个类叫 MultiHeadSelfAttention 而不是 CausalMHA——它本身不知道自己
+        # 是不是自回归的，因果性完全由传进来的 mask 决定。给 None 默认值的话，
+        # 下游 SDPA 会直接跳过 masked_fill，忘传就等于全双向注意力：不报错、
+        # shape 全对、loss 还降得比正确实现快，只能靠"怎么这么好"反推回来。
+        # 只有 TransformerLM.forward 那一层允许 mask=None，含义是"帮我补因果"
+        # （hw2 的 DDP/FSDP 只调 model(x)，缺省必须安全）。
+        # 缺省应该是"补全"或"报错"，不能是"跳过"。
         q = self.q_proj(x) # ... seq_len d_model
         k = self.k_proj(x)
         v = self.v_proj(x)
@@ -262,8 +307,12 @@ class MultiHeadSelfAttention(nn.Module):
 
         if self.rope is not None:
             assert token_positions is not None, "token_positions 必须由外部提供 (RoPE 启用时)"
-            q_arrg = self.rope(q_arrg, token_positions)
-            k_arrg = self.rope(k_arrg, token_positions)
+            if token_positions.ndim > 1:
+                token_positions_rope = rearrange(token_positions, "... seq -> ... 1 seq")
+            else:
+                token_positions_rope = token_positions
+            q_arrg = self.rope(q_arrg, token_positions_rope)
+            k_arrg = self.rope(k_arrg, token_positions_rope)
 
         o_arrg = scaled_dot_product_attention(q_arrg, k_arrg, v_arrg, mask)
         o = rearrange(o_arrg, '... h seq_len d -> ... seq_len (h d)')
@@ -276,8 +325,7 @@ class TransformerBlock(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
-        max_seq_len: int | None = None,
-        theta: float | None = None,
+        rope: nn.Module | None = None,
         norm: str = "pre",
         ffn: str = "swiglu",
         device: torch.device | None = None,
@@ -296,8 +344,7 @@ class TransformerBlock(nn.Module):
         self.attn = MultiHeadSelfAttention(
             d_model=d_model,
             num_heads=num_heads,
-            max_seq_len=max_seq_len,
-            theta=theta,
+            rope=rope,
             device=device,
             dtype=dtype
         )
@@ -312,7 +359,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: Float[Tensor, "... seq_len d_model"],
-        mask: Bool[Tensor, "... seq_len seq_len"],
+        mask: Bool[Tensor, "... seq_len seq_len"],          # 必填，理由见 MHA.forward
         token_positions: Int[Tensor, "... seq_len"] | None = None
     ) -> Float[Tensor, "... seq_len d_model"]:
         if self.norm == "post":
@@ -327,37 +374,7 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(self.ln2(x))
         return x
 
-def build_attention_mask(
-    seq_len: int,
-    device: torch.device | str,
-    x: Int[Tensor, "... seq_len"] | None = None,
-    doc_sep_id: int | None = None,
-) -> Bool[Tensor, "... 1 seq_len seq_len"]:
-    """构造注意力 mask，True 表示允许注意。
-
-    始终包含因果 mask；传了 x 和 doc_sep_id 就再叠加一层 document mask，
-    挡住注意力跨越文档边界。
-
-    返回值多出的那个长度为 1 的轴是给 num_heads 留的位置：MHA 的打分矩阵是
-    [..., h, seq, seq]，而广播是右对齐的，不给 head 留位就会让 batch 撞上 h。
-    留 1 而不是 expand 成 h，是为了让下游 masked_fill 里的 ~mask 只物化一份。
-    """
-    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
-    
-    if doc_sep_id is not None and x is not None:
-        # Build doc_mask on the fly
-        # doc_id[i] = 位置 i 属于窗口内的第几篇文档。
-        # cumsum 对整型默认提升到 int64，必须显式给 dtype 才是 int32；
-        # bool 可以直接 cumsum，不用先 .long()。上界是窗口内的分隔符个数
-        # （≤ seq_len），int32 绰绰有余。
-        is_sep = x == doc_sep_id
-        doc_id = is_sep.cumsum(-1, dtype=torch.int32) - is_sep.to(torch.int32)  # 分隔符归它结束的那篇
-        doc_mask = doc_id.unsqueeze(-1) == doc_id.unsqueeze(-2)     # 同篇才允许
-        mask = (doc_mask & causal_mask).unsqueeze(-3) # Insert head dim
-    else:
-        # Construct [1, 1, seq, seq]
-        mask = causal_mask.unsqueeze(0).unsqueeze(0)
-    return mask
+logger = logging.getLogger(__name__)
 
 class TransformerLM(nn.Module):
     def __init__(
@@ -378,15 +395,19 @@ class TransformerLM(nn.Module):
         super().__init__()
         self.context_length = context_length
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        
+        # rope_theta=None 就是 NoPE（handout `no_pos_emb`）：为 None 时根本不建 RoPE 模块
+        if rope_theta is not None:
+            self.rope = RoPE(theta=rope_theta, d_k=d_model // num_heads, max_seq_len=context_length, device=device)
+        else:
+            self.rope = None
+            
         self.layers = nn.ModuleList([
             TransformerBlock(
                 d_model = d_model,
                 num_heads = num_heads,
                 d_ff = d_ff,
-                max_seq_len = context_length,
-                # rope_theta=None 就是 NoPE（handout `no_pos_emb`）：MHA 里
-                # theta 为 None 时根本不建 RoPE 模块，位置信息完全不进模型
-                theta = rope_theta,
+                rope = self.rope,
                 norm = norm,
                 ffn = ffn,
                 device = device,
@@ -419,19 +440,21 @@ class TransformerLM(nn.Module):
                 a=-3.0 * d_model ** -0.5, b=3.0 * d_model ** -0.5)
             self.lm_head.weight = self.token_embeddings.weight
 
+        # 打印模型参数量
+        logger.info("number of parameters: %.2fM", self.get_num_params() / 1e6)
+
     def forward(
         self,
         x: Int[Tensor, "... seq_len"],
-        mask: Bool[Tensor, "... seq_len seq_len"],
+        mask: Bool[Tensor, "... seq_len seq_len"] | None = None,
         token_positions: Int[Tensor, "... seq_len"] | None = None
     ) -> Float[Tensor, "... seq_len vocab_size"]:
-        # mask 是必填的。这个模型本身不知道自己是自回归的——因果性完全由传进来的
-        # mask 决定（用 build_attention_mask 构造）。给它一个 None 默认值的话，
-        # 忘传就等于全双向注意力，而且不报错、loss 还降得特别漂亮。
-        # 缺省应该是"补全"或"报错"，不能是"跳过"。
         assert x.shape[-1] <= self.context_length, f"Input sequence length {x.shape[-1]} exceeds maximum context length {self.context_length}"
         
         seq_len = x.shape[-1]
+
+        if mask is None:
+            mask = build_attention_mask(seq_len, device=x.device)
 
         if token_positions is None:
             token_positions = torch.arange(seq_len, device=x.device)
@@ -443,3 +466,131 @@ class TransformerLM(nn.Module):
 
         # Return the unnormalized logits (no softmax applied!)
         return self.lm_head(self.ln_final(hidden_states))
+
+    @torch.no_grad()
+    def generate(self, x, max_new_tokens, temperature=1.0, top_k=None, top_p=None, eos_token_id=None):
+        """
+        自回归文本生成 (Autoregressive Text Generation)
+        """
+        # 只在本函数内切到 eval，退出时还原：generate 现在是模型方法，
+        # 训练中途采样几行文本的话，不还原就会静默把模型留在 eval 模式。
+        was_training = self.training
+        self.eval()
+        try:
+            return self._generate_loop(x, max_new_tokens, temperature, top_k, top_p, eos_token_id)
+        finally:
+            self.train(was_training)
+
+    def _generate_loop(self, x, max_new_tokens, temperature, top_k, top_p, eos_token_id):
+        for _ in range(max_new_tokens):
+            # 截断输入，确保不超过模型的最大上下文长度
+            if x.size(1) > self.context_length:
+                x_cropped = x[:, -self.context_length:]
+            else:
+                x_cropped = x
+                
+            # 前向传播，拿到所有的 logits。mask 交给 forward 内部去自动构造！
+            logits = self(x_cropped)
+            
+            # 取出序列最后一个 token 对 "下一个位置" 的预测
+            next_token_logits = logits[:, -1, :]
+            
+            # 温度调节 (Temperature Scaling)
+            if temperature > 0.0:
+                next_token_logits = next_token_logits / temperature
+                
+            # Top-K Sampling
+            if top_k is not None and top_k > 0:
+                # 找出 top_k 的阈值
+                v, _ = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))
+                next_token_logits[next_token_logits < v[:, [-1]]] = float('-inf')
+            
+            # Top-P (Nucleus) Sampling 智能旋转门
+            if top_p is not None and top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                
+                # 剔除烂词 (处理 差一错误 Off-by-one)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # 把排好序的剔除标记，还原回原本词表的顺序
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                
+                # 斩杀烂词！
+                next_token_logits.masked_fill_(indices_to_remove, float('-inf'))
+                
+            # 把处理好的 logits 变成概率分布
+            probs = torch.softmax(next_token_logits, dim=-1)
+            
+            # 抽签 (Sampling)
+            if temperature == 0.0:
+                next_token = torch.argmax(probs, dim=-1, keepdim=True)
+            else:
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+            # 拼接
+            x = torch.cat([x, next_token], dim=1)
+            
+            # 提前结束
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+                
+        return x
+
+    
+
+    
+    def get_num_params(self, non_embedding: bool = False) -> int:
+        """参数总量；non_embedding=True 时扣掉 token embedding 那张表。
+
+        注意 nn.Module.parameters() 自带去重：weight tying 时
+        token_embeddings.weight 和 lm_head.weight 是同一个 Parameter 对象，
+        本来就只数一次，不需要（也不能）再手工减一次。
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.token_embeddings.weight.numel()
+        return n_params
+
+    @classmethod
+    def from_pretrained(cls, checkpoint_path, device=None, dtype=None):
+        import os, yaml, json
+        ckpt_dir = os.path.dirname(checkpoint_path)
+        config_path_yaml = os.path.join(ckpt_dir, "config.yaml")
+        config_path_json = os.path.join(ckpt_dir, "config.json")
+        
+        config = None
+        if os.path.exists(config_path_yaml):
+            with open(config_path_yaml, "r") as f:
+                config = yaml.safe_load(f)
+        elif os.path.exists(config_path_json):
+            with open(config_path_json, "r") as f:
+                config = json.load(f)
+        else:
+            raise FileNotFoundError(f"Config file not found in {ckpt_dir} (needed to reconstruct model architecture).")
+
+        model = cls(
+            vocab_size=config['vocab_size'],
+            context_length=config['context_length'],
+            d_model=config['d_model'],
+            num_layers=config['num_layers'],
+            num_heads=config['num_heads'],
+            d_ff=config.get('d_ff', config['d_model'] * 4),
+            rope_theta=None if config.get('no_rope') else config.get('rope_theta', 10000.0),
+            norm=config.get('norm', 'pre'),
+            ffn=config.get('ffn', 'swiglu'),
+            tie_embeddings=config.get('tie_embeddings', False),
+            device=device,
+            dtype=dtype
+        )
+        
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        if 'model_state_dict' in state_dict:
+            model.load_state_dict(state_dict['model_state_dict'])
+        else:
+            model.load_state_dict(state_dict)
+            
+        return model

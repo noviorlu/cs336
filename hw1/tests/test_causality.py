@@ -19,12 +19,14 @@ def _model(vocab_size=50, seq=8, heads=4):
     ).eval()
 
 
-def test_mask_is_required():
-    """忘了传 mask 必须当场报错，而不是静默退化成全双向注意力。"""
+def test_mask_is_optional_but_causal_by_default():
+    """忘了传 mask 时，应该在内部构造因果 mask，而不是静默退化成全双向注意力。"""
     m = _model()
     x = torch.randint(0, 50, (2, 8))
-    with pytest.raises(TypeError):
-        m(x)  # type: ignore[call-arg]
+    with torch.no_grad():
+        a = m(x)
+        b = m(x, mask=build_attention_mask(x.shape[-1], x.device))
+    assert torch.equal(a, b), "默认不传 mask 时没有等价于因果 mask" 
 
 
 def test_causal_mask_blocks_future():
@@ -72,3 +74,23 @@ def test_mask_keeps_head_axis_unexpanded():
     doc = build_attention_mask(8, x.device, x=x, doc_sep_id=49)
     assert doc.shape == (4, 1, 8, 8)
     assert doc.untyped_storage().nbytes() == 4 * 8 * 8, "mask 不该被 expand 成 [B, h, s, s]"
+
+
+def test_lower_layers_require_mask():
+    """MHA / TransformerBlock 的 mask 必须是必填参数，不能有 None 默认值。
+
+    只有 TransformerLM.forward 那一层允许 mask=None，含义是"帮我补因果"
+    （hw2 的 DDP/FSDP 只调 model(x)）。下面两层一旦给了 None 默认值，
+    SDPA 会直接跳过 masked_fill，忘传就是静默的全双向注意力——不报错、
+    shape 全对、loss 还降得更快。文件开头说这个洞被打开过两次，
+    2026-08-29 的重构是第三次，所以在签名层面把它钉死。
+    """
+    import inspect
+    from cs336_basics.transformer import MultiHeadSelfAttention, TransformerBlock
+
+    for cls in (MultiHeadSelfAttention, TransformerBlock):
+        param = inspect.signature(cls.forward).parameters["mask"]
+        assert param.default is inspect.Parameter.empty, (
+            f"{cls.__name__}.forward 的 mask 有了默认值 {param.default!r}；"
+            "缺省应该是\"补全\"或\"报错\"，不能是\"跳过\""
+        )

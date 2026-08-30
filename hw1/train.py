@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 from cs336_basics.transformer import TransformerLM, build_attention_mask
-from cs336_basics.optimizer import AdamW, cross_entropy, get_lr_cosine_schedule, gradient_clipping
+from cs336_basics.optimizer import AdamW, get_lr_cosine_schedule
+from cs336_basics.nn_utils import cross_entropy, gradient_clipping
 from cs336_basics.checkpoint import save_checkpoint, load_checkpoint
 from cs336_basics.data import get_batch
 from cs336_basics.bpe_tokenizer import lookup_token_id
@@ -102,12 +103,17 @@ def evaluate_loss(model, dataset, eval_iters, batch_size, context_length, device
     # 曲线上的起伏才是模型在变，而不是采样噪声。
     rng = np.random.default_rng(seed)
     total = 0.0
+    
+    local_causal_mask = build_attention_mask(context_length, device) if doc_sep_id is None else None
+    
     with torch.no_grad():
         for _ in range(eval_iters):
             x, y = get_batch(dataset, batch_size, context_length, device, rng=rng)
             with ctx:
-                seq_len = x.shape[-1]
-                mask = build_attention_mask(seq_len, x.device, x=x, doc_sep_id=doc_sep_id)
+                if doc_sep_id is not None:
+                    mask = build_attention_mask(context_length, x.device, x=x, doc_sep_id=doc_sep_id)
+                else:
+                    mask = local_causal_mask
                 
                 logits = model(x, mask=mask)
                 loss = cross_entropy(logits, y)
@@ -208,8 +214,10 @@ def main():
             config_path = os.path.join(ckpt_dir, "config.json")
 
     if config_path:
+        # 这里不能再写 `import yaml`：函数内的 import 会把 yaml 变成整个 main()
+        # 的局部变量，把文件顶部的模块级 import 遮掉。不传 --config 时这一支不
+        # 执行，下面第 255 行 dump 配置就会 UnboundLocalError。
         if config_path.endswith((".yaml", ".yml")):
-            import yaml
             with open(config_path, "r") as f:
                 config_dict = yaml.safe_load(f)
         else:
@@ -355,6 +363,9 @@ def main():
     tokens_seen = 0
     t0 = time.perf_counter()
 
+    # 预先在 GPU 上把不依赖数据的因果 Mask 建好，省得在梯度累加循环里反复建
+    global_causal_mask = build_attention_mask(args.context_length, device) if doc_sep_id is None else None
+
     # 4. Training Loop
     #    评估和存盘放在每轮的**末尾**（见 --- E ---）。放在开头的话，标着
     #    `ckpt_step_N` 的文件其实是第 N-1 步之后的状态，从它 resume 会静默跳掉一步，
@@ -388,8 +399,10 @@ def main():
             x, y = get_batch(train_data, args.batch_size, args.context_length, device,
                              rng=np.random.default_rng([args.seed, it, micro]))
             with ctx:
-                seq_len = x.shape[-1]
-                mask = build_attention_mask(seq_len, x.device, x=x, doc_sep_id=doc_sep_id)
+                if doc_sep_id is not None:
+                    mask = build_attention_mask(args.context_length, x.device, x=x, doc_sep_id=doc_sep_id)
+                else:
+                    mask = global_causal_mask
 
                 logits = model(x, mask=mask)
                 loss = cross_entropy(logits, y) / args.accum      # ①

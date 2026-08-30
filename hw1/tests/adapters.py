@@ -10,6 +10,7 @@ from torch import Tensor
 
 import cs336_basics.bpe_tokenizer as bpe_tokenizer
 from cs336_basics.transformer import *
+from cs336_basics.nn_utils import *
 from cs336_basics.optimizer import *
 from cs336_basics.data import *
 from cs336_basics.checkpoint import *
@@ -117,6 +118,10 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
+    # tests/conftest.py 的 fixture 返回的是 "True = 允许" 的旧版掩码
+    # 新版要求传入 "True = 阻断" 的掩码，因此在此适配层进行反转
+    if mask is not None:
+        mask = ~mask
     return scaled_dot_product_attention(Q, K, V, mask)
 
 # V
@@ -161,7 +166,7 @@ def run_multihead_self_attention(
     mha.load_state_dict(state_dict)
     
     seq_len = in_features.shape[-2]
-    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device))
+    causal_mask = torch.triu(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device), diagonal=1)
     return mha(x=in_features, mask=causal_mask)
 
 # V
@@ -202,7 +207,9 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, theta=theta)
+    from cs336_basics.transformer import RoPE
+    rope = RoPE(theta=theta, d_k=d_model // num_heads, max_seq_len=max_seq_len)
+    mha = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, rope=rope)
     state_dict = {
         "q_proj.weight": q_proj_weight,
         "k_proj.weight": k_proj_weight,
@@ -212,7 +219,7 @@ def run_multihead_self_attention_with_rope(
     mha.load_state_dict(state_dict)
     
     seq_len = in_features.shape[-2]
-    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device))
+    causal_mask = torch.triu(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device), diagonal=1)
     
     if token_positions is None:
         token_positions = torch.arange(seq_len, device=in_features.device)
@@ -313,17 +320,18 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
+    from cs336_basics.transformer import RoPE
+    rope = RoPE(theta=theta, d_k=d_model // num_heads, max_seq_len=max_seq_len)
     block = TransformerBlock(
         d_model=d_model,
         num_heads=num_heads,
         d_ff=d_ff,
-        max_seq_len=max_seq_len,
-        theta=theta,
+        rope=rope,
     )
     block.load_state_dict(weights, strict=True)
     
     seq_len = in_features.shape[-2]
-    causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device))
+    causal_mask = torch.triu(torch.ones((seq_len, seq_len), dtype=torch.bool, device=in_features.device), diagonal=1)
     token_positions = torch.arange(seq_len, device=in_features.device)
     
     return block(x=in_features, mask=causal_mask, token_positions=token_positions)

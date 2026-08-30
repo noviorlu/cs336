@@ -71,9 +71,10 @@ def test_positions_with_batch_dim_match_1d(rope):
     conftest 里 batch = heads = 4，所以那种情况下不报错、只是静默算错。
     """
     torch.manual_seed(0)
-    mha = MultiHeadSelfAttention(d_model=D_K, num_heads=4, max_seq_len=MAX_SEQ, theta=THETA)
+    mha = MultiHeadSelfAttention(d_model=D_K, num_heads=4, rope=RoPE(theta=THETA, d_k=D_K//4, max_seq_len=MAX_SEQ))
     x = torch.randn(4, 6, D_K)                      # batch 故意和 heads 一样是 4
-    mask = torch.tril(torch.ones(6, 6, dtype=torch.bool))
+    # mask 语义已改为 True=阻断，因果 mask 是上三角（不含对角线）
+    mask = torch.triu(torch.ones(6, 6, dtype=torch.bool), diagonal=1)
 
     out_1d = mha(x, mask=mask, token_positions=torch.arange(6))
     out_2d = mha(x, mask=mask, token_positions=torch.arange(6).expand(4, 6))

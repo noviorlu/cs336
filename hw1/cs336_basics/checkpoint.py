@@ -22,13 +22,23 @@ def save_checkpoint(
 def load_checkpoint(
     src: Union[str, os.PathLike, BinaryIO, IO[bytes]],
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> int:
     """
     Load a checkpoint from src, recover the model and optimizer states,
     and return the iteration number that was saved.
     """
     checkpoint = torch.load(src, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    return checkpoint['iteration']
+    
+    # 兼容 torch.compile 产出的带 _orig_mod. 前缀的权重
+    sd = checkpoint.get('model_state_dict', checkpoint)
+    for k in list(sd):
+        if k.startswith("_orig_mod."): 
+            sd[k[len("_orig_mod."):]] = sd.pop(k)
+            
+    model.load_state_dict(sd)
+    
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+    return checkpoint.get('iteration', 0)

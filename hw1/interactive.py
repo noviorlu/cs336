@@ -2,9 +2,8 @@ import torch
 import argparse
 import os
 import yaml
-from cs336_basics.transformer import TransformerLM, build_attention_mask
+from cs336_basics.transformer import TransformerLM
 from cs336_basics.bpe_tokenizer import Tokenizer
-from decoder import generate
 
 def main():
     parser = argparse.ArgumentParser()
@@ -42,29 +41,16 @@ def main():
         config = yaml.safe_load(f)
         
     # 2. Load Tokenizer
-    vocab_path = os.path.join("data", "tinystories_vocab.json")
-    merges_path = os.path.join("data", "tinystories_merges.json")
+    stem = "owt" if config['vocab_size'] > 20000 else "tinystories"
+    vocab_path = os.path.join("data", f"{stem}_vocab.json")
+    merges_path = os.path.join("data", f"{stem}_merges.json")
     if not os.path.exists(vocab_path) or not os.path.exists(merges_path):
         print("Warning: Tokenizer files not found at data/. Make sure they exist.")
     tokenizer = Tokenizer.from_files(vocab_path, merges_path, special_tokens=["<|endoftext|>"])
     
     # 3. Load Model
     print(f"Loading model from {checkpoint_path}...")
-    model = TransformerLM(
-        vocab_size=config['vocab_size'],
-        context_length=config['context_length'],
-        d_model=config['d_model'],
-        num_layers=config['num_layers'],
-        num_heads=config['num_heads'],
-        d_ff=config.get('d_ff', config['d_model'] * 4),
-        rope_theta=config.get('rope_theta', 10000.0)
-    ).to(device)
-    
-    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    if 'model_state_dict' in state_dict:
-        model.load_state_dict(state_dict['model_state_dict'])
-    else:
-        model.load_state_dict(state_dict)
+    model = TransformerLM.from_pretrained(checkpoint_path, device=device)
     
     print("\n✅ 模型加载完毕！")
     print("输入 'quit' 或 'exit' 退出程序，输入 'clear' 清空控制台。")
@@ -104,15 +90,12 @@ def main():
                 print(f"\033[93m[警告]: 对话过长，已自动截断至最近的 {ctx_len} 个 Token。\033[0m")
             
             # 生成后续文本
-            output_ids = generate(
-                model, 
-                input_ids, 
+            output_ids = model.generate(
+                x=input_ids, 
                 max_new_tokens=max_new_tokens, 
-                context_length=config['context_length'],
                 temperature=temperature, 
                 top_p=top_p, 
-                device=device,
-                eos_id=tokenizer.encode("<|endoftext|>")[0]
+                eos_token_id=tokenizer.encode("<|endoftext|>")[0]
             )
             
             # 把历史记录更新为完整的序列
