@@ -327,6 +327,9 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
 - [ ] 核 §B.4 那张报价表（采集于 2026-03-28，早就过期），并确认 Modal 上多卡档位有哪些、
       便宜档（H100 / A100 / L40S）的价差、B200 排不排得上队
 - [ ] 注册 Modal，拿 $30/月免费额度
+- [ ] **镜像里怎么装 nsys**（本机是软链到 conda 的 2025.3.1，`.venv` 不跟着走，
+      发行版源里的 2022 版在 Blackwell 上不可用——见 §0 Action 5）。
+      这个决定拖到做镜像时再下，现在定了也会过期
 - [ ] 搭 Modal 脚手架（归 Claude）：镜像、代码同步、Volume 存产物、单容器多卡的 `mp.spawn`、
       `--backend/--world-size/--local` 开关。**写一次，§5–§7 全复用**
 - [ ] 第一次正式上云跑 **§5.1**：每次 <5 分钟、不依赖模型代码，**失败成本最低的多卡首跑**
@@ -357,38 +360,24 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
   cs336-basics = { path = "../hw1", editable = true }
   ```
 
-- [x] **Action 5**: 配置 `nsys` (Nsight Systems CLI) —— **核心避坑：坚决不通过 apt 系统级安装**。
-  - **踩坑记录**：Ubuntu 默认源 `apt install nsight-systems` 只能拉到 `2022.4.2` 版。该版本过于老旧，无法解析 5090 (Blackwell/sm_120) 的硬件 trace，会导致静默失败（只生成 `qdstrm` 且报 `Importer error status`）。
-  - **最终解法**：直接复用本地 conda 环境 `diff` 中自带的较新版 (2025.3.1.0)，将其软链接到当前 hw2 项目专属的 `uv` 虚拟环境中：
-    `ln -sf /home/yc/miniconda3/envs/diff/nsight-compute-2025.3.1/host/target-linux-x64/nsys /home/yc/projects/LLM/hw2/.venv/bin/nsys`
-  - **收益**：既不污染全局、不引发系统级依赖地狱，又适配 `uv run nsys profile ...` 的调用方式。
-  - **⚠️ 这个方案有个必须防的失败模式**（2026-08-30 Claude 验证时发现）：
-    `uv run` 把 `.venv/bin` 排在 `PATH` **最前**，所以软链在就用新版；
-    **软链一旦消失**（uv 重建 venv、`diff` 那个 conda 环境被删/改名），
-    `nsys` 会**静默回退到 `/usr/bin/nsys` 那个 2022 坏版本**——不报错，只是又给你一个
-    `.qdstrm`。而且 `.venv` 是 gitignore 的，**换机器/上 Modal 都不会带过去**。
-    → 每次正式 profile 前先跑验收脚本，别裸奔。
-  - **验收标准：`nsys --version` 通过不算数**，旧版也能打印版本、也认得出 5090，
-    它是在收尾时才失败的。要验的是 §2.2 实际要用的四样能力，缺一不可：
-    1. 版本 ≥ 2024（Blackwell/sm_120 的门槛），并确认解析到的**路径**是 `.venv/bin/nsys`
-    2. 能生成 **`.nsys-rep`** —— 旧版就死在这步，只吐 `.qdstrm`
-    3. `nsys stats --report nvtx_sum` 能出 NVTX 汇总 —— §2.2 靠它把 warmup 过滤掉
-    4. `nsys stats --report cuda_gpu_kern_sum --filter-nvtx="<range 名>"`
-       能把 kernel 归因到某个 range 内 —— **§2.2(b)(e) 的核心能力**，PDF 的 hint 说的就是这个
+- [x] **Action 5**: 配置 `nsys` (Nsight Systems CLI)。**别用 apt 装**——Ubuntu 源里只有 `2022.4.2`，
+  比 Blackwell(sm_120) 早三年，在 5090 上会**静默失败**（能跑、能认出 5090，但收尾报
+  `Importer error status`，只吐 `.qdstrm`、生不成 `.nsys-rep`）。
+  - **做法**：软链 conda 里自带的 2025.3.1 到 hw2 的 venv，不污染全局：
     ```sh
-    uv run which nsys && uv run nsys --version          # 1
-    uv run nsys profile -o /tmp/chk --force-overwrite true -t cuda,nvtx python <带 NVTX 的脚本>
-    ls /tmp/chk.nsys-rep                                 # 2
-    uv run nsys stats --force-export=true --report nvtx_sum /tmp/chk.nsys-rep          # 3
-    uv run nsys stats --force-export=true --report cuda_gpu_kern_sum \
-           --filter-nvtx="scaled dot product attention" /tmp/chk.nsys-rep              # 4
+    ln -sf /home/yc/miniconda3/envs/diff/nsight-compute-2025.3.1/host/target-linux-x64/nsys \
+           /home/yc/projects/LLM/hw2/.venv/bin/nsys
     ```
-    **2026-08-30 用一个 4 层 TransformerLM + §2.2 的 annotated attention 实测四步全绿**
-    （patch 被调用 20 次 = 4 层 ×(2 warmup + 3 step)，顺带确认改名 `model.py` 后猴补丁生效）。
-    →**做 §2.2 时把这四步并进正式实现**，不另留脚本；**上 Modal 时也要再验一遍**（见 §B.3 闸 4）
-  - 踩到的两个小坑：`nsys stats` 复用旧的 `.sqlite` 会报
-    `File is older than input file` 然后直接退出 → 加 `--force-export=true`；
-    旧版还不认 `--force-overwrite`（报 option is ambiguous）
+  - **§0 的完成判据就这一行**（能不能调用到正确的二进制）：
+    ```sh
+    uv run which nsys && uv run nsys --version   # 要 .venv/bin/nsys + 2025.3.1
+    ```
+  - ⚠️ **这个方案会静默退化**：`uv run` 把 `.venv/bin` 排在 `PATH` 最前，软链在就用新版；
+    **软链一旦消失**（uv 重建 venv、`diff` 那个 conda 环境被删/改名），`nsys` 会
+    **悄悄退回 `/usr/bin/nsys` 那个坏版本**，不报错。而且 `.venv` 是 gitignore 的，
+    **换机器 / 上 Modal 都带不过去** → 镜像里得另装，见 §B.3 的 ⏸ 清单
+  - **能不能产出报告是另一回事，归 §2.2 验**（那几步需要一个带 NVTX 的脚本，
+    而那本来就是 §2.2 的交付物）。2026-08-30 已预跑通，结论记在 §2.2
 - [x] **Action 6**: 跑一次空转的 `uv run pytest tests/`，验证依赖全部贯通（此时 `adapters.py` 里的 8 个 hook 还是 NotImplementedError，必然报错，但只要不是 import 报错就说明环境通了）。
 
 ### Tips
@@ -463,6 +452,28 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
 - [ ] 编写 `annotated_scaled_dot_product_attention`，用 `cs336_basics.model.scaled_dot_product_attention = ...` 替换原函数打上 NVTX 猴补丁。
 - [ ] 使用 `nvtx.range` 圈出 warm-up、前向/反向、以及 Attention 内的 "scores"、"softmax"、"final matmul"。
 - [ ] 选 2 个 model size × 3 个 >128 的 seq_len (选显存极限下的最大值)，跑 `nsys profile` 抓取数据。
+- [ ] **先验工具链再跑正式实验**（`nsys --version` 通过不算数，旧版也能打印版本、也认得出
+      5090，它是收尾时才失败的）。这四步全绿才算 nsys 可用，正好也是 (b)(e) 的取数手段：
+      ```sh
+      uv run which nsys && uv run nsys --version                      # 1 路径+版本≥2024
+      uv run nsys profile -o /tmp/chk --force-overwrite true \
+             -t cuda,nvtx python <带 NVTX 的脚本>
+      ls /tmp/chk.nsys-rep                                            # 2 旧版死在这，只有 .qdstrm
+      uv run nsys stats --force-export=true --report nvtx_sum /tmp/chk.nsys-rep        # 3
+      uv run nsys stats --force-export=true --report cuda_gpu_kern_sum \
+             --filter-nvtx="scaled dot product attention" /tmp/chk.nsys-rep            # 4
+      ```
+      - 第 3 步的 `nvtx_sum` 是**把 warmup 过滤掉**的手段
+      - 第 4 步的 `--filter-nvtx` 把 kernel 归因到某个 range 内，**PDF 在 (b) 的 hint 里
+        说的就是这个**（"filter using NVTX ranges to identify which parts of the model
+        are responsible for which kernels"），(e) 比 softmax vs matmul 也靠它
+      - ⚠️ `nsys stats` 复用旧的 `.sqlite` 会报 `File is older than input file` 然后
+        **直接退出**（不是警告）→ 每次都带 `--force-export=true`
+      - ⚠️ 旧版 nsys 不认 `--force-overwrite`，报 `option is ambiguous`——看到这个说明
+        PATH 又退回 2022 版了（见 §0 Action 5）
+      - **2026-08-30 已用一个 4 层 TransformerLM + annotated attention 预跑过，四步全绿**
+        （patch 被调用 20 次 = 4 层 ×(2 warmup + 3 step)，同时确认改名 `model.py` 后
+        猴补丁确实生效）。正式做这题时把这四步并进实现，不另留脚本
 
 **Blog:**
 - [ ] (a) 前向总时间是否与 2.1 脚本测试出的时间对齐？
