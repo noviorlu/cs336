@@ -75,11 +75,12 @@
 |---|---|---|
 | **核心实现** | **用户自己写** | Triton kernel、分布式逻辑、所有数学推导 |
 | **脚手架 / 非核心** | Claude 可以写 | benchmark 脚本、表格生成、nsys 封装、画图、环境配置 |
-| **review & debug** | Claude | 见下面的边界 |
+| **review & debug** | Claude | 直接指出哪行错、为什么错，但不贴成品实现 |
+| **博客正文** | Claude 起草，用户审核 | 素材和结论必须来自用户实测 |
 
-### A.1 逐题归属
+下面按这四行逐一展开。
 
-**用户自己写（Claude 不给可粘贴的实现）**
+**① 核心实现 —— 用户自己写（Claude 不给可粘贴的实现）**
 
 - §3.1(a) 递归 checkpoint 策略推导
 - §4.3 `flash_forward`（PyTorch tiled 版 + Triton kernel + causal masking）
@@ -91,7 +92,7 @@
 - §8.1–§8.5 全部推导（DP / FSDP / TP / 2D 的 FLOPs、通信时间、瓶颈不等式）
 - §9 leaderboard 的 kernel 优化（fused AdamW、融合 LM head + cross-entropy、FA 改进）
 
-**Claude 可以写**
+**② 脚手架 / 非核心 —— Claude 可以写**
 
 - §0 环境配置：`pyproject` 指向、`transformer.py` → `model.py` 改名、类别名
 - §2.1 benchmark 脚本骨架：CLI 参数、warmup/measure 循环、`cuda.synchronize()`、均值±标准差
@@ -107,9 +108,7 @@
 - 所有表格生成（markdown / `to_latex` / `to_typst`）和画图
 - 博客用的对照表、可复现性脚注（硬件、torch 版本、warmup/measure 步数）
 
-### A.2 review & debug 的边界
-
-用户明确要 Claude 做 review 和 debug，**所以不必用苏格拉底式提问绕圈子**：
+**③ review & debug 的边界** —— 用户明确要了，**所以不必用苏格拉底式提问绕圈子**：
 
 - ✅ 直接指出哪一行错了、为什么错、会以什么现象暴露
 - ✅ 给验证手段：toy input、shape 断言、和参考实现对拍、profiler 检查点
@@ -120,7 +119,7 @@
 用户卡住时的降级顺序：**指出症状 → 给验证方法 → 讲清思路 → 高层伪代码**，
 到伪代码为止，不落到可粘贴的成品。
 
-### A.3 博客写作分工（2026-08-30 补充：正文可由 Claude 起草）
+**④ 博客正文 —— Claude 可以起草**（2026-08-30 补充）
 
 **和代码不是一回事。** 代码自己写是为了学到东西；博客文段不承担这个作用，
 不必也由用户从零敲。采用的模式是：
@@ -136,7 +135,7 @@
 - ⚠️ 引用代码时贴的是**用户自己写的实现**，不是 Claude 现场另写一版
 - 语气/风格在第 1 篇上校准一次，之后沿用
 
-**这条不放宽代码的边界**：§A.1「逐题归属」里列的核心实现（Triton kernel、
+**这条不放宽代码的边界**：①里列的核心实现（Triton kernel、
 分布式逻辑、§8 推导）仍然由用户自己写。放宽的只有"把已有的东西写成文章"这一步。
 
 ---
