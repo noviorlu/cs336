@@ -446,11 +446,33 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
   - **三种运行模式**：通过参数控制测量的范围：① 仅前向传播 (forward-only)；② 前向+反向传播 (forward and backward)；③ 完整训练步 (包含 optimizer.step)。
   - **预热与计时机制**：先执行 $w$ 次预热步（只运行不计时），再执行 $n$ 次测量步。使用高精度的 `timeit.default_timer()` 进行计时。
 - [ ] ⚠️ **GPU 测速天坑防御**：在每一步（无论是 warmup 还是 measure）执行结束后，必须严格调用 `torch.cuda.synchronize()` 强制 CPU 挂起等待 GPU 队列清空，否则测出的只是“CPU 发送指令的时间”。
+- [ ] 默认配置照 §0 的模型配置表：vocab 10000、batch 4、**context_length 512**（PDF Table 1 下方注明"除非另有说明"）
+- ⚙️ **一个必须先定的设计选择：仅前向模式要不要包 `torch.no_grad()`？**
+  PDF 没规定，但它**直接决定下面那张表里哪些格是 OOM**：包了就不存反向激活，
+  显存差一个数量级，xl 可能跑得动；不包则和 fwd+bwd 走同一条代码路径、更诚实。
+  **选哪个都行，但必须在博客里写明**，否则读者拿自己的机器对不上账。
+
+**⚠️ 这个脚本会被反复回来扩展，第一版就留好扩展点**——PDF 特意加粗强调
+"it will pay off to have your script enable these variations via **command-line arguments**"，
+说的就是这件事（现在不留，后面四处都要返工）：
+
+| 谁来扩展 | 要加什么 |
+|---|---|
+| §2.2 | NVTX range + attention 猴补丁 |
+| §2.4 | `--dtype bfloat16` + `torch.autocast`（PDF 提示用 `nullcontext` 做"关掉混合精度"的开关） |
+| §2.5 | memory profiler 的 `_record_memory_history` / `_dump_snapshot` 开关 |
+| §4.2 | `torch.compile` 开关 |
 
 **Blog:**
 - [ ] **(b) 基础跑分报告**：在 5 warmup + 10 measure 的设定下，跑通 Section 2.1.2 里的所有模型尺寸（small 到 10B）。
   - 用 1-2 句话和表格回答：前向/反向各花多久？10次测量的方差大不大（标准差小说明测试很稳）？
-  - *（注：10B 尺寸在单卡 5090 极易 OOM，若爆显存请如实记录 OOM 现象及位置）*
+  - ⚠️ **本机（5090 32G，§2.1 全程 fp32）会出现两种性质不同的缺格，博客里要分开标**：
+    - **10B —— 整行必缺，且是确定的**。12.83B 参数 × fp32 = **权重就 51.3 GB > 32 GB**，
+      **在建模型那一步就 OOM**，连"仅测前向"都不成立。这一档能交付的只有 OOM 现象本身
+    - **xl —— 待实测，现在别下断言**。权重 13.6 G 装得下；但按 PDF §3.2 给的实测数
+      （xl 单个 TransformerBlock 在 batch4/seq2048 存了 3651 MiB 反向激活），
+      折到 seq512 约 0.9 GiB/层 × 32 层 ≈ 29 GB，**很可能连 forward-with-grad 都过不了**，
+      完整训练步的 54.5 G 更不用说。跑出来照实记——**这正是第 1 篇"单卡能到哪一步"的素材**
 - [ ] **(c) Warm-up 踩坑实验**：
   - 测试 `warmup=0` 时的均值/方差变化，用 2-3 句话解释为什么首步会极度耗时（提示：CUDA Context 初始化、PyTorch 显存池首次分配、内核按需加载等）。
   - 测试 `warmup=1` 或 `2` 时的变化，解释为何结果可能仍有偏差（提示：算法自适应选择如 cuDNN benchmark、更深层的硬件预热）。
