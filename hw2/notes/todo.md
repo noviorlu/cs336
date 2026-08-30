@@ -440,12 +440,20 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
 
 ### 2.1 `benchmarking_script` (4分)
 **Actions:**
-- [ ] 编写 `benchmark.py`，支持 CLI 参数（超参组合、三种执行模式：仅前向/前向反向/完整训练步、warm-up/measure 步数）。
-- [ ] 确保在测试循环中每步结束后严格调用 `torch.cuda.synchronize()`。
+- [ ] 编写 `benchmark.py`（端到端性能基准测试脚本）。要求支持以下核心功能：
+  - **动态初始化**：能通过 CLI 参数接收模型尺寸配置（参考 2.1.2 节的 5 种 size），并初始化基础版 `TransformerLM`。
+  - **造假数据**：无需真实语料，直接用 `torch.randint` 生成形状一致的随机数据批次（batch）。
+  - **三种运行模式**：通过参数控制测量的范围：① 仅前向传播 (forward-only)；② 前向+反向传播 (forward and backward)；③ 完整训练步 (包含 optimizer.step)。
+  - **预热与计时机制**：先执行 $w$ 次预热步（只运行不计时），再执行 $n$ 次测量步。使用高精度的 `timeit.default_timer()` 进行计时。
+- [ ] ⚠️ **GPU 测速天坑防御**：在每一步（无论是 warmup 还是 measure）执行结束后，必须严格调用 `torch.cuda.synchronize()` 强制 CPU 挂起等待 GPU 队列清空，否则测出的只是“CPU 发送指令的时间”。
 
 **Blog:**
-- [ ] 测 §0 那张模型配置表里的 5 个 size（= PDF Table 1，在 PDF §2.1.2） (5 warmup + 10 measure)，记录均值和标准差。（⚠️ 10B 本地必爆 OOM，记录报错现象或仅测前向即可）。
-- [ ] 对比 0 步、1-2 步、5 步 warm-up 的结果差异并解释原因（提示：CUDA 上下文/内存池预热等）。
+- [ ] **(b) 基础跑分报告**：在 5 warmup + 10 measure 的设定下，跑通 Section 2.1.2 里的所有模型尺寸（small 到 10B）。
+  - 用 1-2 句话和表格回答：前向/反向各花多久？10次测量的方差大不大（标准差小说明测试很稳）？
+  - *（注：10B 尺寸在单卡 5090 极易 OOM，若爆显存请如实记录 OOM 现象及位置）*
+- [ ] **(c) Warm-up 踩坑实验**：
+  - 测试 `warmup=0` 时的均值/方差变化，用 2-3 句话解释为什么首步会极度耗时（提示：CUDA Context 初始化、PyTorch 显存池首次分配、内核按需加载等）。
+  - 测试 `warmup=1` 或 `2` 时的变化，解释为何结果可能仍有偏差（提示：算法自适应选择如 cuDNN benchmark、更深层的硬件预热）。
 
 ### 2.2 `nsys_profile` (5分)
 **Actions:**
