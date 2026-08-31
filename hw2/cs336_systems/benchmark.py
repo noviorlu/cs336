@@ -2,8 +2,11 @@ import argparse
 import contextlib
 import itertools
 import json
+import os
 import platform
+import subprocess
 import sys
+import tempfile
 import timeit
 import traceback
 from dataclasses import dataclass, field, fields
@@ -45,15 +48,29 @@ SWEEP_CONFIGS = {
             ("full", False),
         ],
     },
-    "warmup_test": {
+    # ⚠️ 预热实验必须配 --isolate。不预热的开销大半是**进程级**一次性成本，
+    #    同进程连跑会让后面的配置白捡前面的预热：实测同一组 warmup=0，
+    #    独立进程下 small 是 6.85×，同进程里排第 3 位就变成 1.00×——结论相反且不报错。
+    "warmup_by_size": {
         "model_type": ["basics"],
-        "size": ["medium"],
+        "size": ["small", "medium", "large"],
         "seq_len": [512],
         "batch_size": [4],
         "vocab_size": [10000],
-        "warmup": [0, 1, 2, 5, 10],
+        "warmup": [0, 1, 2, 5],
         "steps": [10],
         "mode_and_inference": [("full", False)],
+    },
+    # xl 的完整训练步 OOM，只能用推理前向；模式不同，不与上面横向比
+    "warmup_xl": {
+        "model_type": ["basics"],
+        "size": ["xl"],
+        "seq_len": [512],
+        "batch_size": [4],
+        "vocab_size": [10000],
+        "warmup": [0, 1, 2, 5],
+        "steps": [10],
+        "mode_and_inference": [("forward", True)],
     },
 }
 
@@ -98,11 +115,11 @@ class BenchResult:
     inference: bool
     avg_ms: float
     std_ms: float
-    first_ms: float          # 第 1 步单独拎出来：2.1(c) 的结论就藏在这里
-    rest_avg_ms: float       # 第 2 步起的均值，和 first_ms 对照
+    first_ms: float
+    rest_avg_ms: float
     peak_mem_gb: float
     status: str
-    times_ms: list[float] = field(default_factory=list)   # 逐步原始耗时，落 JSON 用
+    times_ms: list[float] = field(default_factory=list)
 
 
 # ---------- 设备工具：CPU 上这些 CUDA 调用会直接崩，统一包一层 ----------
@@ -195,7 +212,7 @@ def benchmark(cfg: BenchConfig) -> BenchResult:
     model = opt = batch = step_fn = None
 
     try:
-        _reset_peak(cfg)                      # 从干净的水位开始
+        _reset_peak(cfg)
         model = build_model(cfg)
         batch = build_batch(cfg)
         opt = AdamW(model.parameters(), lr=1e-4)
@@ -205,8 +222,6 @@ def benchmark(cfg: BenchConfig) -> BenchResult:
             step_fn()
             _sync(cfg)
 
-        # ★ 峰值只统计测量段：warmup 期间分配器还在扩张，混进来的不是稳态峰值。
-        #   （想看含 warmup 的峰值就把这行挪到 warmup 之前，但要同步改脚注。）
         _reset_peak(cfg)
 
         times = []
@@ -281,15 +296,52 @@ def _footnote(cfgs: list[BenchConfig]) -> str:
     )
 
 
-def sweep(cfgs: list[BenchConfig], out_path: str | None = None):
+def _cfg_to_argv(cfg: BenchConfig) -> list[str]:
+    argv = [
+        "--model", cfg.model_type, "--size", cfg.size, "--mode", cfg.mode,
+        "--warmup", str(cfg.warmup), "--steps", str(cfg.steps),
+        "--batch-size", str(cfg.batch_size), "--seq-len", str(cfg.seq_len),
+        "--vocab-size", str(cfg.vocab_size), "--device", cfg.device,
+    ]
+    if cfg.inference:
+        argv.append("--inference")
+    return argv
+
+
+def _run_isolated(cfg: BenchConfig) -> BenchResult:
+    """在独立子进程里跑一个配置。
+
+    为什么需要：CUDA context 创建、kernel 懒加载、显存池首次扩张都是**进程级**的
+    一次性开销。同一进程里连着扫表，第一个配置付完账，后面的全白捡——测"第一步有多贵"
+    这类实验会直接得出相反结论（实测 small 的 warmup=0 惩罚：独立进程 6.85×，
+    同进程排第 3 位 1.00×），而且不报任何错。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "r.md")
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), *_cfg_to_argv(cfg), "--out", out],
+            capture_output=True, text=True,
+        )
+        jp = out.rsplit(".", 1)[0] + ".json"
+        if not os.path.exists(jp):
+            print(proc.stderr[-2000:], file=sys.stderr)
+            raise RuntimeError(
+                f"隔离子进程无产出：size={cfg.size} mode={cfg.mode} warmup={cfg.warmup}"
+            )
+        with open(jp) as f:
+            return BenchResult(**json.load(f)[0])
+
+
+def sweep(cfgs: list[BenchConfig], out_path: str | None = None, isolate: bool = False):
     results = []
     for i, c in enumerate(cfgs, 1):
         print(
             f"[{i}/{len(cfgs)}] model={c.model_type:<6} size={c.size:<6} seq={c.seq_len:<4} "
             f"batch={c.batch_size:<2} warmup={c.warmup:<2} steps={c.steps:<2} "
-            f"mode={c.mode:<8} inference={str(c.inference):<5}..."
+            f"mode={c.mode:<8} inference={str(c.inference):<5}"
+            f"{' [isolated]' if isolate else ''}..."
         )
-        results.append(benchmark(c))
+        results.append(_run_isolated(c) if isolate else benchmark(c))
         # benchmark() 已经返回 → OOM 分支的异常帧此时才真正释放，这里再收一次。
         # 不收的话下一档会继承上一档的碎片，"哪一格 OOM" 就变得依赖运行顺序。
         if c.is_cuda:
@@ -337,6 +389,9 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--sweep", action="store_true", help="Enable sweep mode")
+    parser.add_argument("--isolate", action="store_true",
+                        help="每个配置起独立子进程跑。测预热/首步开销这类实验必须开，"
+                             "否则后面的配置会白捡前面的进程级预热")
     parser.add_argument("--config", type=str, default="default", help="Name of the sweep config in SWEEP_CONFIGS")
     parser.add_argument("--out", type=str, default=None, help="写出 .md，同名 .json 一并写出")
 
@@ -346,7 +401,7 @@ def main():
         if args.config not in SWEEP_CONFIGS:
             raise ValueError(f"Sweep config '{args.config}' not found in SWEEP_CONFIGS dict.")
         cfgs = parse_sweep_config(SWEEP_CONFIGS[args.config], args.device)
-        sweep(cfgs, args.out)
+        sweep(cfgs, args.out, isolate=args.isolate)
     else:
         cfg = BenchConfig(
             args.model, args.size, args.mode, args.inference,
