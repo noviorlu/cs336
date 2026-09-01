@@ -132,6 +132,30 @@ def _range(cfg: BenchConfig, name: str, gate: list | None = None):
     return contextlib.nullcontext()
 
 
+@contextlib.contextmanager
+def _phase(cfg: BenchConfig, name: str, gate: list | None = None):
+    """阶段 range，**结尾带 synchronize**——(a) 问的就是每个 pass 多久，直接读它。
+
+    为什么必须 sync：CUDA 异步，不同步的话 range 结束时 CPU 只是"把 kernel 排完队"，
+    GPU 还在算，那个时长不是阶段耗时。实测 medium@1024 前向：不同步的 range 只有
+    33.7 ms，真实 GPU 耗时约 147 ms（CPU 跑在前面 4.4 倍）。
+
+    sync 还顺带解决 backward 无法归因的问题：`loss.backward()` 的 kernel 由 autograd
+    引擎的**工作线程**发起，而 NVTX range 是 per-thread 的，主线程 push 的 range
+    覆盖不到（实测 nvtx_gpu_proj_sum 只归到 5 个 GPU op，前向是 6700 个）。
+    sync 让时间窗口对齐后改走窗口口径，这个限制就绕开了。
+
+    代价：掐断 CPU/GPU 流水重叠，Σ(各阶段) > 不开 nvtx 时的总步长。
+    这些 range 只在 `--nvtx` 打开时存在，§2.1 的计时基准不受影响。
+    """
+    if not (cfg.nvtx and cfg.is_cuda and (gate is None or gate[0])):
+        yield
+        return
+    with nvtx.range(name):
+        yield
+        torch.cuda.synchronize()
+
+
 def _peak_gb(cfg: BenchConfig) -> float:
     if not cfg.is_cuda:
         return 0.0
@@ -175,7 +199,7 @@ def make_step_fn(
     x, y = batch
 
     def step():
-        with _range(cfg, "forward", nvtx_on):
+        with _phase(cfg, "forward", nvtx_on):
             stage_ptr[0] = "forward"
             ctx = torch.no_grad() if cfg.inference else contextlib.nullcontext()
             with ctx:
@@ -183,17 +207,17 @@ def make_step_fn(
                 loss = cross_entropy(logits, y)
 
         if cfg.mode in ("fwd_bwd", "full"):
-            with _range(cfg, "backward", nvtx_on):
+            with _phase(cfg, "backward", nvtx_on):
                 stage_ptr[0] = "backward"
                 loss.backward()
 
         if cfg.mode == "full":
-            with _range(cfg, "optimizer", nvtx_on):
+            with _phase(cfg, "optimizer", nvtx_on):
                 stage_ptr[0] = "optimizer"
                 opt.step()
 
         if cfg.mode != "forward":
-            with _range(cfg, "zero_grad", nvtx_on):
+            with _phase(cfg, "zero_grad", nvtx_on):
                 model.zero_grad(set_to_none=True)
 
     return step
