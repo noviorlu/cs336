@@ -165,3 +165,8 @@ cython_debug/
 
 checkpoints/
 wandb/
+# Nsight Systems 产物（二进制大文件，不进 git）
+*.nsys-rep
+*.sqlite
+*.qdstrm
+hw2/profiles/
