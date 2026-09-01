@@ -149,3 +149,118 @@ xl 的完整训练步 OOM，退而用推理前向（**模式不同，不与前�
   `timeit.default_timer()` 计时；**Deliverable c 的每个配置跑在独立进程里**
 - 显存口径：`reset_peak_memory_stats()` 在 warmup 之后，只统计测量段；每步 `zero_grad(set_to_none=True)`
 - 采集日期：2026-08-30
+
+---
+
+## 2.2 Nsight Systems Profiling
+
+选了 **small + medium** 两个 size，seq_len 取 **256 / 512 / 1024**。
+handout 要求「三个大于 128 的 2 的幂，最大那档取显存装得下的最长」——
+`large` 在 5090 上只跑得到 512（1024 就 OOM），凑不齐三档；
+而 small/medium 的 **1024 正好是各自上限**，2048 两者都 OOM。
+
+采集用轻量档 `--trace=cuda,nvtx`，warmup 5 / measure 5，每档一份完整训练步的 profile。
+
+### (a) 前向总耗时，和 timeit 对得上吗
+
+**两个数必须当天一起测。** 第一版我拿今天的 nsys 数去比 §2.1 几天前发表的 timeit 数，
+得到「有正有负、落进噪声」的结论——错的。同一配置隔几天重测会漂 3% 左右
+（`small@512` 当时 17.18 ms，重测 16.66 ms），这个漂移把系统性的 profiler 开销盖住了。
+重新当天同机测一遍：
+
+| Size | Seq | nsys `forward` range | `timeit`（无 profiler） | 绝对差 | 相对差 |
+|:-----|----:|---------------------:|------------------------:|-------:|-------:|
+| small  |  256 |  10.17 ms |   9.44 ± 0.32 ms | +0.73 ms | **+7.7%** |
+| small  |  512 |  17.50 ms |  16.66 ± 0.33 ms | +0.84 ms | **+5.0%** |
+| small  | 1024 |  52.50 ms |  51.30 ± 0.70 ms | +1.20 ms | **+2.3%** |
+| medium |  256 |  24.68 ms |  23.37 ± 0.38 ms | +1.31 ms | **+5.6%** |
+| medium |  512 |  49.76 ms |  47.67 ± 0.64 ms | +2.09 ms | **+4.4%** |
+| medium | 1024 | 150.78 ms | 146.52 ± 2.18 ms | +4.26 ms | **+2.9%** |
+
+**对得上，而且 nsys 一致偏高 2.3%–7.7%。** 六档符号全为正，这才是 profiler 开销该有的样子。
+
+**相对开销随负载变大而缩小**（7.7% → 2.9%）。nsys 的拦截成本主要花在 CPU 侧——
+每次 CUDA API 调用都要记一笔；而调用次数只跟层数有关（small 12 层 vs medium 24 层），
+跟 seq_len 无关。序列一长，GPU 那边的活变重，同样的拦截成本就被摊薄了。
+
+不过这个"纯按调用次数"的模型解释不了全部：同一个 size 内调用次数不变，
+绝对开销却仍随 seq 增长（medium 是 1.31 / 2.09 / 4.26 ms）。
+差值都在 2σ 以上，不像纯噪声。**成因没查，先记为待解释**，别当结论用。
+
+所以 (a) 的答案不止是"对得上"，还附带一条实用结论：
+**profiler 的相对开销在小配置上最明显**，想量准就别拿最小的那档去做基准。
+
+**但这个"对得上"是有前提的，而且前提差点没成立。** 见下。
+
+### 差点得出前向比反向快 9 倍的结论
+
+第一版的 NVTX range 里**没有加 `synchronize()`**，读出来是这样：
+
+```
+forward    33.7 ms
+backward  299   ms       ← 9 倍？
+```
+
+真值是 **145 : 320，约 1 : 2.2**。
+
+错因是 CUDA 的异步：`model(x)` 只是把 kernel **塞进队列**就返回了，塞完 1244 个花了 33.7 ms
+（约 27 µs/次，是 Python + PyTorch dispatch 的开销）。此时 GPU 才刚开始算。
+CPU 进到 `backward` 之后 GPU 还在啃前向——**前向的 GPU 时间被算进了 backward 的窗口**。
+
+把 `synchronize()` 加进 range 结尾之后：
+
+```
+forward   147.89 ms      真值 144.97  ✓
+backward  292.10 ms
+optimizer  11.22 ms
+zero_grad   0.64 ms
+──────────────────
+合计      451.85 ms
+step      452.82 ms      ← 阶段之和覆盖 99.8%
+```
+
+比值回到 **1.97**。而且「阶段之和 ≈ step」是个免费的自洽校验，以后每份 profile 都能拿它验一遍。
+
+有意思的是**序列化的代价几乎为零**：452.83 vs 453.48 ms，约 0.1%。
+因为 GPU 本来就 93% 满载，插 sync 只是让 CPU 别再往前跑，并没有让 GPU 闲下来。
+
+### 那根长长的 cudaDeviceSynchronize 不是浪费
+
+时间线上 `forward` 的 149 ms 里，有 118 ms 是 CPU 卡在 `cudaDeviceSynchronize`。
+容易误读成「大部分时间在等」。把 GPU 操作按起始时刻分桶就清楚了：
+
+```
+前 30 ms（CPU 还在 launch）:   271 个 GPU op，GPU 忙  29.90 ms
+30 ms 之后（CPU 在 sync）  : 1069 个 GPU op，GPU 忙 121.39 ms
+```
+
+**80% 的 kernel 是在那根 sync 长条期间执行的**，且那段时间 GPU 忙碌率接近 100%。
+
+```
+CUDA API 行(CPU):  ▓▓ launch×1244 ▓▓│░░░░░ cudaDeviceSynchronize 阻塞 ░░░░░│
+CUDA HW  行(GPU):  ███████████████████████████████████████████████████████
+```
+
+**"CPU 在等" 和 "GPU 在忙" 不矛盾——它们是两个处理器。** 这正是异步执行的意义。
+
+反过来才该担心：sync 很短说明 CPU 刚发完 GPU 就算完了，**GPU 在饿肚子**，
+瓶颈在 dispatch，优化方向就变成减少 launch 次数（算子融合、CUDA Graph），
+而不是优化 kernel 本身。我们这里 sync 占 78%，是健康的 GPU-bound。
+
+### 一个手动 NVTX 拿不到的东西
+
+`backward` 的耗时能读（因为 sync 让时间窗口对齐了），但**归因不到它的 kernel**。
+nsys 的 `nvtx_gpu_proj_sum`（把 range 投影到 GPU 时间线）给出：
+
+```
+:forward    Range 150.78 ms   Proj 150.68 ms   6700 个 GPU op
+:backward   Range 296.70 ms   Proj   0.0007 ms     5 个 GPU op   ← ？
+```
+
+原因在时间线上一眼可见：多了一个线程 **`[19088] pt_autograd_0`**，
+反向的 kernel 全是它发起的。而 **NVTX range 是 per-thread 的**——
+我们在主线程 push 的 `backward`，覆盖不到另一个线程的 launch。
+
+所以**手动包住 `loss.backward()` 永远拿不到它的 kernel 归因**，这跟 range 放在哪无关。
+要按算子看反向，得让 PyTorch 自己往引擎里插：`--pytorch=autograd-shapes-nvtx`。
+
