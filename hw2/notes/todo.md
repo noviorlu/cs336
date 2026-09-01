@@ -366,15 +366,13 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
   - **现状（2026-08-31）**：装了官方 **`nsight-systems-2025.3.2`**，
     在 `/opt/nvidia/nsight-systems/2025.3.2/bin/{nsys,nsys-ui}`，**自带 GUI**
     （旧的 `/usr/bin/nsys-ui` 是 2022 版，打不开新版报告，格式不向前兼容）
-  - ⚠️ **`/usr/bin/nsys` 仍指向旧的 2022.4.2**（老 apt 包 `nsight-systems` 还占着）。
-    待办：
+  - ✅ **已卸掉老 apt 包并链到 `/usr/local/bin`**（2026-08-31）：
     ```sh
-    sudo apt -s remove nsight-systems nsight-systems-target   # 先模拟，确认不带走别的
-    sudo apt remove  nsight-systems nsight-systems-target
+    sudo apt remove nsight-systems nsight-systems-target
     sudo ln -sf /opt/nvidia/nsight-systems/2025.3.2/bin/nsys    /usr/local/bin/nsys
     sudo ln -sf /opt/nvidia/nsight-systems/2025.3.2/bin/nsys-ui /usr/local/bin/nsys-ui
-    which -a nsys && nsys --version    # 应只剩 2025.3.2
     ```
+    现在 `which -a nsys` 只有一条，CLI/GUI 都是 2025.3.2，`uv run nsys` 也解析到它
   - **历史教训（原方案的坑，已被现实验证）**：之前是软链 conda 的 2025.3.1 到
     `.venv/bin/nsys`。重装时那个软链消失，`uv run nsys` 立刻**静默退回 2022.4.2**——
     不报错，只是又开始吐 `.qdstrm`。改成系统级就没这个问题，上 Modal 做镜像也有据可抄
@@ -560,6 +558,18 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
         **直接退出**（不是警告）→ 每次都带 `--force-export=true`
       - ⚠️ 旧版 nsys 不认 `--force-overwrite`，报 `option is ambiguous`——看到这个说明
         PATH 又退回 2022 版了（见 §0 Action 5）
+      - ⚠️ **`--filter-nvtx` 的语法是 `<range>[@<domain>][/<index>]`，range 属于某个
+        domain 时 domain 必填**。`nvtx_sum` 的显示格式是 `域:范围`（如
+        `PyTorch:torch.autograd.backward`），**照抄这个格式过滤不到任何东西**，
+        要反过来写成 `torch.autograd.backward@PyTorch`。踩过，静默返回空表不报错
+      - 💡 **`--pytorch=functions-trace,autograd-shapes-nvtx` 白送很多**：自动给每个
+        aten 算子插 NVTX 并带张量形状，还有 `Optimizer.step#AdamW.step`、
+        `torch.autograd.backward`、模块 `__call__`——(b)(c)(d) 可以直接取数。
+        但注意：① 这些 range 的时长是 **CPU 侧 push/pop**，不是 GPU kernel 时间
+        （要 GPU 时间得用 `cuda_gpu_kern_sum` 按 range 过滤）；
+        ② 部分 range 名带**每次都变的 `op_id = NNNN` 后缀**，精确匹配过滤不上
+        → **(e) 要用的 attention 内部三段仍必须自己插稳定命名的 range**；
+        ③ `functions-trace` 开销不小，**(a) 问"和 §2.1 的数对不对得上"时要算上这层观测开销**
       - **2026-08-30 已用一个 4 层 TransformerLM + annotated attention 预跑过，四步全绿**
         （patch 被调用 20 次 = 4 层 ×(2 warmup + 3 step)，同时确认改名 `model.py` 后
         猴补丁确实生效）。正式做这题时把这四步并进实现，不另留脚本
