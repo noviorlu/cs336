@@ -15,6 +15,7 @@ from typing import Any, Callable, Tuple
 
 import pandas as pd
 import torch
+import torch.cuda.nvtx as nvtx
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
@@ -28,9 +29,6 @@ MODEL_SIZES = {
     "10B":    {"d_model": 4608, "d_ff": 12288, "num_layers": 50, "num_heads": 36},
 }
 
-# ==========================================
-# 扫表配置区 (Sweep Configurations)
-# ==========================================
 SWEEP_CONFIGS = {
     "default": {
         "model_type": ["basics"],
@@ -40,7 +38,6 @@ SWEEP_CONFIGS = {
         "vocab_size": [10000],
         "warmup": [5],
         "steps": [10],
-        # inference=True 只允许配 forward（no_grad 下 backward 无图可回）
         "mode_and_inference": [
             ("forward", True),
             ("forward", False),
@@ -48,9 +45,6 @@ SWEEP_CONFIGS = {
             ("full", False),
         ],
     },
-    # ⚠️ 预热实验必须配 --isolate。不预热的开销大半是**进程级**一次性成本，
-    #    同进程连跑会让后面的配置白捡前面的预热：实测同一组 warmup=0，
-    #    独立进程下 small 是 6.85×，同进程里排第 3 位就变成 1.00×——结论相反且不报错。
     "warmup_by_size": {
         "model_type": ["basics"],
         "size": ["small", "medium", "large"],
@@ -61,7 +55,6 @@ SWEEP_CONFIGS = {
         "steps": [10],
         "mode_and_inference": [("full", False)],
     },
-    # xl 的完整训练步 OOM，只能用推理前向；模式不同，不与上面横向比
     "warmup_xl": {
         "model_type": ["basics"],
         "size": ["xl"],
@@ -87,6 +80,7 @@ class BenchConfig:
     seq_len: int
     vocab_size: int
     device: str
+    nvtx: bool = False          # 插 NVTX range（供 nsys profile 用），默认关
 
     def __post_init__(self):
         # no_grad 下不建反向图，backward 会报 "does not require grad"。
@@ -122,8 +116,6 @@ class BenchResult:
     times_ms: list[float] = field(default_factory=list)
 
 
-# ---------- 设备工具：CPU 上这些 CUDA 调用会直接崩，统一包一层 ----------
-
 def _sync(cfg: BenchConfig) -> None:
     if cfg.is_cuda:
         torch.cuda.synchronize()
@@ -132,6 +124,23 @@ def _sync(cfg: BenchConfig) -> None:
 def _reset_peak(cfg: BenchConfig) -> None:
     if cfg.is_cuda:
         torch.cuda.reset_peak_memory_stats()
+
+
+def _range(cfg: BenchConfig, name: str, gate: list | None = None):
+    """NVTX range；`--nvtx` 关闭时退化成 nullcontext，零成本。
+
+    为什么要能关：§2.1 的计时结果已经发表，而 §2.2(a) 要拿 nsys 的前向时间
+    和它对账。无条件插 NVTX 等于悄悄改了基准线，(a) 就无从比起了。
+
+    `gate`：一个单元素列表做的开关，用来**在预热期间彻底不发 range**。
+    必须如此的原因：`nsys stats --filter-nvtx` 默认只取该 range 的**第一个实例**。
+    只把预热循环包进 "warmup" 是不够的——预热步内部照样会发 "forward"，
+    于是 `--filter-nvtx=forward` 抓到的是被冷启动污染的那一步。
+    实测症状：top kernel 的 Max 是 Med 的 9 倍（562us vs 61us）。
+    """
+    if cfg.nvtx and cfg.is_cuda and (gate is None or gate[0]):
+        return nvtx.range(name)
+    return contextlib.nullcontext()
 
 
 def _peak_gb(cfg: BenchConfig) -> float:
@@ -172,26 +181,36 @@ def make_step_fn(
     batch: Tuple[torch.Tensor, torch.Tensor],
     cfg: BenchConfig,
     stage_ptr: list,
+    nvtx_on: list | None = None,
 ) -> Callable[[], None]:
     x, y = batch
 
     def step():
-        stage_ptr[0] = "forward"
-        ctx = torch.no_grad() if cfg.inference else contextlib.nullcontext()
-        with ctx:
-            logits = model(x)
-            loss = cross_entropy(logits, y)
+        # NVTX range 和 stage_ptr 标在同一批边界上，但用途不同、不要合并：
+        # stage_ptr 管 OOM 归因，必须始终开着；NVTX 管 profiling，要能关。
+        # ⚠️ 这几个 range 里没有 synchronize，所以它们的 CPU 时长是"把 kernel
+        #    排完队"的时间，不是 GPU 算完的时间。§2.2(a) 要 GPU 侧耗时的话，
+        #    得用 `nsys stats --report cuda_gpu_kern_sum --filter-nvtx=forward`。
+        with _range(cfg, "forward", nvtx_on):
+            stage_ptr[0] = "forward"
+            ctx = torch.no_grad() if cfg.inference else contextlib.nullcontext()
+            with ctx:
+                logits = model(x)
+                loss = cross_entropy(logits, y)
 
         if cfg.mode in ("fwd_bwd", "full"):
-            stage_ptr[0] = "backward"
-            loss.backward()
+            with _range(cfg, "backward", nvtx_on):
+                stage_ptr[0] = "backward"
+                loss.backward()
 
         if cfg.mode == "full":
-            stage_ptr[0] = "optimizer"
-            opt.step()
+            with _range(cfg, "optimizer", nvtx_on):
+                stage_ptr[0] = "optimizer"
+                opt.step()
 
         if cfg.mode != "forward":
-            model.zero_grad(set_to_none=True)
+            with _range(cfg, "zero_grad", nvtx_on):
+                model.zero_grad(set_to_none=True)
 
     return step
 
@@ -216,19 +235,27 @@ def benchmark(cfg: BenchConfig) -> BenchResult:
         model = build_model(cfg)
         batch = build_batch(cfg)
         opt = AdamW(model.parameters(), lr=1e-4)
-        step_fn = make_step_fn(model, opt, batch, cfg, stage_ptr)
+        nvtx_on = [False]          # 预热期间不发阶段 range，见 _range 的说明
+        step_fn = make_step_fn(model, opt, batch, cfg, stage_ptr, nvtx_on)
 
-        for _ in range(cfg.warmup):
-            step_fn()
-            _sync(cfg)
+        # 预热单独包一个 range：`--filter-nvtx` 默认只取该 range 的**第一个实例**，
+        # 若预热步也叫 "step"，(b) 抓到的就是被冷启动污染的那一步。
+        with _range(cfg, "warmup"):
+            for _ in range(cfg.warmup):
+                step_fn()
+                _sync(cfg)
 
         _reset_peak(cfg)
+        nvtx_on[0] = True          # 预热结束，从这里开始才发阶段 range
 
         times = []
         for _ in range(cfg.steps):
             start = timeit.default_timer()
-            step_fn()
-            _sync(cfg)
+            # sync 放在 range **内部**：这样 "step" 的时长才等于 timeit 量到的墙钟，
+            # (a) 拿它和 §2.1 对账才是同一个量。
+            with _range(cfg, "step"):
+                step_fn()
+                _sync(cfg)
             times.append((timeit.default_timer() - start) * 1000)
 
         peak_mem = _peak_gb(cfg)
@@ -305,6 +332,8 @@ def _cfg_to_argv(cfg: BenchConfig) -> list[str]:
     ]
     if cfg.inference:
         argv.append("--inference")
+    if cfg.nvtx:
+        argv.append("--nvtx")
     return argv
 
 
@@ -387,6 +416,9 @@ def main():
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--vocab-size", type=int, default=10000)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--nvtx", action="store_true",
+                        help="插 NVTX range（warmup/step/forward/backward/optimizer），供 nsys profile 用。"
+                             "默认关，以免改变 §2.1 的计时基准线")
 
     parser.add_argument("--sweep", action="store_true", help="Enable sweep mode")
     parser.add_argument("--isolate", action="store_true",
@@ -406,6 +438,7 @@ def main():
         cfg = BenchConfig(
             args.model, args.size, args.mode, args.inference,
             args.warmup, args.steps, args.batch_size, args.seq_len, args.vocab_size, args.device,
+            args.nvtx,
         )
         sweep([cfg], args.out)
 
