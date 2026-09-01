@@ -360,24 +360,32 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
   cs336-basics = { path = "../hw1", editable = true }
   ```
 
-- [x] **Action 5**: 配置 `nsys` (Nsight Systems CLI)。**别用 apt 装**——Ubuntu 源里只有 `2022.4.2`，
-  比 Blackwell(sm_120) 早三年，在 5090 上会**静默失败**（能跑、能认出 5090，但收尾报
-  `Importer error status`，只吐 `.qdstrm`、生不成 `.nsys-rep`）。
-  - **做法**：软链 conda 里自带的 2025.3.1 到 hw2 的 venv，不污染全局：
+- [x] **Action 5**: `nsys` (Nsight Systems CLI + GUI)。**别用 apt 源里的**——Ubuntu 只有
+  `2022.4.2`，比 Blackwell(sm_120) 早三年，在 5090 上会**静默失败**（能跑、能认出 5090，
+  但收尾报 `Importer error status`，只吐 `.qdstrm`、生不成 `.nsys-rep`）。
+  - **现状（2026-08-31）**：装了官方 **`nsight-systems-2025.3.2`**，
+    在 `/opt/nvidia/nsight-systems/2025.3.2/bin/{nsys,nsys-ui}`，**自带 GUI**
+    （旧的 `/usr/bin/nsys-ui` 是 2022 版，打不开新版报告，格式不向前兼容）
+  - ⚠️ **`/usr/bin/nsys` 仍指向旧的 2022.4.2**（老 apt 包 `nsight-systems` 还占着）。
+    待办：
     ```sh
-    ln -sf /home/yc/miniconda3/envs/diff/nsight-compute-2025.3.1/host/target-linux-x64/nsys \
-           /home/yc/projects/LLM/hw2/.venv/bin/nsys
+    sudo apt -s remove nsight-systems nsight-systems-target   # 先模拟，确认不带走别的
+    sudo apt remove  nsight-systems nsight-systems-target
+    sudo ln -sf /opt/nvidia/nsight-systems/2025.3.2/bin/nsys    /usr/local/bin/nsys
+    sudo ln -sf /opt/nvidia/nsight-systems/2025.3.2/bin/nsys-ui /usr/local/bin/nsys-ui
+    which -a nsys && nsys --version    # 应只剩 2025.3.2
     ```
-  - **§0 的完成判据就这一行**（能不能调用到正确的二进制）：
-    ```sh
-    uv run which nsys && uv run nsys --version   # 要 .venv/bin/nsys + 2025.3.1
-    ```
-  - ⚠️ **这个方案会静默退化**：`uv run` 把 `.venv/bin` 排在 `PATH` 最前，软链在就用新版；
-    **软链一旦消失**（uv 重建 venv、`diff` 那个 conda 环境被删/改名），`nsys` 会
-    **悄悄退回 `/usr/bin/nsys` 那个坏版本**，不报错。而且 `.venv` 是 gitignore 的，
-    **换机器 / 上 Modal 都带不过去** → 镜像里得另装，见 §B.3 的 ⏸ 清单
-  - **能不能产出报告是另一回事，归 §2.2 验**（那几步需要一个带 NVTX 的脚本，
-    而那本来就是 §2.2 的交付物）。2026-08-30 已预跑通，结论记在 §2.2
+  - **历史教训（原方案的坑，已被现实验证）**：之前是软链 conda 的 2025.3.1 到
+    `.venv/bin/nsys`。重装时那个软链消失，`uv run nsys` 立刻**静默退回 2022.4.2**——
+    不报错，只是又开始吐 `.qdstrm`。改成系统级就没这个问题，上 Modal 做镜像也有据可抄
+  - **GPU 计数器权限**（`--gpu-metrics-devices`）：需要
+    `/etc/modprobe.d/nvidia-profiler.conf` 写 `options nvidia NVreg_RestrictProfilingToAdminUsers=0`
+    再重启。⚠️ **验证方式和常见说法不同**：本机是**开源内核模块**
+    （595.84 "UNIX Open Kernel Module"），`/sys/module/nvidia/parameters/` **根本不存在**，
+    要看 `/proc/driver/nvidia/params` 里的 **`RmProfilingAdminOnly: 0`**。
+    配好后 PDF §2.1.4 那条完整命令（`--trace=... --pytorch=... --cudabacktrace=all
+    --python-backtrace=cuda --gpu-metrics-devices=0`）可原样跑通，实测有效
+  - **能不能产出报告归 §2.2 验**（那几步需要带 NVTX 的脚本，本来就是 §2.2 的交付物）
 - [x] **Action 6**: 跑一次空转的 `uv run pytest tests/`，验证依赖全部贯通（此时 `adapters.py` 里的 8 个 hook 还是 NotImplementedError，必然报错，但只要不是 import 报错就说明环境通了）。
 
 ### Tips
