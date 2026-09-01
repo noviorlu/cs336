@@ -127,17 +127,6 @@ def _reset_peak(cfg: BenchConfig) -> None:
 
 
 def _range(cfg: BenchConfig, name: str, gate: list | None = None):
-    """NVTX range；`--nvtx` 关闭时退化成 nullcontext，零成本。
-
-    为什么要能关：§2.1 的计时结果已经发表，而 §2.2(a) 要拿 nsys 的前向时间
-    和它对账。无条件插 NVTX 等于悄悄改了基准线，(a) 就无从比起了。
-
-    `gate`：一个单元素列表做的开关，用来**在预热期间彻底不发 range**。
-    必须如此的原因：`nsys stats --filter-nvtx` 默认只取该 range 的**第一个实例**。
-    只把预热循环包进 "warmup" 是不够的——预热步内部照样会发 "forward"，
-    于是 `--filter-nvtx=forward` 抓到的是被冷启动污染的那一步。
-    实测症状：top kernel 的 Max 是 Med 的 9 倍（562us vs 61us）。
-    """
     if cfg.nvtx and cfg.is_cuda and (gate is None or gate[0]):
         return nvtx.range(name)
     return contextlib.nullcontext()
@@ -186,11 +175,6 @@ def make_step_fn(
     x, y = batch
 
     def step():
-        # NVTX range 和 stage_ptr 标在同一批边界上，但用途不同、不要合并：
-        # stage_ptr 管 OOM 归因，必须始终开着；NVTX 管 profiling，要能关。
-        # ⚠️ 这几个 range 里没有 synchronize，所以它们的 CPU 时长是"把 kernel
-        #    排完队"的时间，不是 GPU 算完的时间。§2.2(a) 要 GPU 侧耗时的话，
-        #    得用 `nsys stats --report cuda_gpu_kern_sum --filter-nvtx=forward`。
         with _range(cfg, "forward", nvtx_on):
             stage_ptr[0] = "forward"
             ctx = torch.no_grad() if cfg.inference else contextlib.nullcontext()
@@ -235,7 +219,7 @@ def benchmark(cfg: BenchConfig) -> BenchResult:
         model = build_model(cfg)
         batch = build_batch(cfg)
         opt = AdamW(model.parameters(), lr=1e-4)
-        nvtx_on = [False]          # 预热期间不发阶段 range，见 _range 的说明
+        nvtx_on = [False]          # 预热期间不发阶段 range
         step_fn = make_step_fn(model, opt, batch, cfg, stage_ptr, nvtx_on)
 
         # 预热单独包一个 range：`--filter-nvtx` 默认只取该 range 的**第一个实例**，
@@ -246,13 +230,12 @@ def benchmark(cfg: BenchConfig) -> BenchResult:
                 _sync(cfg)
 
         _reset_peak(cfg)
-        nvtx_on[0] = True          # 预热结束，从这里开始才发阶段 range
+        nvtx_on[0] = True
 
         times = []
         for _ in range(cfg.steps):
             start = timeit.default_timer()
-            # sync 放在 range **内部**：这样 "step" 的时长才等于 timeit 量到的墙钟，
-            # (a) 拿它和 §2.1 对账才是同一个量。
+            # sync 放在 range **内部**：这样 "step" 的时长才等于 timeit 量到的墙钟
             with _range(cfg, "step"):
                 step_fn()
                 _sync(cfg)
@@ -276,23 +259,17 @@ def benchmark(cfg: BenchConfig) -> BenchResult:
         )
 
     except RuntimeError as e:
-        peak = _peak_gb(cfg)                  # 爆之前用到了多少，§2.5 要这个数
+        peak = _peak_gb(cfg)
         if "out of memory" in str(e).lower():
             return _oom_result(cfg, stage_ptr[0], peak, "OOM")
-        # 非 OOM 的异常：记下来但不要中断整个 sweep（一跑几十分钟，不值当全丢）
         print(f"\n!! 非 OOM 异常 @ stage={stage_ptr[0]}: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return _oom_result(cfg, stage_ptr[0], peak, "ERROR")
 
     finally:
-        # 顺序很重要：empty_cache() 只能回收"已经没人引用"的块。
-        # 这些还是活着的局部变量，不 del 掉的话这句等于空转（原版就是这个 bug）。
         del step_fn, opt, batch, model
         if cfg.is_cuda:
             torch.cuda.empty_cache()
-        # 注意：OOM 分支走到这里时异常还在处理中，抛出点的栈帧仍钉着张量，
-        # 这一次 empty_cache() 收不干净。真正的兜底在 sweep() 里——函数返回后再收一次。
-
 
 def _footnote(cfgs: list[BenchConfig]) -> str:
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -311,15 +288,6 @@ def _footnote(cfgs: list[BenchConfig]) -> str:
         f"- 测法：warmup {warmups} 步 / measure {steps} 步，每步 `torch.cuda.synchronize()`，"
         f"计时用 `timeit.default_timer()`\n"
         f"- 采集日期：{date.today().isoformat()}\n\n"
-        "**读表须知**\n\n"
-        "- `inference=True` 表示前向包在 `torch.no_grad()` 里（不建反向图）；"
-        "`False` 则保留 autograd 图，是训练步的前向。**两者不是同一个量，别混着相减。**\n"
-        "- 反向和优化器耗时是**减出来的**，不是直接测的："
-        "`Backward = fwd_bwd − forward(inference=False)`，`Optimizer = full − fwd_bwd`。"
-        "这隐含可加性假设；当两个被减数接近时，差值会落进噪声（可能为负）。\n"
-        "- `peak_mem_gb` 只统计**测量段**（warmup 之后已 `reset_peak_memory_stats()`），"
-        "且每步 `zero_grad(set_to_none=True)`——这两个设置都会影响峰值。\n"
-        "- `first_ms` / `rest_avg_ms` 是第 1 步与第 2 步起的均值，用来看预热是否收敛。\n"
     )
 
 
@@ -338,13 +306,6 @@ def _cfg_to_argv(cfg: BenchConfig) -> list[str]:
 
 
 def _run_isolated(cfg: BenchConfig) -> BenchResult:
-    """在独立子进程里跑一个配置。
-
-    为什么需要：CUDA context 创建、kernel 懒加载、显存池首次扩张都是**进程级**的
-    一次性开销。同一进程里连着扫表，第一个配置付完账，后面的全白捡——测"第一步有多贵"
-    这类实验会直接得出相反结论（实测 small 的 warmup=0 惩罚：独立进程 6.85×，
-    同进程排第 3 位 1.00×），而且不报任何错。
-    """
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "r.md")
         proc = subprocess.run(
@@ -371,8 +332,6 @@ def sweep(cfgs: list[BenchConfig], out_path: str | None = None, isolate: bool = 
             f"{' [isolated]' if isolate else ''}..."
         )
         results.append(_run_isolated(c) if isolate else benchmark(c))
-        # benchmark() 已经返回 → OOM 分支的异常帧此时才真正释放，这里再收一次。
-        # 不收的话下一档会继承上一档的碎片，"哪一格 OOM" 就变得依赖运行顺序。
         if c.is_cuda:
             torch.cuda.empty_cache()
 
