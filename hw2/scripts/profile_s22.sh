@@ -7,11 +7,17 @@
 # 最大那档取显存装得下的最长"。large 只跑得到 512 凑不齐三档，所以选 small+medium，
 # 三档 256/512/1024——1024 正是两者各自的上限（2048 都 OOM）。
 #
-# 每个配置采两份：
-#   full   —— 完整训练步，(a)(b)(c) 从它的 forward range 取数，(d) 的训练侧也是它
-#   infer  —— --mode forward --inference，(d) 的推理基准
-# PDF 的 (d) 原文是 "compared to doing inference (forward pass only)"，
-# 所以基准必须是 no_grad 的推理，不是训练步里的前向。
+# 每档只采一份 full（完整训练步）就够，四问都能答：
+#   (a)(c)  → --filter-nvtx="forward"
+#   (b)     → forward 和 step 两个 range 对比
+#   (d)     → 同一份里 forward vs step 的 matmul 占比
+#
+# PDF 的 (d) 原文是 "compared to doing inference (forward pass only)"，看似需要
+# 单独采一份 --inference。实测不需要（medium@1024）：
+#   full 的 forward   142.22 ms  1244 次  matmul 53.2%  elementwise 40.1%
+#   infer 的 step     138.77 ms  1244 次  matmul 53.3%  elementwise 40.3%
+# kernel 次数完全相同、占比差 <0.3pp——no_grad 省掉的是 CPU 侧建图记账，
+# 不产生额外 GPU kernel。总时长差的 2.4% 是那点记账开销，不影响占比。
 set -euo pipefail
 
 OUT="${1:-profiles}"
@@ -41,7 +47,6 @@ run() {
 for size in "${SIZES[@]}"; do
   for seq in "${SEQS[@]}"; do
     run "$size" "$seq" full  --mode full
-    run "$size" "$seq" infer --mode forward --inference
   done
 done
 
