@@ -1011,6 +1011,28 @@ Modal 的账号、报价、镜像现在定了也会过期，到时候再一次�
     结论——和真相恰好相反，且数字毫无异常、不报任何错。
     → 凡是测"第一次"的实验，先问"这个进程之前干过什么"；贴 profiling 结果时
     必须写清运行方式，同代码同卡、扫表组织方式不同就能得出相反结论
+  - **NVTX range 结尾不 `synchronize()`，读到的是"CPU 排完队"的时间。** 实测 medium@1024
+    前向 range 只有 33.7 ms（真值 147），而反向 299 ms —— 会得出"前向比反向快 9 倍"的
+    荒谬结论（真值 1:2.2）。加 sync 后阶段之和覆盖 step 的 99.8%，可作自洽校验；
+    序列化代价仅 0.1%（GPU 本就 93% 满载）
+  - **`nsys stats --filter-nvtx` 是按*墙钟窗口重叠*过滤的，不是按"谁发起"。** 异步之下
+    窗口里跑的不是本阶段的 kernel。只有内部带 sync 的 range（我们的 `step`、加 sync 后的
+    阶段 range）才可用。按发起者归因要用 `nvtx_gpu_proj_sum`
+  - **手动 NVTX 包住 `loss.backward()` 永远拿不到它的 kernel 归因。** 反向的 kernel 由
+    autograd 工作线程（时间线上的 `pt_autograd_0`）发起，而 NVTX range 是 per-thread 的。
+    实测 `nvtx_gpu_proj_sum` 给 backward 只归到 5 个 GPU op（前向 6700 个）。
+    与 range 放在哪无关，要 `--pytorch=autograd-shapes-nvtx`
+  - **⭐ `nsys stats` 默认输出会把过长的 kernel 名截断成 `…`，不同 kernel 会塌成同一行。**
+    某份 forward 表 25 行被截断，5 个不同的 `at::native::elementwise_kernel<...>`
+    （9.40/9.13/8.77/2.52/1.89 ms）前缀完全相同 → 按名字聚合时被合并成一行 31.72 ms，
+    直接让 (b) 的冠军判定反转。加 `:mangled` **也会截**，**只有 `--format csv` 不截断**
+  - **`--filter-nvtx` 的语法是 `range@domain`**，而 `nvtx_sum` 的显示格式是 `domain:range`。
+    照抄显示格式过滤会**静默返回空表**，不报错
+  - **只把 warmup 循环包进 `warmup` range 不够**：预热步内部照样发 `forward` range，而
+    `--filter-nvtx` 默认取**第一个实例** → 抓到的是冷启动那一步。症状是 top kernel 的
+    Max 是 Med 的 9 倍。要用开关在预热期间彻底不发阶段 range
+  - **profiler 的数和基准必须当天同机测。** 同配置隔几天重测会漂约 3%（`small@512`
+    17.18 → 16.66 ms），足以盖住 nsys 那 2.3%–7.7% 的系统性开销，让人误判成"落进噪声"
   - **`finally: torch.cuda.empty_cache()` 可能是句空转。** `finally` 在函数返回
     **之前**执行，那时 `model/opt/batch` 还是活着的局部变量，而 `empty_cache()`
     只回收"已经没人引用"的块 → 什么也没释放。要先 `del` 再收；OOM 路径还得等
