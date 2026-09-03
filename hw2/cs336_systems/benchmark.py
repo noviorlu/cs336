@@ -17,8 +17,13 @@ import pandas as pd
 import torch
 import torch.cuda.nvtx as nvtx
 
+import math
+
+from einops import einsum
+
+import cs336_basics.model as basics_model
 from cs336_basics.model import BasicsTransformerLM
-from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.nn_utils import cross_entropy, softmax
 from cs336_basics.optimizer import AdamW
 
 MODEL_SIZES = {
@@ -81,11 +86,14 @@ class BenchConfig:
     vocab_size: int
     device: str
     nvtx: bool = False          # 插 NVTX range（供 nsys profile 用），默认关
+    nvtx_attn: bool = False     # 再往 attention 内部插三段 range（§2.2 (e)），需 --nvtx
 
     def __post_init__(self):
         # no_grad 下不建反向图，backward 会报 "does not require grad"。
         # 早失败，别等跑到一半才崩（且那个 RuntimeError 不含 "out of memory"，
         # 会穿透 OOM 分支把整个 sweep 带走）。
+        if self.nvtx_attn and not self.nvtx:
+            raise ValueError("--nvtx-attn 需要同时开 --nvtx")
         if self.inference and self.mode != "forward":
             raise ValueError(
                 f"--inference 只能配 --mode forward，当前 mode={self.mode}。"
@@ -148,7 +156,7 @@ def _phase(cfg: BenchConfig, name: str, gate: list | None = None):
     代价：掐断 CPU/GPU 流水重叠，Σ(各阶段) > 不开 nvtx 时的总步长。
     这些 range 只在 `--nvtx` 打开时存在，§2.1 的计时基准不受影响。
     """
-    if not (cfg.nvtx and cfg.is_cuda and (gate is None or gate[0])):
+    if cfg is None or not (cfg.nvtx and cfg.is_cuda and (gate is None or gate[0])):
         yield
         return
     with nvtx.range(name):
@@ -160,6 +168,45 @@ def _peak_gb(cfg: BenchConfig) -> float:
     if not cfg.is_cuda:
         return 0.0
     return torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+
+# ---- §2.2 (e)：attention 内部的三段 range ----------------------------------
+# 这两个 list 是 annotated_sdpa 与 benchmark() 之间的活引用：cfg 决定开不开，
+# gate 决定"现在是不是测量期"（预热期必须闭嘴，否则 --filter-nvtx 抓到冷启动那步）。
+_ATTN_CFG: list = [None]
+_ATTN_GATE: list = [False]
+
+
+def annotated_scaled_dot_product_attention(q, k, v, mask=None):
+    """与 cs336_basics.model.scaled_dot_product_attention 逐行等价，多三段 _phase。
+
+    每段结尾带 synchronize —— (e) 问的是各段各占多久，只有同步过的 range
+    宽度才等于 GPU 耗时；代价是把 attention 内部串行化了，所以默认不开。
+    注意 mask 语义跟着原函数走：masked_fill 屏蔽的是 mask 为 True 的位置。
+    """
+    cfg = _ATTN_CFG[0]
+    d_k = q.shape[-1]
+
+    with _phase(cfg, "attn.scores", _ATTN_GATE):
+        QK = einsum(q, k, "... queries d_k, ... keys d_k -> ... queries keys") / math.sqrt(d_k)
+        if mask is not None:
+            QK = QK.masked_fill(mask, float("-inf"))
+
+    with _phase(cfg, "attn.softmax", _ATTN_GATE):
+        softQK = softmax(QK, dim=-1)
+
+    with _phase(cfg, "attn.matmul", _ATTN_GATE):
+        out = einsum(softQK, v, "... queries keys, ... keys d_v -> ... queries d_v")
+
+    return out
+
+
+def _install_attn_probes(cfg: BenchConfig) -> None:
+    """猴补 model 模块里的自由函数——CausalMultiHeadSelfAttention 按模块全局查它。"""
+    if not (cfg.nvtx_attn and cfg.is_cuda):
+        return
+    _ATTN_CFG[0] = cfg
+    basics_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 
 def build_model(cfg: BenchConfig) -> Any:
@@ -243,7 +290,10 @@ def benchmark(cfg: BenchConfig) -> BenchResult:
         model = build_model(cfg)
         batch = build_batch(cfg)
         opt = AdamW(model.parameters(), lr=1e-4)
-        nvtx_on = [False]          # 预热期间不发阶段 range
+        # 与 attention 内部探针共用同一个 gate：预热期间两层 range 一起闭嘴
+        nvtx_on = _ATTN_GATE
+        nvtx_on[0] = False
+        _install_attn_probes(cfg)
         step_fn = make_step_fn(model, opt, batch, cfg, stage_ptr, nvtx_on)
 
         # 预热单独包一个 range：`--filter-nvtx` 默认只取该 range 的**第一个实例**，
@@ -326,6 +376,8 @@ def _cfg_to_argv(cfg: BenchConfig) -> list[str]:
         argv.append("--inference")
     if cfg.nvtx:
         argv.append("--nvtx")
+    if cfg.nvtx_attn:
+        argv.append("--nvtx-attn")
     return argv
 
 
@@ -402,6 +454,9 @@ def main():
     parser.add_argument("--nvtx", action="store_true",
                         help="插 NVTX range（warmup/step/forward/backward/optimizer），供 nsys profile 用。"
                              "默认关，以免改变 §2.1 的计时基准线")
+    parser.add_argument("--nvtx-attn", action="store_true",
+                        help="§2.2 (e)：在 attention 内部再插 scores/softmax/matmul 三段 range。"
+                             "需配合 --nvtx；会把 attention 串行化，不要拿它的墙钟去对 §2.1")
 
     parser.add_argument("--sweep", action="store_true", help="Enable sweep mode")
     parser.add_argument("--isolate", action="store_true",
@@ -421,7 +476,7 @@ def main():
         cfg = BenchConfig(
             args.model, args.size, args.mode, args.inference,
             args.warmup, args.steps, args.batch_size, args.seq_len, args.vocab_size, args.device,
-            args.nvtx,
+            args.nvtx, args.nvtx_attn,
         )
         sweep([cfg], args.out)
 

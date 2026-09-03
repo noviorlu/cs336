@@ -157,7 +157,27 @@ RoPE、mask、残差加）和归约 kernel（`reduce_kernel`，来自 RMSNorm �
 
 ### (e) attention 内 softmax vs 矩阵乘
 
-TODO —— 需要在 attention 内部插 NVTX range 才能把 kernel 归到「scores / softmax / final matmul」三段。
+softmax 的耗时**与它的 FLOPs 完全不成比例**：它比同在 attention 里的 `softQK·V` 矩阵乘贵 1.2–4.5 倍，
+而占比最大的 `scores` 段（61%）之所以比 FLOPs 相同的 `matmul` 段慢 11.6 倍，也是因为它多带了
+`/√d_k` 和 `masked_fill` 两个对 `[b, h, s, s]` 的全尺寸逐元素读写——三段都卡在带宽而非算力上。
+
+| size | seq | forward ms | scores | softmax | matmul | attention 合计 |
+|---|---|---|---|---|---|---|
+| small | 256 | 11.49 | 3.14 (27%) | 0.92 (8%) | 0.75 (7%) | 4.81 (42%) |
+| small | 512 | 19.66 | 7.99 (41%) | 2.03 (10%) | 1.64 (8%) | 11.66 (59%) |
+| small | 1024 | 54.27 | 29.18 (54%) | 12.72 (23%) | 2.83 (5%) | 44.73 (82%) |
+| medium | 256 | 27.35 | 11.06 (40%) | 1.78 (7%) | 1.69 (6%) | 14.53 (53%) |
+| medium | 512 | 51.44 | 28.38 (55%) | 5.57 (11%) | 3.15 (6%) | 37.10 (72%) |
+| medium | 1024 | 150.77 | 91.88 (61%) | 33.78 (22%) | 7.59 (5%) | 133.25 (88%) |
+
+> 采法：`benchmark.py --nvtx --nvtx-attn` 把 `scaled_dot_product_attention` 换成带三段
+> `_phase` 的等价实现（逐位相同，`max diff = 0.0`），每段结尾 sync，故 range 宽度即 GPU 耗时。
+> 代价是 attention 被串行化，forward 比不插探针时慢约 7%，所以此表只用于**段间比占比**，
+> 不能与 §2.1 的墙钟对账。数值为 5 步均值，`--mode forward`。
+>
+> 只覆盖前向：反向由 autograd 引擎在 `pt_autograd_0` 线程上跑 grad_fn，不会再进这个 Python
+> 函数体，手插的 range 一条都不会触发（120 个 instance = 24 层 × 5 步，正好只有前向一遍）。
+
 
 ---
 
