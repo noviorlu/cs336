@@ -1,0 +1,10 @@
+组件              autocast=fp16   autocast=bf16   
+------------------------------------------------
+参数（autocast 外）  float32         float32         
+参数（autocast 内）  float32         float32         
+fc1 输出          float16         bfloat16        
+ln 输出           float32         float32         
+logits（fc2 输出）  float16         bfloat16        
+loss            float32         float32         
+梯度（.grad）       float32         float32         
+ln 的参数梯度        float32         float32         

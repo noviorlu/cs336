@@ -1,0 +1,36 @@
+
+=== mem_xl_seq128_forward.pickle: 10110 events, baseline 12.82 GiB, peak 12.90 GiB → mem_xl_seq128_forward.png
+        大小    次数  调用点
+    20.0 MiB    64  forward@model.py:27 ← forward@model.py:102 ← forward@model.py:374
+    20.0 MiB   128  forward@model.py:81 ← forward@model.py:102 ← forward@model.py:374
+    20.0 MiB    64  forward@model.py:27 ← forward@model.py:103 ← forward@model.py:374
+    20.0 MiB    64  forward@model.py:104 ← forward@model.py:374 ← forward@model.py:465
+    19.5 MiB     2  forward@model.py:27 ← forward@model.py:468 ← step@runner.py:74
+    19.5 MiB     1  cross_entropy@nn_utils.py:29 ← step@runner.py:75 ← run@runner.py:128
+
+=== mem_xl_seq128_full.pickle: 13407 events, baseline 12.82 GiB, peak 29.35 GiB → mem_xl_seq128_full.png
+        大小    次数  调用点
+   100.0 MiB   192  (无 Python 栈)
+   100.0 MiB    13  step@optimizer.py:52 ← step@runner.py:85 ← run@runner.py:128
+   100.0 MiB    13  step@optimizer.py:53 ← step@runner.py:85 ← run@runner.py:128
+   100.0 MiB    13  step@optimizer.py:74 ← step@runner.py:85 ← run@runner.py:128
+    97.7 MiB     3  (无 Python 栈)
+    97.7 MiB     1  step@optimizer.py:52 ← step@runner.py:85 ← run@runner.py:128
+
+=== mem_xl_seq2048_forward.pickle: 10121 events, baseline 12.82 GiB, peak 21.38 GiB → mem_xl_seq2048_forward.png
+        大小    次数  调用点
+  2048.0 MiB   128  scaled_dot_product_attention@model.py:253 ← forward@model.py:317 ← forward@model.py:372
+  2048.0 MiB    64  scaled_dot_product_attention@model.py:255 ← forward@model.py:317 ← forward@model.py:372
+  2048.0 MiB    64  softmax@nn_utils.py:15 ← scaled_dot_product_attention@model.py:257 ← forward@model.py:317
+  2048.0 MiB    64  softmax@nn_utils.py:18 ← scaled_dot_product_attention@model.py:257 ← forward@model.py:317
+  2048.0 MiB    64  softmax@nn_utils.py:24 ← scaled_dot_product_attention@model.py:257 ← forward@model.py:317
+   320.0 MiB    64  forward@model.py:27 ← forward@model.py:102 ← forward@model.py:374
+
+=== mem_xl_seq2048_full.pickle: 195 events, baseline 12.82 GiB, peak 25.96 GiB → mem_xl_seq2048_full.png
+        大小    次数  调用点
+  2048.0 MiB     4  scaled_dot_product_attention@model.py:253 ← forward@model.py:317 ← forward@model.py:372
+  2048.0 MiB     2  scaled_dot_product_attention@model.py:255 ← forward@model.py:317 ← forward@model.py:372
+  2048.0 MiB     2  softmax@nn_utils.py:15 ← scaled_dot_product_attention@model.py:257 ← forward@model.py:317
+  2048.0 MiB     2  softmax@nn_utils.py:18 ← scaled_dot_product_attention@model.py:257 ← forward@model.py:317
+  2048.0 MiB     1  softmax@nn_utils.py:24 ← scaled_dot_product_attention@model.py:257 ← forward@model.py:317
+   320.0 MiB     1  forward@model.py:27 ← forward@model.py:102 ← forward@model.py:374

@@ -1,0 +1,10 @@
+block5  前向 4.4 ms，aten 算子 341 个，seq 826–990
+  前向分配 288.3 MiB，其中活到 range 结束的（residual）166.3 MiB / 25 个张量
+  top 5 来源：
+        60.0 MiB   36.1%  aten::mul
+        40.0 MiB   24.1%  aten::bmm
+        20.0 MiB   12.0%  aten::empty
+        20.0 MiB   12.0%  aten::sigmoid
+        10.0 MiB    6.0%  aten::add
+  反向窗口 11.1 ms：分配 1203.2，释放 954.4（其中 residual 161.3），净 +248.8 MiB
+  ⇒ 反向新产生的张量（梯度等）≈ 净变化 + 释放的 residual = 410.0 MiB
