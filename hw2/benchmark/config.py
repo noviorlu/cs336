@@ -80,6 +80,21 @@ SWEEP_CONFIGS = {
         "autocast": [False, True],
         "mode_and_inference": [("forward", True), ("full", False)],
     },
+    # §3.2 (b)：扫 checkpoint 段长（每段几层）看 fwd_bwd 的峰值显存和 step 时间。
+    # 题面 xl@2048 batch 4 在 5090 上任何段长都 OOM（参数+梯度 25.4 GiB），large@2048 batch 4 也只有
+    # every ≤ 4 能跑。要让全部段长（含不 checkpoint）都出数，降到 large / batch 1 / seq 1024：
+    # 一层 saved tensors ≈ 0.26 GiB，不 checkpoint 也只有 ~17 GiB。跑前重启 kernel。
+    "checkpoint_large": {
+        "model_type": ["basics"],
+        "size": ["large"],
+        "seq_len": [1024],
+        "batch_size": [1],
+        "vocab_size": [10000],
+        "warmup": [2],
+        "steps": [5],
+        "checkpoint_every": [None, 1, 2, 3, 4, 6, 9, 12, 18, 36],
+        "mode_and_inference": [("fwd_bwd", False)],
+    },
 }
 
 
@@ -101,6 +116,7 @@ class BenchConfig:
     nvtx_attn: bool = False # 再往 attention 内部插三段 range（§2.2 (e)），需 --nvtx
     nvtx_ops: bool = False  # 每层 block range + aten 算子级 range（§2.5 (f) 显存归因），需 --nvtx
     memory_snapshot: str | None = None  # §2.5：测量段的显存快照写到这个 .pickle；None 关
+    checkpoint_every: int | None = None # §3.2 (b)：每 every 层包一个 torch.utils.checkpoint 段；None 关
 
     def __post_init__(self):
         # 早失败，别等跑到一半才崩（且那个 RuntimeError 不含 "out of memory"，
@@ -130,6 +146,8 @@ class BenchConfig:
                 argv.append("--" + flag.replace("_", "-"))
         if self.memory_snapshot:
             argv += ["--memory-snapshot", self.memory_snapshot]
+        if self.checkpoint_every:
+            argv += ["--checkpoint-every", str(self.checkpoint_every)]
         return argv
 
 
@@ -150,6 +168,7 @@ class BenchResult:
     rest_avg_ms: float
     peak_mem_gib: float
     status: str                                     # OK | OOM (stage) | ERROR (stage)
+    checkpoint_every: int | None = None             # §3.2 (b)；旧 json 没有这列，默认 None
     times_ms: list[float] = field(default_factory=list)  # 逐步原始耗时，只进 json 不进表
 
     @classmethod
@@ -157,7 +176,7 @@ class BenchResult:
         return cls(
             model=cfg.model_type, size=cfg.size, seq_len=cfg.seq_len, batch=cfg.batch_size,
             warmup=cfg.warmup, steps=cfg.steps, mode=cfg.mode,
-            inference=cfg.inference, autocast=cfg.autocast,
+            inference=cfg.inference, autocast=cfg.autocast, checkpoint_every=cfg.checkpoint_every,
             avg_ms=float("nan"), std_ms=float("nan"),
             first_ms=float("nan"), rest_avg_ms=float("nan"),
             peak_mem_gib=round(peak_gib, 2),

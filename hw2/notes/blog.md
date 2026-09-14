@@ -5,7 +5,19 @@
 
 ---
 
-## 0 Model Size
+## 0 Background Setups
+
+### 0.0 术语
+
+全文统一用英文术语：
+
+| 术语 | 含义 |
+|:--|:--|
+| **activation** | 前向算出的任何中间张量，不管存不存 |
+| **saved tensors** | 其中 autograd 为反向留下的那部分（PyTorch `saved_tensors_hooks` 看到的就是它们）。handout 和 JAX 叫 **residuals**，本文不用这个词，以免和 residual connection 混 |
+| **entry** | 一段 checkpoint 的输入 x_i（`[b, s, d]`，80 MiB），checkpoint 唯一保留的东西，反向 recompute 的起点 |
+| **recompute** | 反向时用 entry 把一段前向重跑一遍 |
+| **L / k** | L = Transformer 层数；k = checkpoint 段数，每段 L/k 层 |
 
 handout Table 1 的五个 size，`vocab=10000, seq=512, batch=4`，`d_head = d_model / num_heads = 64`（10B 是 128）：
 
@@ -222,11 +234,11 @@ xl@2048 前向最大的分配是 **2 GiB**，全部来自 attention 的 `[4, 32,
 
 #### (f) 单层 TransformerBlock 为反向保存的显存
 
-xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还没释放——这就是为反向保存的 residual，占该层前向分配的 58%。按包着每次分配的最内层 `aten::*` range 归因，前五个来源占 residual 的 90%：`aten::mul` 60 MiB（36%，SwiGLU 的门积和 SiLU 的 `x·σ(x)`，`[4,128,10240]` fp32 各 20 MiB）、`aten::bmm` 40 MiB（24%，attention 的 q/k/v 与 `softmax·V`）、`aten::empty` 20 MiB（12%，`w1(x)`/`w3(x)` 的输出，einsum 先 `empty` 再写入）、`aten::sigmoid` 20 MiB（12%，SiLU 里的 `σ(x)`）、`aten::add` 10 MiB（6%，残差相加）。算子名要读成「malloc 发生时正在跑的算子」而非「张量属于谁」。可以看到大头是 FFN 的 `d_ff` 宽中间量而不是 attention——seq=128 时 `[b,h,s,s]` 分数矩阵只有 8 MiB，§2.5(e) 里 seq=2048 时它才变成 2 GiB 的主角。
+xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还没释放——这就是为反向保存的 saved tensors，占该层前向分配的 58%。按包着每次分配的最内层 `aten::*` range 归因，前五个来源占 saved tensors 的 90%：`aten::mul` 60 MiB（36%，SwiGLU 的门积和 SiLU 的 `x·σ(x)`，`[4,128,10240]` fp32 各 20 MiB）、`aten::bmm` 40 MiB（24%，attention 的 q/k/v 与 `softmax·V`）、`aten::empty` 20 MiB（12%，`w1(x)`/`w3(x)` 的输出，einsum 先 `empty` 再写入）、`aten::sigmoid` 20 MiB（12%，SiLU 里的 `σ(x)`）、`aten::add` 10 MiB（6%，残差相加）。算子名要读成「malloc 发生时正在跑的算子」而非「张量属于谁」。可以看到大头是 FFN 的 `d_ff` 宽中间量而不是 attention——seq=128 时 `[b,h,s,s]` 分数矩阵只有 8 MiB，§2.5(e) 里 seq=2048 时它才变成 2 GiB 的主角。
 
-反向时用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来（反向在 autograd 工作线程上跑，自己插的 range 覆盖不到），这一段窗口内分配 1203 MiB、释放 954 MiB，**净增 249 MiB**；其中释放的 954 MiB 里有 161 MiB 是上面那些 residual。所以反向新产生的张量 = 净增 + 释放的 residual = **410 MiB**。预期值：这一层 104.9M 参数的权重梯度 × 4 B = 400 MiB，加上传给前一层的输入梯度 `[4,128,2560]` × 4 B = 5 MiB，合 405 MiB，误差 1%——符合预期。这也解释了 §2.5(a) 时间线里反向为什么"不下坡"：每层释放 166 MiB、新增 410 MiB，净值必然继续爬。
+反向时用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来（反向在 autograd 工作线程上跑，自己插的 range 覆盖不到），这一段窗口内分配 1203 MiB、释放 954 MiB，**净增 249 MiB**；其中释放的 954 MiB 里有 161 MiB 是上面那些 saved tensors。所以反向新产生的张量 = 净增 + 释放的 saved tensors = **410 MiB**。预期值：这一层 104.9M 参数的权重梯度 × 4 B = 400 MiB，加上传给前一层的输入梯度 `[4,128,2560]` × 4 B = 5 MiB，合 405 MiB，误差 1%——符合预期。这也解释了 §2.5(a) 时间线里反向为什么"不下坡"：每层释放 166 MiB、新增 410 MiB，净值必然继续爬。
 
-| 来源算子 | residual | 占比 | 是什么 |
+| 来源算子 | saved tensors | 占比 | 是什么 |
 |:--|--:|--:|:--|
 | `aten::mul`     | 60 MiB | 36% | SwiGLU 的门积和 SiLU 的 `x·σ(x)`（`[4,128,10240]` 各 20 MiB） |
 | `aten::bmm`     | 40 MiB | 24% | attention 的 q/k/v 与 `softmax·V` 输出 |
@@ -237,9 +249,9 @@ xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 
 > 采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`，`--nvtx-ops` 给每层打 `block{i}` range、`emit_nvtx` 给每个 aten 算子打带 `seq` 编号的 range；归因脚本 `python -m benchmark.memory`。不关 caching allocator 的话 nsys 只看到显存池的增长，看不到单个张量。
 > 关了 caching 后 `cudaFree` 过的地址会被复用，分配和释放要按「之后的第一次 free」配对，直接按地址集合会多算 60 MiB。
 
-![block5 residuals](assets/s2/nsys_block5_memory.png)
+![block5 saved tensorss](assets/s2/nsys_block5_memory.png)
 
-> 图从 nsys 的 sqlite 导出直接画（`CUDA_GPU_MEMORY_USAGE_EVENTS` + `NVTX_EVENTS`，与 GUI 同源）：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配。
+> 图从 nsys 的 sqlite 导出直接画（`CUDA_GPU_MEMORY_USAGE_EVENTS` + `NVTX_EVENTS`，与 GUI 同源）：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配（saved tensors）。
 
 ---
 
@@ -391,7 +403,7 @@ x̂ = x·r 现场重算
 
 ### 3.2 Activation Checkpointing
 
-xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，为反向存的仍有 **3655 MiB**（PDF 3651，多的 4 MiB 是 hw1 显式传入的 mask）。剩下的全是矩阵乘的输入，融合动不了：
+xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，为反向存的仍有 **3655 MiB**（PDF 3651，多 4 MiB 是 hw1 显式传入的 mask）。剩下的全是矩阵乘的输入，融合动不了：
 
 | MiB | 张量 | 占比 |
 |--:|:--|--:|
@@ -402,22 +414,30 @@ xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，�
 
 > shape 和总量是 `saved_tensors_hooks` 实测，MiB 按 shape × 4 B 算，「是什么」按 shape 唯一性反推。
 
-32 层 = 114 GiB，xl@2048 fp32 光激活就装不下。attention 的 2 GiB 靠 §4 FlashAttention，其余靠 checkpointing。
+32 层 = 114 GiB，xl@2048 fp32 光 activation 就装不下。attention 那 2 GiB 靠 §4 FlashAttention，其余靠 checkpointing。
+
+checkpointing 是用计算换显存。x 轴：反向峰值时活着的 saved tensors；y 轴：一步要算几遍前向（xl@2048 batch 4，L = 32）：
+
+![checkpoint tradeoff](assets/s3/checkpoint_tradeoff.png)
+
+- **y = 2× 那一排**：平切成 k 段。每层恰好被重算一次，所以总前向恒为 2×；k 只决定同时物化几层，从 k = 1（114 GiB）到 k = L（6.1 GiB）单调下降——entry 太便宜，没有 U 形。PDF (b) 就是这一排。
+- **往左上**：嵌套 checkpoint。一层的 saved tensors（3.6 GiB，红虚线）是底线，减的只是 entry，计算从 2× 涨到 6×。PDF (a) 的答案在左上角。
+- 实践停在 k = L，或者用选择性重算（只丢 S、P 这类大而便宜的张量，前向 +5%）。要压底线本身靠 §4 FlashAttention。
 
 #### 3.2.1 Recomputation
 
-`checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入，反向到这段时重跑一遍前向造出 residual，用完释放。4 层 xl block 实测：
+`checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入（entry），反向到这段时重跑一遍前向造出 saved tensors，用完释放。4 层 xl block 实测：
 
-| | ① 前向 pack、活到反向（实测） | ② 反向重算一段临时物化（估） | 峰值 ① + ② |
+| | ① 前向留下、活到反向（实测） | ② 反向重算一段临时物化（估） | 峰值 ① + ② |
 |:--|--:|--:|--:|
 | 不 checkpoint | 4 × 3655 = **14621 MiB** | 0 | 14.6 GiB |
-| 每 2 层一个 checkpoint | 2 个入口 × 80 = **160 MiB** | 2 × 3655 = 7310 MiB | 7.5 GiB |
+| 每 2 层一个 checkpoint | 2 个 entry × 80 = **160 MiB** | 2 × 3655 = 7310 MiB | 7.5 GiB |
 
-k 段的峰值 ≈ k × 80 MiB + (L/k) × 3655 MiB，k 的取舍是本节推导题。代价：每段前向算两遍，一步 ≈ 2 fwd + bwd，多约 1/3。
+k 段的峰值 ≈ k × 80 MiB + (L/k) × 3655 MiB。代价：每层前向算两遍，一步 ≈ 2 fwd + bwd，多约 1/3。
 
-画法同 §3.1：实线前向、红虚线反向，挂在算子下的框是它为反向留的东西。**绿色 = 前向 pack、一直占着；红色 = 前向丢掉、反向时重算、用完释放。**
+画法同 §3.1：实线前向、红虚线反向，挂在算子下的框是它为反向留的东西。**绿 = 前向留下、一直占着；红 = 前向丢掉、反向时重算、用完释放。**
 
-**不 checkpoint**：每层各自 pack 3655 MiB（含输入 x_i），一起活到反向。
+**不 checkpoint**：每层各自留 3655 MiB（含输入 x_i），一起活到反向。
 
 ```mermaid
 flowchart LR
@@ -456,7 +476,7 @@ flowchart LR
     linkStyle 12,13,14,15,16,17,18,19 stroke:#c62828,stroke-width:2px
 ```
 
-**每 2 层一个 checkpoint**：只 pack 入口 x0、x2；x1、x3 和两层的 residual 都在框内，反向到这段时重算。
+**每 2 层一个 checkpoint**：只留 entry x0、x2；x1、x3 和两层的 saved tensors 都在框内，反向到这段时重算。
 
 ```mermaid
 flowchart LR
@@ -488,6 +508,144 @@ flowchart LR
     linkStyle 6,7,8,9 stroke:#c62828,stroke-width:2px
 ```
 
-两段不能并行：L2 反向要 `dx2`，它是 L3 反向的输出。前半段的重算只依赖 x0、理论上能提前，但那样两段红色同时活着，峰值回到 14.6 GiB——串行就是省显存的代价。
+两段不能并行：L2 反向要 `dx2`，它是 L3 反向的输出。前半段的重算只依赖 x0、理论上能提前，但那样两段的红色同时活着，峰值回到 14.6 GiB。
+
+#### 3.2.2 Recursive Checkpointing
+
+峰值 = 一层的 saved tensors + 活着的 entry。前者最少 1 层，每层一个 checkpoint 已做到；后者要存 x0…x_{L-1}，O(L)。**entry 也是 activation，也能被 checkpoint 掉**：一段层外面再包一层 `checkpoint`，段内的 entry 就不存，反向到这段时重算。一路对半包到底就是一棵二叉树——节点 = 一次 `checkpoint` 调用、留自己的 entry；叶子 = 层：
+
+```mermaid
+flowchart TD
+    classDef path fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef res fill:#fce4ec,stroke:#c62828,stroke-width:2px
+    classDef node fill:#f5f5f5,stroke:#999
+
+    R["C[L1..L8]<br/>留 x0"]:::path
+    A["C[L1..L4]<br/>留 x0"]:::node
+    B["C[L5..L8]<br/>留 x4"]:::path
+    A1["C[L1 L2]<br/>留 x0"]:::node
+    A2["C[L3 L4]<br/>留 x2"]:::node
+    B1["C[L5 L6]<br/>留 x4"]:::node
+    B2["C[L7 L8]<br/>留 x6"]:::path
+    L1["L1<br/>x0"]:::node
+    L2["L2<br/>x1"]:::node
+    L3["L3<br/>x2"]:::node
+    L4["L4<br/>x3"]:::node
+    L5["L5<br/>x4"]:::node
+    L6["L6<br/>x5"]:::node
+    L7["L7<br/>x6"]:::node
+    L8["L8<br/>x7<br/>saved 3655"]:::res
+
+    R --> A & B
+    A --> A1 & A2
+    B --> B1 & B2
+    A1 --> L1 & L2
+    A2 --> L3 & L4
+    B1 --> L5 & L6
+    B2 --> L7 & L8
+```
+
+反向到 L8 时活着的只有根到它**这条路径**上的：4 个 entry（x0 x4 x6 x7，各属于一个开始了还没做完的 checkpoint）+ L8 的 saved tensors。路径外的灰节点此刻不占显存。同一时刻用 3.2.1 的画法，颜色 = entry 是第几层重算时出现的：
+
+```mermaid
+flowchart LR
+    classDef l1 fill:#e8f5e9,stroke:#2e7d32,color:#2e7d32
+    classDef l2 fill:#e3f2fd,stroke:#1565c0,color:#1565c0
+    classDef l3 fill:#fff3e0,stroke:#e65100,color:#e65100
+    classDef l4 fill:#f3e5f5,stroke:#6a1b9a,color:#6a1b9a
+    classDef res fill:#fce4ec,stroke:#c62828,color:#c62828
+    classDef op fill:#eeeeee,stroke:#555
+    classDef off fill:#fafafa,stroke:#ccc,color:#aaa
+
+    x0>"x0"]:::l1
+    y(["y"]):::op
+    subgraph C1["C[L1..L8]  留 x0"]
+        direction LR
+        A["C[L1..L4]"]:::off
+        x4["x4"]:::l2
+        subgraph C2["C[L5..L8]  留 x4"]
+            direction LR
+            B1["C[L5 L6]"]:::off
+            x6["x6"]:::l3
+            subgraph C3["C[L7 L8]  留 x6"]
+                direction LR
+                L7["C[L7]"]:::off
+                x7["x7"]:::l4
+                subgraph C4["C[L8]  留 x7"]
+                    L8["L8"]:::op
+                end
+                L7 --> x7 --> L8
+            end
+            B1 --> x6 --> L7
+        end
+        A --> x4 --> B1
+    end
+    x0 --> A
+    L8 --> y
+
+    R8["3655 MiB\n第 4 层重算时出现"]:::res
+    L8 --- R8
+
+    y -. "反向到 L8" .-> L8
+    linkStyle 9 stroke:#c62828,stroke-width:2px
+    style C1 fill:#f1f8f1,stroke:#2e7d32
+    style C2 fill:#eaf2fb,stroke:#1565c0
+    style C3 fill:#fff8f0,stroke:#e65100
+    style C4 fill:#f8f0fa,stroke:#6a1b9a
+```
+
+完整顺序（F = 重算前向，B = 反向）。autograd 走到 checkpoint 节点先重跑它的前向再往里走，碰到普通层才 backward。后两列是此刻活着的 saved tensors：entry（80 MiB 一个）和某一层内部的（3655 MiB）：
+
+| 步 | F / B | 做什么（括号 = 前向了几层） | entry x_i：用 → 得 ⇒ 显存里留着的 | one layer's saved tensors（MiB） |
+|--:|:--|:--|:--|--:|
+| 0 | F | 原始前向 L1–L8（8） | x0 → y ⇒ {x0} | 0 |
+| 1 | F | 重算 C[L1..L8]（8） | x0 → x4 ⇒ {x0 x4} | 0 |
+| 2 | F | 重算 C[L5..L8]（4） | x4 → x6 ⇒ {x0 x4 x6} | 0 |
+| 3 | F | 重算 C[L7 L8]（2） | x6 → x7 ⇒ {x0 x4 x6 x7} | 0 |
+| 4 | F | 重算 C[L8]（1） | x7 → L8 saved tensors ⇒ {x0 x4 x6 x7} | **3655**（峰值，上图） |
+| | B | 反向 L8 | → dx7 ⇒ {x0 x4 x6 x7} | 0 |
+| 5 | F | 重算 C[L7]（1） | x6 → L7 saved tensors ⇒ {x0 x4 x6 x7} | 3655 |
+| | B | 反向 L7；C[L7 L8] 完成 | → dx6，−x7 −x6 ⇒ {x0 x4} | 0 |
+| 6–8 | F/B | 同样做完 L6、L5：C[L5 L6]（2）→ C[L6]（1）→ C[L5]（1）；C[L5..L8] 完成 | x4 → x5 → … ⇒ 最多 {x0 x4 x5}，最后 −x5 −x4 ⇒ {x0} | ≤ 3655 |
+| 9–15 | F/B | 左半边同理：C[L1..L4]（4）→ C[L3 L4]（2）→ C[L4]（1）→ C[L3]（1）→ C[L1 L2]（2）→ C[L2]（1）→ C[L1]（1） | x0 → x2 → x3 → … ⇒ 最多 {x0 x2 x3} | ≤ 3655 |
+
+树高 log₂L：任一时刻 entry ≤ log₂L + 1 个、层内 saved tensors 1 层，峰值 **O(log L)**。计算：树的每个深度上所有节点重算一遍加起来正好是整网一遍（8 = 4+4 = 2+2+2+2 = 1×8），log₂L + 1 个深度再加原始前向，共 L × (log₂L + 2)——8 层是 40，**O(L log L)**。对比：不 checkpoint L，平切 2L。
+
+```python
+def ckpt(layers, x):
+    if len(layers) == 1:
+        return layers[0](x)                          # 叶子：普通前向，saved tensors 会留
+    mid = len(layers) // 2
+    left  = lambda x: ckpt(layers[:mid], x)
+    right = lambda x: ckpt(layers[mid:], x)
+    return checkpoint(right, checkpoint(left, x))    # 两个子树各包一个 checkpoint
+```
+
+**(b) 不嵌套**：只能平切 k 段，峰值 = k × entry + (L/k) × 一层 saved tensors。xl@2048 是 k × 80 + (32/k) × 3655 MiB，两项相等要 k ≈ 38 > 32——entry 比一层 saved tensors 小 45 倍，所以切到最细（每层一个）最优，没有中间的平衡点。
+
+题面 xl@2048 batch 4 在 5090 上量不了：参数+梯度 25.4 GiB，任何段长都 OOM。用 large（36 层，参数+梯度 7.2 GiB）测：batch 4 / seq 2048 只有每段 ≤ 4 层能跑（15.4 / 18.9 / 22.5 / 26.1 GiB，每多 1 层 +3.6 GiB），要让全部段长含「不 checkpoint」都出数，降到 batch 1 / seq 1024，fwd_bwd：
+
+![checkpoint sweep](assets/s3/checkpoint_large_sweep.png)
+
+| 每段几层 | 1 | 2 | 3 | 4 | 6 | 9 | 12 | 18 | 36（整网一段） | 不 checkpoint |
+|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 反向时同时物化的层数 | 1 | 2 | 3 | 4 | 6 | 9 | 12 | 18 | 36 | 36（前向就存着） |
+| 反向时重算的前向 | 36 层 | 36 | 36 | 36 | 36 | 36 | 36 | 36 | 36 | **0** |
+| 峰值 GiB | **7.8** | 8.0 | 8.2 | 8.4 | 8.9 | 9.5 | 10.1 | 11.3 | 15.0 | 15.0 |
+| step ms | 302 | 306 | 311 | 311 | 312 | 309 | 312 | 313 | 313 | **236** |
+
+两行标注说明了两条曲线：显存跟「同时物化几层」走，时间跟「重算多少层」走。重算总量不管怎么切都是整网 36 层（每段各重跑一次，加起来一遍），所以时间恒为 4F ≈ 313 ms；不 checkpoint 不重算，3F = 236 ms（§2.1 的反向 ≈ 2× 前向）。整网一段（36）是纯亏：重算了一遍，显存却和不 checkpoint 一样。
+
+显存随每段层数单调上升、无 U 形，**每层一个 checkpoint 最优**（7.8 GiB，比不 checkpoint 省 7.2 = 36 × 0.2 GiB，即全部 saved tensors 只剩 1 层）；相邻档每段 2 层差 0.2 GiB，比 1 更细不存在；整网一段（36）和不 checkpoint 一样大，因为反向时整网重算。step 时间 302–313 ms 与段长无关，比不 checkpoint 的 236 ms 多 28–33%——正是"平切恒为 2× 前向、前向占一步约 1/3"。
+
+L 层、每段 e 层、entry 大小 a、一层 saved tensors 大小 r，峰值 = 全部 L/e 个 entry + 正在重算的 e 层：
+
+$$M(e) = \frac{L}{e}a + e\,r$$
+
+e 越小第二项越小，但 entry 数 L/e 越多。只要 **全部 entry 加起来都不到一层 saved（L·a < r）**，第一项永远压不过第二项，显存随 e 单调、最优 e = 1。这里 36 × 5 MiB = 180 MiB < 220 MiB；xl@2048 是 32 × 80 = 2.5 GiB < 3.6 GiB。Transformer 每层很胖，几乎总是如此；只有层数超过 r/a（这里 ≈ 44）时 e = 1 才会比 e = 2 更费。
+
+**怎么选**：段长永远是 1，真正的旋钮是「包几层」。计算代价 ∝ 包的层数 N，显存节省 ∝ N × 单层 saved，线性可调——按显存缺口取最小的 N，不必全包。顺序：不 checkpoint → FlashAttention / 选择性重算（几乎免费）→ 包 N 层（e = 1）→ 全包（2× 前向）。Megatron 的 `--recompute-method block --recompute-num-layers N` 就是第三步。
+
+> 原始输出 `assets/s3/checkpoint_large_b1_seq1024.md`（含逐步耗时）、`checkpoint_large_b4_seq2048.md`。eager 模式，一层 saved tensors 比 §3.2 开头 compile 后的账多出 RMSNorm、SiLU 的中间量。
 
 > 原始输出 `assets/s3/four_blocks_checkpoint.txt`，实验在 `notes/notes.ipynb` §3.2。

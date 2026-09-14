@@ -17,6 +17,7 @@ from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
 
 from .config import MODEL_SIZES, BenchConfig, BenchResult
+from .checkpointing import apply_checkpointing
 from .memory import record_snapshot
 from .nvtx import Probes
 
@@ -115,6 +116,8 @@ def run(cfg: BenchConfig) -> BenchResult:
         # ---- setup ----
         _reset_peak(cfg)
         model = build_model(cfg)
+        if cfg.checkpoint_every:
+            apply_checkpointing(model, cfg.checkpoint_every)
         batch = build_batch(cfg)
         opt = AdamW(model.parameters(), lr=1e-4)
         probes.install_attention_probes()
@@ -149,7 +152,7 @@ def run(cfg: BenchConfig) -> BenchResult:
         return BenchResult(
             model=cfg.model_type, size=cfg.size, seq_len=cfg.seq_len, batch=cfg.batch_size,
             warmup=cfg.warmup, steps=cfg.steps, mode=cfg.mode,
-            inference=cfg.inference, autocast=cfg.autocast,
+            inference=cfg.inference, autocast=cfg.autocast, checkpoint_every=cfg.checkpoint_every,
             avg_ms=round(t.mean().item(), 2) if cfg.steps > 0 else float("nan"),
             std_ms=round(t.std().item(), 2) if cfg.steps > 1 else 0.0,
             first_ms=round(times[0], 2) if times else float("nan"),

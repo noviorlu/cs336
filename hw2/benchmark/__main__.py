@@ -38,6 +38,10 @@ def main():
                    help="把测量段的显存分配历史写成 .pickle（拖进 pytorch.org/memory_viz）。"
                         "建议配 --steps 1 或 2，时间线才看得清；OOM 时也会落盘")
 
+    g = p.add_argument_group("激活检查点（§3.2 (b)）")
+    g.add_argument("--checkpoint-every", type=int, default=None, metavar="N",
+                   help="每 N 层包一个 torch.utils.checkpoint 段；前向只留段的输入，反向重算")
+
     g = p.add_argument_group("批量")
     g.add_argument("--sweep", action="store_true", help="按 --config 指定的 SWEEP_CONFIGS 条目批量跑")
     g.add_argument("--config", default="default", choices=SWEEP_CONFIGS.keys())
@@ -55,7 +59,7 @@ def main():
             warmup=a.warmup, steps=a.steps, batch_size=a.batch_size, seq_len=a.seq_len,
             vocab_size=a.vocab_size, device=a.device,
             autocast=a.autocast, nvtx=a.nvtx, nvtx_attn=a.nvtx_attn, nvtx_ops=a.nvtx_ops,
-            memory_snapshot=a.memory_snapshot,
+            memory_snapshot=a.memory_snapshot, checkpoint_every=a.checkpoint_every,
         )]
     sweep(cfgs, a.out, isolate=a.isolate)
 
