@@ -1,25 +1,32 @@
-# CS336 A2 作答
+# 单卡 5090 上的 Transformer 训练：算力、显存与 checkpoint
 
-> 每个 deliverable：1–2 句作答 + 一张佐证表。长分析、踩坑、设计取舍见 [blog_long.md](blog_long.md)。
+Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验记录。模型是作业 1 里从零写的 Transformer LM（RMSNorm + RoPE + SwiGLU，pre-norm），本篇覆盖作业的 §2 Profiling & Benchmarking 和 §3 Single-GPU Memory（§2、§3 沿用作业编号，§1 是自己加的背景和纸面估算）。每小节先一句话说清问题，再 1–2 句作答加一张佐证表；长分析和踩坑见 [blog_long.md](blog_long.md)。
+
 > 硬件 RTX 5090 32 GB（`torch` 可用 31.3 GiB；下文显存一律 GiB = 2³⁰ B，即 `max_memory_allocated()/1024³`），torch 2.11.0+cu130，fp32 基准 `allow_tf32=False`；除注明外 `batch=4, seq=512`，warmup 5 / measure 10。
 
 ---
 
-## 0 Background Setups
+## 1 背景与纸面账
 
-### 0.0 术语
+### 1.1 术语
 
 全文统一用英文术语：
 
 | 术语 | 含义 |
 |:--|:--|
 | **activation** | 前向算出的任何中间张量，不管存不存 |
-| **saved tensors** | 其中 autograd 为反向留下的那部分（PyTorch `saved_tensors_hooks` 看到的就是它们）。handout 和 JAX 叫 **residuals**，本文不用这个词，以免和 residual connection 混 |
+| **saved tensors** | 其中 autograd 为反向留下的那部分（PyTorch `saved_tensors_hooks` 看到的就是它们）。作业文档和 JAX 叫 **residuals**，本文不用这个词，以免和 residual connection 混 |
 | **entry** | 一段 checkpoint 的输入 x_i（`[b, s, d]`，80 MiB），checkpoint 唯一保留的东西，反向 recompute 的起点 |
-| **recompute** | 反向时用 entry 把一段前向重跑一遍 |
+| **recompute**（重算） | 反向时用 entry 把一段前向重跑一遍 |
 | **L / k** | L = Transformer 层数；k = checkpoint 段数，每段 L/k 层 |
+| **residual stream**（残差流） | Transformer 里逐层相加的那条 `[batch, seq, d_model]` 主干，与上面的 residuals 无关 |
+| **forward / fwd_bwd / full** | benchmark 的三种模式：纯前向（`no_grad`）/ 前向 + 反向 / 前向 + 反向 + optimizer step |
+| **kernel / op** | kernel = GPU 上执行的一个函数（nsys 看到的单位）；op = PyTorch 的 aten 算子，一个 op 可能发多个 kernel |
+| **matmul / GEMM** | 矩阵乘；GEMM 是 cuBLAS/cutlass 里矩阵乘 kernel 的名字 |
 
-handout Table 1 的五个 size，`vocab=10000, seq=512, batch=4`，`d_head = d_model / num_heads = 64`（10B 是 128）：
+### 1.2 模型规格
+
+作业给定的五个模型规格（下文 small / medium / large / xl / 10B），`vocab=10000, seq=512, batch=4`，`d_head = d_model / num_heads = 64`（10B 是 128）：
 
 | Size | d_model | d_ff | num_layers | num_heads | N |
 |:-----|--:|--:|--:|--:|--:|
@@ -34,7 +41,7 @@ handout Table 1 的五个 size，`vocab=10000, seq=512, batch=4`，`d_head = d_m
 **公式**：每层参数 `4d² + 3·d·d_ff + 2d`（q/k/v/o、SwiGLU 三矩阵、两个 RMSNorm），加 `2·V·d`（embedding 与 lm_head 不共享）。
 前向 FLOPs/token `= 2·(N − V·d) + 4·L·S·d`（矩阵乘 2N + attention 的 QKᵀ/PV），训练 `= 3×` 前向。
 
-### 0.1 FLOPs
+### 1.3 FLOPs
 
 单位 FLOPs；每步 = 每 token × 2048。
 
@@ -48,11 +55,11 @@ handout Table 1 的五个 size，`vocab=10000, seq=512, batch=4`，`d_head = d_m
 
 attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
-### 0.2 显存
+### 1.4 显存
 
-训练静态 = 16 B/参数（fp32 权重 4 + 梯度 4 + Adam m/v 8），autocast 再 +2；激活由 §2.1 实测反推（fwd_bwd 峰值 − 权重 − 梯度）。
+训练静态 = 16 B/参数（fp32 权重 4 + 梯度 4 + Adam m/v 8），autocast 再 +2；activation 由 §2.1 实测反推（fwd_bwd 峰值 − 权重 − 梯度）。
 
-| Size | 权重 (fp32) | 训练静态 | 激活（实测，seq 512） | 合计 | 31.3 GiB？ |
+| Size | 权重 (fp32) | 训练静态 | activation（实测，seq 512） | 合计 | 31.3 GiB？ |
 |:-----|--:|--:|--:|--:|:--|
 | small  |  0.5 GiB |   1.9 |  3.1 |   5.0 | ✓ |
 | medium |  1.6 |   6.3 |  7.4 |  13.7 | ✓ |
@@ -62,7 +69,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OOM。
 
-### 0.3 训练 20N token 要多久
+### 1.5 训练 20N token 要多久
 
 用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPs/s**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.4(c) 的 fwd_bwd 加速换算。
 
@@ -73,19 +80,23 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | large  | 19.4B | 371.5 ms | 977 h（41 天） | 195 ms | 511 h（21 天） |
 | xl     | 68.1B | OOM | — | OOM | — |
 
-单卡 5090 认真训的上限是 medium；large 一个多月，xl 装不下——这就是 §5–§7 多卡的理由。
+单卡 5090 认真训的上限是 medium；large 一个多月，xl 装不下——这就是作业后半段（§5–§7）要上多卡的理由。
 
 ---
 
-## 2 Profiling and Benchmarking
+## 2 性能剖析与基准（Profiling & Benchmarking）
 
-### 2.1 Benchmarking Script
+### 2.1 计时脚本（Benchmarking Script）
 
 #### (a) 脚本
+
+**问题**：写一个端到端 benchmark，能选模型规格、预热后计时 forward / fwd_bwd / full 三种模式。
 
 `benchmark/`（`python -m benchmark`）：按 CLI 建 `BasicsTransformerLM`、随机批、预热 `w` 步后对 `n` 步计时，`--mode` 切 forward / fwd_bwd / full，每步 `cuda.synchronize()`。
 
 #### (b) 各阶段耗时
+
+**问题**：五个规格各跑 10 步，前向、反向、optimizer 各占多少时间，测量稳不稳。
 
 反向约为前向的 2 倍（2.02 / 2.02 / 1.93），optimizer 占 7%；测量很稳，标准差 ≤1.4%。xl 前向带图即 OOM，10B 建模型即 OOM。
 
@@ -98,6 +109,8 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 #### (c) 不预热会怎样
 
+**问题**：去掉 warmup、或只预热 1–2 步，均值和方差变成什么样，为什么。
+
 不预热时首步比稳态慢 1.7–6.9×（绝对开销 ~300 ms，来自 kernel 懒加载、cuBLAS 初始化、显存池首次 cudaMalloc），10 步均值虚高 7–59%、标准差从 ~1 ms 涨到 ~100 ms；warmup=1 之后就稳了，模型越小坑越深。
 
 | Size | w=0 | w=1 | w=5 |
@@ -106,11 +119,13 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | medium | 196.8 ± 96.7  | 166.5 ± 0.9 | 167.2 ± 1.8 |
 | large  | 400.9 ± 86.8  | 374.4 ± 2.8 | 375.1 ± 3.2 |
 
-### 2.2 Nsight Systems Profiling
+### 2.2 Nsight Systems 剖析
 
-small + medium × seq 256 / 512 / 1024（large 只跑得到 512）。
+用 NVIDIA Nsight Systems（`nsys`）采 GPU kernel 级 timeline，代码里用 NVTX range 标出 forward / backward / optimizer 各段。覆盖 small + medium × seq 256 / 512 / 1024（large 只跑得到 512）。
 
 #### (a) 前向耗时与 timeit 对得上吗
+
+**问题**：nsys 里 forward range 的宽度和 §2.1 用 `timeit` 量的一致吗。
 
 对得上，nsys 系统性偏高 2.3–7.7%，相对开销随负载增大而缩小。
 
@@ -122,9 +137,13 @@ small + medium × seq 256 / 512 / 1024（large 只跑得到 512）。
 
 #### (b) 最耗时的 kernel
 
+**问题**：前向里 GPU 时间最长的 kernel 是哪个、调用几次；加上反向后还是它吗。
+
 六档都是 `cutlass_80_simt_sgemm_128x256_8x4_tn`（占前向 41–70%，单次前向 37–169 次）；加上反向仍是它（medium@1024 占 14.6%），反向 GEMM 散在三个 tile 变体上。
 
 #### (c) 非矩阵乘 kernel
+
+**问题**：除矩阵乘之外，还有哪些 kernel 占了可观的时间。
 
 elementwise（SwiGLU、RoPE、mask、残差）+ reduce（RMSNorm、softmax）占前向 18–49%，随 seq 急剧上升——它们访存受限，attention 中间张量随 seq² 涨。
 
@@ -133,11 +152,15 @@ elementwise（SwiGLU、RoPE、mask、残差）+ reduce（RMSNorm、softmax）占
 | matmul  | 79% | 77% | 51% | 81% | 75% | 53% |
 | 非 matmul | 20% | 23% | 49% | 18% | 25% | 47% |
 
-#### (d) 完整训练步 vs 纯前向
+#### (d) full step vs 纯前向
 
-完整步中 matmul 占比比前向低 6–18 pp（medium@256：81% → 64%），份额被 elementwise 吃掉（16% → 34%）：反向有大量梯度累加，AdamW 是纯逐元素。
+**问题**：把 optimizer step 也算进来，matmul 的占比怎么变。
+
+full step 中 matmul 占比比前向低 6–18 pp（medium@256：81% → 64%），份额被 elementwise 吃掉（16% → 34%）：反向有大量梯度累加，AdamW 是纯逐元素。
 
 #### (e) attention 内 softmax vs 矩阵乘
+
+**问题**：attention 内部 softmax 和两次矩阵乘各花多少时间，和它们的 FLOPs 相称吗。
 
 softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段（含 `/√d` 和 `masked_fill`）占 attention 的 61%，三段都卡在带宽。
 
@@ -147,7 +170,9 @@ softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段�
 | softmax |  1.8 (7%)     |  5.6 (11%) | 33.8 (22%) |
 | matmul  |  1.7 (6%)     |  3.2 (6%)  |  7.6 (5%)  |
 
-### 2.3 Mixed Precision Accumulation
+### 2.3 混合精度累加（Mixed Precision Accumulation）
+
+**问题**：`s = 0; 重复 1000 次 s += 0.01`，累加器和加数分别用 fp32 / fp16 / bf16，结果各是多少，为什么。
 
 精度由**累加器**的 dtype 决定，加数是什么无所谓：fp16 累加器漂到 9.95，bf16 累加器（7 位尾数）在 4.0 就再也加不动；fp32 累加器无论加数是 fp16/bf16 还是手动转过，都落在 10.00x（偏差来自 0.01 在 16 位里本身存不准）。
 
@@ -159,9 +184,11 @@ softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段�
 | `s(bf16) += x(bf16)` | **4.0000** |
 | `s(fp32) += x(bf16)` | 10.0098 |
 
-### 2.4 Benchmarking Mixed Precision
+### 2.4 混合精度基准（Benchmarking Mixed Precision）
 
 #### (a) fp16 autocast 下各组件 dtype
+
+**问题**：一个 `Linear → ReLU → LayerNorm → Linear` 的玩具模型，参数是 fp32，包在 `torch.autocast(fp16)` 里训练，参数、各层输出、logits、loss、梯度分别是什么 dtype。
 
 参数 fp32（autocast 不改存储的权重，只在算子调用时转换输入）；fc1 输出与 logits fp16；LayerNorm 输出、loss、梯度 fp32。bf16 下模式相同。
 
@@ -171,9 +198,13 @@ softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段�
 
 #### (b) LayerNorm 为什么特殊
 
+**问题**：autocast 为什么把 LayerNorm 留在 fp32；换成 bf16 后还有必要吗。
+
 敏感的是特征维上的**归约**（均值/方差累加）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但尾数只有 7 位、归约精度比 fp16 更差（§2.3 卡在 4.0 就是它），所以仍需保留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，保留 fp32 基本免费。
 
 #### (c) bf16 vs fp32
+
+**问题**：bf16 autocast 相对 fp32，各规格前向和反向快多少，显存省多少。
 
 bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加速越高**（大 GEMM 更接近 Tensor Core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。xl 在 bf16 下仍 OOM。加速比含两个效应：位宽减半 + fp32 基准走 SIMT 而 bf16 走 Tensor Core。
 
@@ -184,13 +215,15 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | −18% |
 | xl     | OOM → OOM | — | — | — | — |
 
-### 2.5 Memory Profiling
+### 2.5 显存剖析（Memory Profiling）
 
-xl，`batch=4`，`max_memory_allocated`（预热后清零）。
+用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。
 
 #### (a) 显存时间线
 
-能认出阶段，靠的是**斜率**而不是峰：前向是 32 级均匀上坡（每层存一份反向要用的激活，12.8 → 18.1 GiB），反向坡度变缓但仍在爬（每层释放 ~140 MiB 激活、同时分配 ~315 MiB 梯度，净增），optimizer 一开始就垂直冲到 29.35 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）几乎是平的——xl@128 只在 12.8 GiB 基线上多 0.08 GiB 临时量。
+**问题**：从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状。
+
+能认出阶段，靠的是**斜率**而不是峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB），反向坡度变缓但仍在爬（每层释放 ~140 MiB saved tensors、同时分配 ~315 MiB 梯度，净增），optimizer 一开始就垂直冲到 29.35 GiB OOM（AdamW 分配 m/v）。纯前向（forward，no_grad）几乎是平的——xl@128 只在 12.8 GiB 基线上多 0.08 GiB 临时量。
 
 ![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
 ![xl seq=2048 forward](assets/s2/mem_xl_seq2048_forward.png)
@@ -199,7 +232,9 @@ xl，`batch=4`，`max_memory_allocated`（预热后清零）。
 
 #### (b) 峰值显存
 
-xl 的完整训练步在 31.3 GiB 上**任何 seq 都装不下**：不是激活，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§0 的「训练静态」）。
+**问题**：xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
+
+xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。
 
 | seq | forward（no_grad） | fwd_bwd | full |
 |----:|------:|------:|:-----|
@@ -208,7 +243,9 @@ xl 的完整训练步在 31.3 GiB 上**任何 seq 都装不下**：不是激活�
 
 #### (c) 混合精度的影响
 
-**不省反多 4–6 GiB**：no_grad 前向 12.9 → 19.2 GiB（128）、21.4 → 25.3 GiB（2048），多出的是一份 bf16 权重副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合）减去激活省下的 1–2 GiB；fwd_bwd 持平（25.56 vs 25.55）。副本在推理时是 autocast 的 cast 缓存（可关，或干脆 `model.to(bf16)`），训练时是反向 `dx = dy·Wᵀ` 的输入（autograd 存的 saved tensor，关缓存也省不掉）。只有激活远大于权重时 autocast 才省显存（§2.4(c) 里 small 省 21%）。
+**问题**：开 bf16 autocast 后峰值变化多少。
+
+**不省反多 4–6 GiB**：no_grad 前向 12.9 → 19.2 GiB（128）、21.4 → 25.3 GiB（2048），多出的是一份 bf16 权重副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合）减去 activation 省下的 1–2 GiB；fwd_bwd 持平（25.56 vs 25.55）。副本在推理时是 autocast 的 cast 缓存（可关，或干脆 `model.to(bf16)`），训练时是反向 `dx = dy·Wᵀ` 的输入（autograd 存的 saved tensor，关缓存也省不掉）。只有 activation 远大于权重时 autocast 才省显存（§2.4(c) 里 small 省 21%）。
 
 | seq | 模式 | fp32 | bf16 |
 |----:|:--|--:|--:|
@@ -218,9 +255,13 @@ xl 的完整训练步在 31.3 GiB 上**任何 seq 都装不下**：不是激活�
 
 #### (d) 残差流张量大小
 
+**问题**：残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大。
+
 `[batch, seq, d_model] × 4 B = 4 × 2048 × 2560 × 4 = 83,886,080 B = 80 MiB`（seq=128 时 5 MiB）；每 token 10 KiB。
 
 #### (e) 最大的几笔分配
+
+**问题**：时间线上最大的分配是什么、多大、从哪行代码来。
 
 xl@2048 前向最大的分配是 **2 GiB**，全部来自 attention 的 `[4, 32, 2048, 2048]` fp32 分数矩阵——每层临时造 6 份（`QKᵀ` einsum、`/√d`、`masked_fill`、softmax 里的 `x − max`、`exp`、除法），调用栈指向 `model.py:253-257` 和 `nn_utils.py:15-24`；次大的 320 MiB 是 SwiGLU 的 `[4, 2048, 10240]` 中间量。残差流本身（80 MiB）排不进前列。
 
@@ -233,6 +274,8 @@ xl@2048 前向最大的分配是 **2 GiB**，全部来自 attention 的 `[4, 32,
 > seq=128 时排序反过来：最大的是 SwiGLU 的 20 MiB，attention 分数只有 8 MiB。分数矩阵随 seq² 涨、其它随 seq 线性涨，seq 一长 attention 就成了显存主角——这是 §4 FlashAttention 的动机。
 
 #### (f) 单层 TransformerBlock 为反向保存的显存
+
+**问题**：一层 block 前向时分配的显存里，有多少要留到反向；反向时又新分配多少。
 
 xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还没释放——这就是为反向保存的 saved tensors，占该层前向分配的 58%。按包着每次分配的最内层 `aten::*` range 归因，前五个来源占 saved tensors 的 90%：`aten::mul` 60 MiB（36%，SwiGLU 的门积和 SiLU 的 `x·σ(x)`，`[4,128,10240]` fp32 各 20 MiB）、`aten::bmm` 40 MiB（24%，attention 的 q/k/v 与 `softmax·V`）、`aten::empty` 20 MiB（12%，`w1(x)`/`w3(x)` 的输出，einsum 先 `empty` 再写入）、`aten::sigmoid` 20 MiB（12%，SiLU 里的 `σ(x)`）、`aten::add` 10 MiB（6%，残差相加）。算子名要读成「malloc 发生时正在跑的算子」而非「张量属于谁」。可以看到大头是 FFN 的 `d_ff` 宽中间量而不是 attention——seq=128 时 `[b,h,s,s]` 分数矩阵只有 8 MiB，§2.5(e) 里 seq=2048 时它才变成 2 GiB 的主角。
 
@@ -255,9 +298,11 @@ xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 
 
 ---
 
-## 3 Single-GPU Memory
+## 3 单卡显存（Single-GPU Memory）
 
-### 3.1 Autograd Residuals
+### 3.1 autograd 为反向存了什么（Autograd Residuals）
+
+**问题**：autograd 到底为反向存了哪些张量？先用最小的例子 RMSNorm 看清楚，再看 `torch.compile` 融合后有什么变化。
 
 §2.5(f) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
 
@@ -289,7 +334,7 @@ y = weight * x_hat                                          # ⑤ mul
 
 6 次 Saving 只对应 4 块内存（pack hook 里打 `data_ptr()` 可以验证：第 1/4 条同址，第 2/3 条同址）。真正为反向多留的只有 $r$ 和 $\hat{x}$，即一份输入大小。
 
-画成图：灰色是算子，实线是前向；`x` 是上一层传来的激活，`w` 是本层参数；`r`、`x̂` 是前向新产生的 tensor，用细线连到 pack 它的算子。虚线是反向，标的是这一步 unpack 的 tensor，颜色与 tensor 一致。
+画成图：灰色是算子，实线是前向；`x` 是上一层传来的 activation，`w` 是本层参数；`r`、`x̂` 是前向新产生的 tensor，用细线连到 pack 它的算子。虚线是反向，标的是这一步 unpack 的 tensor，颜色与 tensor 一致。
 
 ```mermaid
 flowchart LR
@@ -341,7 +386,7 @@ flowchart LR
 
 反向沿虚线 ⑤ → ④ → ③ → ② → ①：⑤ 取 $\hat{x}$、$w$，④ 取 $r$、$x$，③ 取 $r$，① 取 $x$，与 print 的 Loading 顺序一致。`x` 有两条虚线入边，两路梯度在叶子上累加。
 
-#### 3.1.1 Operator Fusion
+#### 3.1.1 算子融合（Operator Fusion）
 
 回看表格：$\partial\hat{x}/\partial x$ 只用到 $r$ 和 $\hat{x}$，而 $\hat{x}=x\cdot r$ 是一次逐元素乘——反向手里有 $x$ 和 $r$ 就能当场算回 $\hat{x}$，不必存那 20 MiB。逐算子写法做不到，因为 ⑤ 的 MulBackward 只知道「我要 $\hat{x}$」，不知道它是 $x\cdot r$ 来的。`torch.compile(RMSNorm(...))` 把 ①–⑤ 追踪成一张图，AOTAutograd 生成一个前向 kernel、一个反向 kernel，并在「存」和「重算」之间选便宜的：
 
@@ -401,9 +446,11 @@ x̂ = x·r 现场重算
 
 原始输出见 `assets/s3/rmsnorm_saved_tensors.txt`。
 
-### 3.2 Activation Checkpointing
+### 3.2 激活检查点（Activation Checkpointing）
 
-xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，为反向存的仍有 **3655 MiB**（PDF 3651，多 4 MiB 是 hw1 显式传入的 mask）。剩下的全是矩阵乘的输入，融合动不了：
+**问题**：融合之后一层 Transformer block 还要为反向存多少；`torch.utils.checkpoint` 怎么用时间换显存。作业题 `gradient_checkpointing`：(a) 忽略算力，峰值显存最小的 checkpoint 策略是什么，渐近显存和计算各多少；(b) 只允许重算一次（不嵌套），xl@2048 batch 4 最优的段长是多少，实测验证并比较相邻段长。
+
+xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，为反向存的仍有 **3655 MiB**（作业文档给的参考值 3651，多 4 MiB 是我们的实现显式传入的 mask）。剩下的全是矩阵乘的输入，融合动不了：
 
 | MiB | 张量 | 占比 |
 |--:|:--|--:|
@@ -414,17 +461,17 @@ xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，�
 
 > shape 和总量是 `saved_tensors_hooks` 实测，MiB 按 shape × 4 B 算，「是什么」按 shape 唯一性反推。
 
-32 层 = 114 GiB，xl@2048 fp32 光 activation 就装不下。attention 那 2 GiB 靠 §4 FlashAttention，其余靠 checkpointing。
+32 层 = 114 GiB，xl@2048 fp32 光 saved tensors 就装不下。attention 那 2 GiB 靠 §4 FlashAttention，其余靠 checkpointing。
 
 checkpointing 是用计算换显存。x 轴：反向峰值时活着的 saved tensors；y 轴：一步要算几遍前向（xl@2048 batch 4，L = 32）：
 
 ![checkpoint tradeoff](assets/s3/checkpoint_tradeoff.png)
 
-- **y = 2× 那一排**：平切成 k 段。每层恰好被重算一次，所以总前向恒为 2×；k 只决定同时物化几层，从 k = 1（114 GiB）到 k = L（6.1 GiB）单调下降——entry 太便宜，没有 U 形。PDF (b) 就是这一排。
-- **往左上**：嵌套 checkpoint。一层的 saved tensors（3.6 GiB，红虚线）是底线，减的只是 entry，计算从 2× 涨到 6×。PDF (a) 的答案在左上角。
+- **y = 2× 那一排**：平切成 k 段。每层恰好被重算一次，所以总前向恒为 2×；k 只决定同时物化几层，从 k = 1（114 GiB）到 k = L（6.1 GiB）单调下降——entry 太便宜，没有 U 形。(b) 问的就是这一排。
+- **往左上**：嵌套 checkpoint。一层的 saved tensors（3.6 GiB，红虚线）是底线，减的只是 entry，计算从 2× 涨到 6×。(a) 的答案在左上角。
 - 实践停在 k = L，或者用选择性重算（只丢 S、P 这类大而便宜的张量，前向 +5%）。要压底线本身靠 §4 FlashAttention。
 
-#### 3.2.1 Recomputation
+#### 3.2.1 重算（Recomputation）
 
 `checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入（entry），反向到这段时重跑一遍前向造出 saved tensors，用完释放。4 层 xl block 实测：
 
@@ -510,9 +557,9 @@ flowchart LR
 
 两段不能并行：L2 反向要 `dx2`，它是 L3 反向的输出。前半段的重算只依赖 x0、理论上能提前，但那样两段的红色同时活着，峰值回到 14.6 GiB。
 
-#### 3.2.2 Recursive Checkpointing
+#### 3.2.2 递归检查点（Recursive Checkpointing）
 
-峰值 = 一层的 saved tensors + 活着的 entry。前者最少 1 层，每层一个 checkpoint 已做到；后者要存 x0…x_{L-1}，O(L)。**entry 也是 activation，也能被 checkpoint 掉**：一段层外面再包一层 `checkpoint`，段内的 entry 就不存，反向到这段时重算。一路对半包到底就是一棵二叉树——节点 = 一次 `checkpoint` 调用、留自己的 entry；叶子 = 层：
+对应作业题 (a)：忽略算力，峰值显存最小能到多少。峰值 = 一层的 saved tensors + 活着的 entry。前者最少 1 层，每层一个 checkpoint 已做到；后者要存 x0…x_{L-1}，O(L)。**entry 也是 activation，也能被 checkpoint 掉**：一段层外面再包一层 `checkpoint`，段内的 entry 就不存，反向到这段时重算。一路对半包到底就是一棵二叉树——节点 = 一次 `checkpoint` 调用、留自己的 entry；叶子 = 层：
 
 ```mermaid
 flowchart TD
@@ -621,9 +668,9 @@ def ckpt(layers, x):
     return checkpoint(right, checkpoint(left, x))    # 两个子树各包一个 checkpoint
 ```
 
-**(b) 不嵌套**：只能平切 k 段，峰值 = k × entry + (L/k) × 一层 saved tensors。xl@2048 是 k × 80 + (32/k) × 3655 MiB，两项相等要 k ≈ 38 > 32——entry 比一层 saved tensors 小 45 倍，所以切到最细（每层一个）最优，没有中间的平衡点。
+**(b) 不嵌套**（作业题 (b)）：只能平切 k 段，峰值 = k × entry + (L/k) × 一层 saved tensors。xl@2048 是 k × 80 + (32/k) × 3655 MiB，两项相等要 k ≈ 38 > 32——entry 比一层 saved tensors 小 45 倍，所以切到最细（每层一个）最优，没有中间的平衡点。
 
-题面 xl@2048 batch 4 在 5090 上量不了：参数+梯度 25.4 GiB，任何段长都 OOM。用 large（36 层，参数+梯度 7.2 GiB）测：batch 4 / seq 2048 只有每段 ≤ 4 层能跑（15.4 / 18.9 / 22.5 / 26.1 GiB，每多 1 层 +3.6 GiB），要让全部段长含「不 checkpoint」都出数，降到 batch 1 / seq 1024，fwd_bwd：
+(b) 指定的 xl@2048 batch 4 在 5090 上量不了：参数+梯度 25.4 GiB，任何段长都 OOM。用 large（36 层，参数+梯度 7.2 GiB）测：batch 4 / seq 2048 只有每段 ≤ 4 层能跑（15.4 / 18.9 / 22.5 / 26.1 GiB，每多 1 层 +3.6 GiB），要让全部段长含「不 checkpoint」都出数，降到 batch 1 / seq 1024，fwd_bwd：
 
 ![checkpoint sweep](assets/s3/checkpoint_large_sweep.png)
 
