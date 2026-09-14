@@ -1,24 +1,23 @@
-# benchmark/rmsbenchmark.py — saved_tensors_hooks on RMSNorm, x: [4,512,2560] fp32
-# pack/unpack hook prints shape, dtype, grad_fn, data_ptr()
+# notes/notes.ipynb §3.1 — saved_tensors_hooks on RMSNorm, x: [4,512,2560] fp32 (CPU)
 
 ## eager (per-op)
-Saving residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x7ee99d829040'
-Saving residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=<RsqrtBackward0 object at 0x7eeaab79bc40>, ptr='0x2e46bc40'
-Saving residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=<RsqrtBackward0 object at 0x7eeaab79bc40>, ptr='0x2e46bc40'
-Saving residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x7ee99d829040'
-Saving residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=<MulBackward0 object at 0x7eeaab79bc40>, ptr='0x2e611140'
-Saving residual: shape=torch.Size([2560]), dtype=torch.float32, grad_fn=None, ptr='0x2de21340'
-Loading residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=<MulBackward0 ...>
-Loading residual: shape=torch.Size([2560]), dtype=torch.float32, grad_fn=None
-Loading residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=<RsqrtBackward0 ...>
-Loading residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None
-Loading residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=<RsqrtBackward0 ...>
-Loading residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x7325d0aa9040'
+Saving residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=<RsqrtBackward0 object at 0x7325d1edf940>, ptr='0x2f2c6b00'
+Saving residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=<RsqrtBackward0 object at 0x7325d1edf940>, ptr='0x2f2c6b00'
+Saving residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x7325d0aa9040'
+Saving residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=<MulBackward0 object at 0x7325d1edf940>, ptr='0x2f3b3c00'
+Saving residual: shape=torch.Size([2560]), dtype=torch.float32, grad_fn=None, ptr='0x2ed01000'
+Loading residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=<MulBackward0 object at 0x732604116530>, ptr='0x2f3b3c00'
+Loading residual: shape=torch.Size([2560]), dtype=torch.float32, grad_fn=None, ptr='0x2ed01000'
+Loading residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=<RsqrtBackward0 object at 0x732604116530>, ptr='0x2f2c6b00'
+Loading residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x7325d0aa9040'
+Loading residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=<RsqrtBackward0 object at 0x732604116530>, ptr='0x2f2c6b00'
+Loading residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x7325d0aa9040'
 
 ## torch.compile (fused)
-Saving residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x725896e29040'
-Saving residual: shape=torch.Size([2560]), dtype=torch.float32, grad_fn=None, ptr='0x2ab02b00'
-Saving residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=None, ptr='0x2f983c40'
-Loading residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x725896e29040'
-Loading residual: shape=torch.Size([2560]), dtype=torch.float32, grad_fn=None, ptr='0x2ab02b00'
-Loading residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=None, ptr='0x2f983c40'
+Saving residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x31bb3c80'
+Saving residual: shape=torch.Size([2560]), dtype=torch.float32, grad_fn=None, ptr='0x2ec6b3c0'
+Saving residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=None, ptr='0x2ea7f9c0'
+Loading residual: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None, ptr='0x31bb3c80'
+Loading residual: shape=torch.Size([2560]), dtype=torch.float32, grad_fn=None, ptr='0x2ec6b3c0'
+Loading residual: shape=torch.Size([4, 512, 1]), dtype=torch.float32, grad_fn=None, ptr='0x2ea7f9c0'

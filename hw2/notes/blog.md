@@ -43,7 +43,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 ### 1.3 FLOPs
 
-单位 FLOPs；每步 = 每 token × 2048。
+两种口径：**/ token** 是处理一个 token 的 FLOPs，只和模型大小有关（前向 ≈ 2N，训练 ≈ 6N）；**/ step** 是一个训练步的 FLOPs = / token × 一步的 token 数，这里 batch 4 × seq 512 = 2048。前者用来对 6N 公式、算 20N token 的总量，后者除以实测 step 时间得到吞吐（§1.5）。
 
 | Size | N | 前向 / token | 训练 / token | 前向 / step | 训练 / step |
 |:-----|--:|--:|--:|--:|--:|
@@ -320,6 +320,18 @@ x_hat = x * rms                                             # ④ mul
 y = weight * x_hat                                          # ⑤ mul
 ```
 
+`saved_tensors_hooks` 在 pack/unpack 时打印（完整输出 `assets/s3/rmsnorm_saved_tensors.txt`）：
+
+```
+Saving  1  [4,512,2560]  grad_fn=None            ptr=…9040
+Saving  2  [4,512,1]     grad_fn=RsqrtBackward0  ptr=…6b00
+Saving  3  [4,512,1]     grad_fn=RsqrtBackward0  ptr=…6b00
+Saving  4  [4,512,2560]  grad_fn=None            ptr=…9040
+Saving  5  [4,512,2560]  grad_fn=MulBackward0    ptr=…3c00
+Saving  6  [2560]        grad_fn=None            ptr=…1000
+Loading    5 → 6 → 2 → 4 → 3 → 1
+```
+
 规则只有一条：每个算子的局部偏导里出现了哪个变量，前向就得把它存下来；偏导是常数的什么都不存。「存」是让反向节点持有引用，不是拷贝，所以本来就活着的输入 `x` 和参数 `w` 不占额外显存。
 
 | op | 前向 | 反向要算的偏导 | 偏导里出现的变量 → 存它 | shape | `grad_fn` | 额外显存 | print 里第几条 |
@@ -332,7 +344,7 @@ y = weight * x_hat                                          # ⑤ mul
 | ⑤ | $y=w\odot\hat{x}$ | $\partial y/\partial w = \hat{x}$ | $\hat{x}$ | `[4,512,2560]` | MulBackward | **20 MiB** | 5 |
 | | | $\partial y/\partial\hat{x} = w$ | $w$ | `[2560]` | None（叶子） | 0（参数本来就在） | 6 |
 
-6 次 Saving 只对应 4 块内存（pack hook 里打 `data_ptr()` 可以验证：第 1/4 条同址，第 2/3 条同址）。真正为反向多留的只有 $r$ 和 $\hat{x}$，即一份输入大小。
+6 次 Saving 只对应 4 块内存：ptr 显示第 1/4 条同址（x）、第 2/3 条同址（r）。真正为反向多留的只有 $r$ 和 $\hat{x}$，即一份输入大小。
 
 画成图：灰色是算子，实线是前向；`x` 是上一层传来的 activation，`w` 是本层参数；`r`、`x̂` 是前向新产生的 tensor，用细线连到 pack 它的算子。虚线是反向，标的是这一步 unpack 的 tensor，颜色与 tensor 一致。
 
@@ -344,9 +356,9 @@ flowchart LR
     classDef rR fill:#e3f2fd,stroke:#1565c0,color:#1565c0
     classDef rXh fill:#fce4ec,stroke:#c62828,color:#c62828
 
-    x>"x  0x…9040
+    x>"x  …9040
 ← 上一层输出"]:::act
-    w[("w  0x…1340
+    w[("w  …1000
 参数")]:::param
     P["① x²"]:::op
     M["② v = ¹/d Σ x²"]:::op
@@ -361,8 +373,8 @@ flowchart LR
     w --> M2 --> y
 
     %% 8-10 pack（只画前向新产生的 tensor）
-    SR["r  0x…bc40"]:::rR
-    SXh["x̂  0x…1140"]:::rXh
+    SR["r  …6b00"]:::rR
+    SXh["x̂  …3c00"]:::rXh
     SR --- R
     SR --- M1
     SXh --- M2
@@ -386,15 +398,15 @@ flowchart LR
 
 反向沿虚线 ⑤ → ④ → ③ → ② → ①：⑤ 取 $\hat{x}$、$w$，④ 取 $r$、$x$，③ 取 $r$，① 取 $x$，与 print 的 Loading 顺序一致。`x` 有两条虚线入边，两路梯度在叶子上累加。
 
-#### 3.1.1 算子融合（Operator Fusion）
+#### 算子融合（Operator Fusion）
 
 回看表格：$\partial\hat{x}/\partial x$ 只用到 $r$ 和 $\hat{x}$，而 $\hat{x}=x\cdot r$ 是一次逐元素乘——反向手里有 $x$ 和 $r$ 就能当场算回 $\hat{x}$，不必存那 20 MiB。逐算子写法做不到，因为 ⑤ 的 MulBackward 只知道「我要 $\hat{x}$」，不知道它是 $x\cdot r$ 来的。`torch.compile(RMSNorm(...))` 把 ①–⑤ 追踪成一张图，AOTAutograd 生成一个前向 kernel、一个反向 kernel，并在「存」和「重算」之间选便宜的：
 
 ```
-Saving  [4,512,2560] grad_fn=None ptr=0x…9040   # x
-Saving  [2560]       grad_fn=None ptr=0x…2b00   # w
-Saving  [4,512,1]    grad_fn=None ptr=0x…3c40   # r
-Loading [4,512,2560] / [2560] / [4,512,1]        # 同序
+Saving  1  [4,512,2560]  grad_fn=None  ptr=…3c80   # x
+Saving  2  [2560]        grad_fn=None  ptr=…b3c0   # w
+Saving  3  [4,512,1]     grad_fn=None  ptr=…f9c0   # r
+Loading    1 → 2 → 3（与 Saving 同序）
 ```
 
 整个 RMSNorm 成了一个算子，反向公式由 AOTAutograd 写死：
@@ -414,14 +426,14 @@ flowchart LR
     classDef rR fill:#e3f2fd,stroke:#1565c0,color:#1565c0
     classDef bwd fill:#fff,stroke:#c62828,stroke-dasharray:4 3,color:#c62828
 
-    x>"x  0x…9040
+    x>"x  …3c80
 ← 上一层输出"]:::act
-    w[("w  0x…2b00
+    w[("w  …b3c0
 参数")]:::param
     F["fused forward
 ①②③④⑤ 一个 kernel"]:::op
     y(["y"]):::op
-    SR["r  0x…3c40"]:::rR
+    SR["r  …f9c0"]:::rR
     B["fused backward
 x̂ = x·r 现场重算
 ∂y/∂w, ∂y/∂x 一个 kernel"]:::bwd
@@ -471,7 +483,7 @@ checkpointing 是用计算换显存。x 轴：反向峰值时活着的 saved ten
 - **往左上**：嵌套 checkpoint。一层的 saved tensors（3.6 GiB，红虚线）是底线，减的只是 entry，计算从 2× 涨到 6×。(a) 的答案在左上角。
 - 实践停在 k = L，或者用选择性重算（只丢 S、P 这类大而便宜的张量，前向 +5%）。要压底线本身靠 §4 FlashAttention。
 
-#### 3.2.1 重算（Recomputation）
+#### 重算（Recomputation）
 
 `checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入（entry），反向到这段时重跑一遍前向造出 saved tensors，用完释放。4 层 xl block 实测：
 
@@ -557,9 +569,9 @@ flowchart LR
 
 两段不能并行：L2 反向要 `dx2`，它是 L3 反向的输出。前半段的重算只依赖 x0、理论上能提前，但那样两段的红色同时活着，峰值回到 14.6 GiB。
 
-#### 3.2.2 递归检查点（Recursive Checkpointing）
+#### (a) 递归检查点（Recursive Checkpointing）：忽略算力时的最优策略
 
-对应作业题 (a)：忽略算力，峰值显存最小能到多少。峰值 = 一层的 saved tensors + 活着的 entry。前者最少 1 层，每层一个 checkpoint 已做到；后者要存 x0…x_{L-1}，O(L)。**entry 也是 activation，也能被 checkpoint 掉**：一段层外面再包一层 `checkpoint`，段内的 entry 就不存，反向到这段时重算。一路对半包到底就是一棵二叉树——节点 = 一次 `checkpoint` 调用、留自己的 entry；叶子 = 层：
+峰值 = 一层的 saved tensors + 活着的 entry。前者最少 1 层，每层一个 checkpoint 已做到；后者要存 x0…x_{L-1}，O(L)。**entry 也是 activation，也能被 checkpoint 掉**：一段层外面再包一层 `checkpoint`，段内的 entry 就不存，反向到这段时重算。一路对半包到底就是一棵二叉树——节点 = 一次 `checkpoint` 调用、留自己的 entry；叶子 = 层：
 
 ```mermaid
 flowchart TD
@@ -592,7 +604,7 @@ flowchart TD
     B2 --> L7 & L8
 ```
 
-反向到 L8 时活着的只有根到它**这条路径**上的：4 个 entry（x0 x4 x6 x7，各属于一个开始了还没做完的 checkpoint）+ L8 的 saved tensors。路径外的灰节点此刻不占显存。同一时刻用 3.2.1 的画法，颜色 = entry 是第几层重算时出现的：
+反向到 L8 时活着的只有根到它**这条路径**上的：4 个 entry（x0 x4 x6 x7，各属于一个开始了还没做完的 checkpoint）+ L8 的 saved tensors。路径外的灰节点此刻不占显存。同一时刻用上一节的画法，颜色 = entry 是第几层重算时出现的：
 
 ```mermaid
 flowchart LR
@@ -668,7 +680,9 @@ def ckpt(layers, x):
     return checkpoint(right, checkpoint(left, x))    # 两个子树各包一个 checkpoint
 ```
 
-**(b) 不嵌套**（作业题 (b)）：只能平切 k 段，峰值 = k × entry + (L/k) × 一层 saved tensors。xl@2048 是 k × 80 + (32/k) × 3655 MiB，两项相等要 k ≈ 38 > 32——entry 比一层 saved tensors 小 45 倍，所以切到最细（每层一个）最优，没有中间的平衡点。
+#### (b) 只允许重算一次：最优段长
+
+不嵌套只能平切 k 段，峰值 = k × entry + (L/k) × 一层 saved tensors。xl@2048 是 k × 80 + (32/k) × 3655 MiB，两项相等要 k ≈ 38 > 32——entry 比一层 saved tensors 小 45 倍，所以切到最细（每层一个）最优，没有中间的平衡点。
 
 (b) 指定的 xl@2048 batch 4 在 5090 上量不了：参数+梯度 25.4 GiB，任何段长都 OOM。用 large（36 层，参数+梯度 7.2 GiB）测：batch 4 / seq 2048 只有每段 ≤ 4 层能跑（15.4 / 18.9 / 22.5 / 26.1 GiB，每多 1 层 +3.6 GiB），要让全部段长含「不 checkpoint」都出数，降到 batch 1 / seq 1024，fwd_bwd：
 
