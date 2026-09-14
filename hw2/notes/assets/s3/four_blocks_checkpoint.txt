@@ -1,0 +1,10 @@
+# notes/notes.ipynb §3.2.1 — xl TransformerBlock (compiled), x [4,2048,2560] fp32
+Total size of saved tensors in single TransformerBlock: 3655.33 MiB
+Total size of saved tensors in four TransformerBlocks: 14621.31 MiB
+
+# four_blocks_checkpoint: checkpoint(two_blocks, x, use_reentrant=False) × 2
+Saving residual: shape=torch.Size([0]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([4, 2048, 2560]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([0]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([4, 2048, 2560]), dtype=torch.float32, grad_fn=<torch.autograd.function.CompiledFunctionBackward object at 0x7325ceb26ad0>
+Total size of saved tensors in four TransformerBlocks with checkpointing: 160.00 MiB

@@ -1,0 +1,11 @@
+vocab=10000 seq=512 batch=4  (2048 token/step)
+
+单位：FLOPs；吞吐为 FLOPs/s；显存 GiB (2^30 B)
+
+             N   fwd_tok train_tok  fwd_step train_step  params_GiB  static_GiB act_GiB step_ms  FLOPs_s tok_20N     hours
+size                                                                                                                      
+small    0.13B  2.61e+08  7.82e+08  5.34e+11   1.60e+12         0.5         1.9     3.1   57.48  2.8e+13    2.6B    20.1 h
+medium   0.42B  8.76e+08  2.63e+09  1.79e+12   5.38e+12         1.6         6.3     7.4  168.39  3.2e+13    8.5B   193.3 h
+large    0.97B  2.01e+09  6.02e+09  4.11e+12   1.23e+13         3.6        14.4    13.1  384.12  3.2e+13   19.4B  1010.1 h
+xl       3.41B  6.93e+09  2.08e+10  1.42e+13   4.26e+13        12.7        50.8       —     OOM        —   68.1B         —
+10B     12.83B  2.60e+10  7.81e+10  5.33e+13   1.60e+14        47.8       191.2       —     OOM        —  256.7B         —

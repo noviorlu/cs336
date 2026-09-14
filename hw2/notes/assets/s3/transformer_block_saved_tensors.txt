@@ -1,0 +1,28 @@
+# benchmark/memorybenchmark.ipynb — torch.compile(TransformerBlock, fullgraph=True), xl config
+# d_model=2560 d_ff=10240 heads=16 seq=2048 batch=4 fp32, pack_hook skips nn.Parameter
+# (hw1 impl: mask [1,1,2048,2048] bool + token_positions passed explicitly → +4.02 MiB vs handout 3651.31)
+
+Saving residual: shape=torch.Size([4, 2048, 2560]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([2048]), dtype=torch.int64, grad_fn=None
+Saving residual: shape=torch.Size([2048, 80]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([2048, 80]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([2]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([1, 1, 2048, 2048]), dtype=torch.bool, grad_fn=None
+Saving residual: shape=torch.Size([4, 2048, 1]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([64, 2048, 2048]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([4, 16, 2048, 1]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([4, 16, 2048, 1]), dtype=torch.int64, grad_fn=None
+Saving residual: shape=torch.Size([4, 16, 2048, 1]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([4, 16, 2048, 2048]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([8192, 2560]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([4, 2048, 1]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([8192, 10240]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([8192, 10240]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([10240, 8192]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([2560, 8192]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([2560, 8192]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([64, 160, 2048]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([64, 160, 2048]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([64, 2048, 160]), dtype=torch.float32, grad_fn=None
+Saving residual: shape=torch.Size([2560, 8192]), dtype=torch.float32, grad_fn=None
+Total size of saved tensors in single TransformerBlock: 3655.33 MiB

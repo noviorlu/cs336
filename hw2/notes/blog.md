@@ -1,11 +1,11 @@
 # CS336 A2 作答
 
 > 每个 deliverable：1–2 句作答 + 一张佐证表。长分析、踩坑、设计取舍见 [blog_long.md](blog_long.md)。
-> 硬件 RTX 5090 32 GB，torch 2.11.0+cu130，fp32 基准 `allow_tf32=False`；除注明外 `batch=4, seq=512`，warmup 5 / measure 10。
+> 硬件 RTX 5090 32 GB（`torch` 可用 31.3 GiB；下文显存一律 GiB = 2³⁰ B，即 `max_memory_allocated()/1024³`），torch 2.11.0+cu130，fp32 基准 `allow_tf32=False`；除注明外 `batch=4, seq=512`，warmup 5 / measure 10。
 
 ---
 
-## 0 纸面账：五个 size 各是多大、要算多少、装不装得下、训多久
+## 0 Model Size
 
 handout Table 1 的五个 size，`vocab=10000, seq=512, batch=4`，`d_head = d_model / num_heads = 64`（10B 是 128）：
 
@@ -17,12 +17,12 @@ handout Table 1 的五个 size，`vocab=10000, seq=512, batch=4`，`d_head = d_m
 | xl     | 2560 | 10240 | 32 | 32 |  3.41B |
 | 10B    | 4608 | 12288 | 50 | 36 | 12.83B |
 
-参数量从真实模型在 meta device 上数，其余套公式（计算结果见 `assets/s2/paper_estimates.txt`）。
+参数量从真实模型在 meta device 上数，其余套公式（计算结果见 `assets/s0/paper_estimates.txt`）。
 
 **公式**：每层参数 `4d² + 3·d·d_ff + 2d`（q/k/v/o、SwiGLU 三矩阵、两个 RMSNorm），加 `2·V·d`（embedding 与 lm_head 不共享）。
 前向 FLOPs/token `= 2·(N − V·d) + 4·L·S·d`（矩阵乘 2N + attention 的 QKᵀ/PV），训练 `= 3×` 前向。
 
-### 1. FLOPs
+### 0.1 FLOPs
 
 单位 FLOPs；每步 = 每 token × 2048。
 
@@ -36,21 +36,21 @@ handout Table 1 的五个 size，`vocab=10000, seq=512, batch=4`，`d_head = d_m
 
 attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
-### 2. 显存
+### 0.2 显存
 
 训练静态 = 16 B/参数（fp32 权重 4 + 梯度 4 + Adam m/v 8），autocast 再 +2；激活由 §2.1 实测反推（fwd_bwd 峰值 − 权重 − 梯度）。
 
-| Size | 权重 (fp32) | 训练静态 | 激活（实测，seq 512） | 合计 | 32 GB？ |
+| Size | 权重 (fp32) | 训练静态 | 激活（实测，seq 512） | 合计 | 31.3 GiB？ |
 |:-----|--:|--:|--:|--:|:--|
-| small  |  0.5 GB |   1.9 |  3.1 |   5.0 | ✓ |
+| small  |  0.5 GiB |   1.9 |  3.1 |   5.0 | ✓ |
 | medium |  1.6 |   6.3 |  7.4 |  13.7 | ✓ |
-| large  |  3.6 |  14.4 | 13.1 |  27.5 | ✓（剩 4.5） |
+| large  |  3.6 |  14.4 | 13.1 |  27.5 | ✓（剩 3.8） |
 | xl     | 12.7 |  50.8 |    — |     — | ✗ 静态就超 |
 | 10B    | 47.8 | 191.2 |    — |     — | ✗ 权重就超 |
 
 xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OOM。
 
-### 3. 训练 20N token 要多久
+### 0.3 训练 20N token 要多久
 
 用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPs/s**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.4(c) 的 fwd_bwd 加速换算。
 
@@ -65,13 +65,15 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 ---
 
-## 2.1 Benchmarking Script
+## 2 Profiling and Benchmarking
 
-### (a) 脚本
+### 2.1 Benchmarking Script
+
+#### (a) 脚本
 
 `benchmark/`（`python -m benchmark`）：按 CLI 建 `BasicsTransformerLM`、随机批、预热 `w` 步后对 `n` 步计时，`--mode` 切 forward / fwd_bwd / full，每步 `cuda.synchronize()`。
 
-### (b) 各阶段耗时
+#### (b) 各阶段耗时
 
 反向约为前向的 2 倍（2.02 / 2.02 / 1.93），optimizer 占 7%；测量很稳，标准差 ≤1.4%。xl 前向带图即 OOM，10B 建模型即 OOM。
 
@@ -82,7 +84,7 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | large  | 118.1 ± 0.3 | 227.8 | 26.9 | 372.8 ± 2.4 |
 | xl     | OOM（no_grad 346.4） | — | — | — |
 
-### (c) 不预热会怎样
+#### (c) 不预热会怎样
 
 不预热时首步比稳态慢 1.7–6.9×（绝对开销 ~300 ms，来自 kernel 懒加载、cuBLAS 初始化、显存池首次 cudaMalloc），10 步均值虚高 7–59%、标准差从 ~1 ms 涨到 ~100 ms；warmup=1 之后就稳了，模型越小坑越深。
 
@@ -92,13 +94,11 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | medium | 196.8 ± 96.7  | 166.5 ± 0.9 | 167.2 ± 1.8 |
 | large  | 400.9 ± 86.8  | 374.4 ± 2.8 | 375.1 ± 3.2 |
 
----
-
-## 2.2 Nsight Systems Profiling
+### 2.2 Nsight Systems Profiling
 
 small + medium × seq 256 / 512 / 1024（large 只跑得到 512）。
 
-### (a) 前向耗时与 timeit 对得上吗
+#### (a) 前向耗时与 timeit 对得上吗
 
 对得上，nsys 系统性偏高 2.3–7.7%，相对开销随负载增大而缩小。
 
@@ -108,11 +108,11 @@ small + medium × seq 256 / 512 / 1024（large 只跑得到 512）。
 | timeit |  9.44 | 16.66 | 51.30 | 23.37 | 47.67 | 146.52 |
 | 相对差 | +7.7% | +5.0% | +2.3% | +5.6% | +4.4% | +2.9% |
 
-### (b) 最耗时的 kernel
+#### (b) 最耗时的 kernel
 
 六档都是 `cutlass_80_simt_sgemm_128x256_8x4_tn`（占前向 41–70%，单次前向 37–169 次）；加上反向仍是它（medium@1024 占 14.6%），反向 GEMM 散在三个 tile 变体上。
 
-### (c) 非矩阵乘 kernel
+#### (c) 非矩阵乘 kernel
 
 elementwise（SwiGLU、RoPE、mask、残差）+ reduce（RMSNorm、softmax）占前向 18–49%，随 seq 急剧上升——它们访存受限，attention 中间张量随 seq² 涨。
 
@@ -121,11 +121,11 @@ elementwise（SwiGLU、RoPE、mask、残差）+ reduce（RMSNorm、softmax）占
 | matmul  | 79% | 77% | 51% | 81% | 75% | 53% |
 | 非 matmul | 20% | 23% | 49% | 18% | 25% | 47% |
 
-### (d) 完整训练步 vs 纯前向
+#### (d) 完整训练步 vs 纯前向
 
 完整步中 matmul 占比比前向低 6–18 pp（medium@256：81% → 64%），份额被 elementwise 吃掉（16% → 34%）：反向有大量梯度累加，AdamW 是纯逐元素。
 
-### (e) attention 内 softmax vs 矩阵乘
+#### (e) attention 内 softmax vs 矩阵乘
 
 softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段（含 `/√d` 和 `masked_fill`）占 attention 的 61%，三段都卡在带宽。
 
@@ -135,9 +135,7 @@ softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段�
 | softmax |  1.8 (7%)     |  5.6 (11%) | 33.8 (22%) |
 | matmul  |  1.7 (6%)     |  3.2 (6%)  |  7.6 (5%)  |
 
----
-
-## 2.3 Mixed Precision Accumulation
+### 2.3 Mixed Precision Accumulation
 
 精度由**累加器**的 dtype 决定，加数是什么无所谓：fp16 累加器漂到 9.95，bf16 累加器（7 位尾数）在 4.0 就再也加不动；fp32 累加器无论加数是 fp16/bf16 还是手动转过，都落在 10.00x（偏差来自 0.01 在 16 位里本身存不准）。
 
@@ -149,11 +147,9 @@ softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段�
 | `s(bf16) += x(bf16)` | **4.0000** |
 | `s(fp32) += x(bf16)` | 10.0098 |
 
----
+### 2.4 Benchmarking Mixed Precision
 
-## 2.4 Benchmarking Mixed Precision
-
-### (a) fp16 autocast 下各组件 dtype
+#### (a) fp16 autocast 下各组件 dtype
 
 参数 fp32（autocast 不改存储的权重，只在算子调用时转换输入）；fc1 输出与 logits fp16；LayerNorm 输出、loss、梯度 fp32。bf16 下模式相同。
 
@@ -161,11 +157,11 @@ softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段�
 |:--|:--|:--|:--|:--|:--|
 | fp32 | fp16 | fp32 | fp16 | fp32 | fp32 |
 
-### (b) LayerNorm 为什么特殊
+#### (b) LayerNorm 为什么特殊
 
 敏感的是特征维上的**归约**（均值/方差累加）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但尾数只有 7 位、归约精度比 fp16 更差（§2.3 卡在 4.0 就是它），所以仍需保留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，保留 fp32 基本免费。
 
-### (c) bf16 vs fp32
+#### (c) bf16 vs fp32
 
 bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加速越高**（大 GEMM 更接近 Tensor Core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。xl 在 bf16 下仍 OOM。加速比含两个效应：位宽减半 + fp32 基准走 SIMT 而 bf16 走 Tensor Core。
 
@@ -176,33 +172,31 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | −18% |
 | xl     | OOM → OOM | — | — | — | — |
 
----
-
-## 2.5 Memory Profiling
+### 2.5 Memory Profiling
 
 xl，`batch=4`，`max_memory_allocated`（预热后清零）。
 
-### (a) 显存时间线
+#### (a) 显存时间线
 
-能认出阶段，靠的是**斜率**而不是峰：前向是 32 级均匀上坡（每层存一份反向要用的激活，12.8 → 18.1 GB），反向坡度变缓但仍在爬（每层释放 ~140 MB 激活、同时分配 ~315 MB 梯度，净增），optimizer 一开始就垂直冲到 29.35 GB OOM（AdamW 分配 m/v）。纯前向（no_grad）几乎是平的——xl@128 只在 12.8 GB 基线上多 0.08 GB 临时量。
+能认出阶段，靠的是**斜率**而不是峰：前向是 32 级均匀上坡（每层存一份反向要用的激活，12.8 → 18.1 GiB），反向坡度变缓但仍在爬（每层释放 ~140 MiB 激活、同时分配 ~315 MiB 梯度，净增），optimizer 一开始就垂直冲到 29.35 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）几乎是平的——xl@128 只在 12.8 GiB 基线上多 0.08 GiB 临时量。
 
 ![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
 ![xl seq=2048 forward](assets/s2/mem_xl_seq2048_forward.png)
 
 > 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
 
-### (b) 峰值显存
+#### (b) 峰值显存
 
-xl 的完整训练步在 32 GB 上**任何 seq 都装不下**：不是激活，是 AdamW 第一次 `step()` 要分配 2 × 13.6 GB 状态（权重 + 梯度 + 状态 = 54 GB）。
+xl 的完整训练步在 31.3 GiB 上**任何 seq 都装不下**：不是激活，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§0 的「训练静态」）。
 
 | seq | forward（no_grad） | fwd_bwd | full |
 |----:|------:|------:|:-----|
 | 128  | 12.90 | 25.56 | OOM @ optimizer（29.35） |
 | 2048 | 21.38 | OOM @ forward（25.96） | OOM @ forward |
 
-### (c) 混合精度的影响
+#### (c) 混合精度的影响
 
-**不省反多 4–6 GB**：no_grad 前向 12.9 → 19.2 GB（128）、21.4 → 25.3 GB（2048），多出的是一份 bf16 权重副本（3.4B × 2 B = 6.8 GB）减去激活省下的 1–2 GB；fwd_bwd 持平（25.56 vs 25.55）。副本在推理时是 autocast 的 cast 缓存（可关，或干脆 `model.to(bf16)`），训练时是反向 `dx = dy·Wᵀ` 的输入（autograd 存的 saved tensor，关缓存也省不掉）。只有激活远大于权重时 autocast 才省显存（§2.4(c) 里 small 省 21%）。
+**不省反多 4–6 GiB**：no_grad 前向 12.9 → 19.2 GiB（128）、21.4 → 25.3 GiB（2048），多出的是一份 bf16 权重副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合）减去激活省下的 1–2 GiB；fwd_bwd 持平（25.56 vs 25.55）。副本在推理时是 autocast 的 cast 缓存（可关，或干脆 `model.to(bf16)`），训练时是反向 `dx = dy·Wᵀ` 的输入（autograd 存的 saved tensor，关缓存也省不掉）。只有激活远大于权重时 autocast 才省显存（§2.4(c) 里 small 省 21%）。
 
 | seq | 模式 | fp32 | bf16 |
 |----:|:--|--:|--:|
@@ -210,11 +204,11 @@ xl 的完整训练步在 32 GB 上**任何 seq 都装不下**：不是激活，�
 | 128  | fwd_bwd | 25.56 | 25.55 |
 | 2048 | forward（no_grad） | 21.38 | 25.27 |
 
-### (d) 残差流张量大小
+#### (d) 残差流张量大小
 
 `[batch, seq, d_model] × 4 B = 4 × 2048 × 2560 × 4 = 83,886,080 B = 80 MiB`（seq=128 时 5 MiB）；每 token 10 KiB。
 
-### (e) 最大的几笔分配
+#### (e) 最大的几笔分配
 
 xl@2048 前向最大的分配是 **2 GiB**，全部来自 attention 的 `[4, 32, 2048, 2048]` fp32 分数矩阵——每层临时造 6 份（`QKᵀ` einsum、`/√d`、`masked_fill`、softmax 里的 `x − max`、`exp`、除法），调用栈指向 `model.py:253-257` 和 `nn_utils.py:15-24`；次大的 320 MiB 是 SwiGLU 的 `[4, 2048, 10240]` 中间量。残差流本身（80 MiB）排不进前列。
 
@@ -226,7 +220,7 @@ xl@2048 前向最大的分配是 **2 GiB**，全部来自 attention 的 `[4, 32,
 
 > seq=128 时排序反过来：最大的是 SwiGLU 的 20 MiB，attention 分数只有 8 MiB。分数矩阵随 seq² 涨、其它随 seq 线性涨，seq 一长 attention 就成了显存主角——这是 §4 FlashAttention 的动机。
 
-### (f) 单层 TransformerBlock 为反向保存的显存
+#### (f) 单层 TransformerBlock 为反向保存的显存
 
 xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还没释放——这就是为反向保存的 residual，占该层前向分配的 58%。按包着每次分配的最内层 `aten::*` range 归因，前五个来源占 residual 的 90%：`aten::mul` 60 MiB（36%，SwiGLU 的门积和 SiLU 的 `x·σ(x)`，`[4,128,10240]` fp32 各 20 MiB）、`aten::bmm` 40 MiB（24%，attention 的 q/k/v 与 `softmax·V`）、`aten::empty` 20 MiB（12%，`w1(x)`/`w3(x)` 的输出，einsum 先 `empty` 再写入）、`aten::sigmoid` 20 MiB（12%，SiLU 里的 `σ(x)`）、`aten::add` 10 MiB（6%，残差相加）。算子名要读成「malloc 发生时正在跑的算子」而非「张量属于谁」。可以看到大头是 FFN 的 `d_ff` 宽中间量而不是 attention——seq=128 时 `[b,h,s,s]` 分数矩阵只有 8 MiB，§2.5(e) 里 seq=2048 时它才变成 2 GiB 的主角。
 
@@ -246,3 +240,254 @@ xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 
 ![block5 residuals](assets/s2/nsys_block5_memory.png)
 
 > 图从 nsys 的 sqlite 导出直接画（`CUDA_GPU_MEMORY_USAGE_EVENTS` + `NVTX_EVENTS`，与 GUI 同源）：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配。
+
+---
+
+## 3 Single-GPU Memory
+
+### 3.1 Autograd Residuals
+
+§2.5(f) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
+
+$$
+\mathrm{RMSNorm}(x)_i = w_i \cdot \frac{x_i}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}}
+\qquad\Longleftrightarrow\qquad
+\underbrace{r = \big(\underbrace{\tfrac{1}{d}\textstyle\sum_j \underbrace{x_j^2}_{①}}_{②} + \epsilon\big)^{-1/2}}_{③},\;
+\underbrace{\hat{x} = x \cdot r}_{④},\;
+\underbrace{y = w \odot \hat{x}}_{⑤}
+$$
+
+```python
+rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)   # ① pow  ② mean  ③ rsqrt
+x_hat = x * rms                                             # ④ mul
+y = weight * x_hat                                          # ⑤ mul
+```
+
+规则只有一条：每个算子的局部偏导里出现了哪个变量，前向就得把它存下来；偏导是常数的什么都不存。「存」是让反向节点持有引用，不是拷贝，所以本来就活着的输入 `x` 和参数 `w` 不占额外显存。
+
+| op | 前向 | 反向要算的偏导 | 偏导里出现的变量 → 存它 | shape | `grad_fn` | 额外显存 | print 里第几条 |
+|:--|:--|:--|:--|:--|:--|--:|:--|
+| ① | $x^2$ | $\partial x^2/\partial x = 2x$ | $x$ | `[4,512,2560]` | None（叶子） | 0（输入本来就在） | 1 |
+| ② | $v=\tfrac1d\sum x^2$ | $\partial v/\partial x^2 = \tfrac1d$ | 常数，不存 | — | — | 0 | — |
+| ③ | $r=(v+\epsilon)^{-1/2}$ | $\partial r/\partial v = -\tfrac12 r^3$ | $r$ | `[4,512,1]` | RsqrtBackward | **8 KiB** | 3 |
+| ④ | $\hat{x}=x\cdot r$ | $\partial\hat{x}/\partial x = r$ | $r$ | `[4,512,1]` | RsqrtBackward | 0（同上一块） | 2 |
+| | | $\partial\hat{x}/\partial r = x$ | $x$ | `[4,512,2560]` | None（叶子） | 0（同第 1 条） | 4 |
+| ⑤ | $y=w\odot\hat{x}$ | $\partial y/\partial w = \hat{x}$ | $\hat{x}$ | `[4,512,2560]` | MulBackward | **20 MiB** | 5 |
+| | | $\partial y/\partial\hat{x} = w$ | $w$ | `[2560]` | None（叶子） | 0（参数本来就在） | 6 |
+
+6 次 Saving 只对应 4 块内存（pack hook 里打 `data_ptr()` 可以验证：第 1/4 条同址，第 2/3 条同址）。真正为反向多留的只有 $r$ 和 $\hat{x}$，即一份输入大小。
+
+画成图：灰色是算子，实线是前向；`x` 是上一层传来的激活，`w` 是本层参数；`r`、`x̂` 是前向新产生的 tensor，用细线连到 pack 它的算子。虚线是反向，标的是这一步 unpack 的 tensor，颜色与 tensor 一致。
+
+```mermaid
+flowchart LR
+    classDef param fill:#f3e5f5,stroke:#6a1b9a,color:#6a1b9a
+    classDef act fill:#e8f5e9,stroke:#2e7d32,color:#2e7d32,stroke-dasharray:3 3
+    classDef op fill:#eeeeee,stroke:#555
+    classDef rR fill:#e3f2fd,stroke:#1565c0,color:#1565c0
+    classDef rXh fill:#fce4ec,stroke:#c62828,color:#c62828
+
+    x>"x  0x…9040
+← 上一层输出"]:::act
+    w[("w  0x…1340
+参数")]:::param
+    P["① x²"]:::op
+    M["② v = ¹/d Σ x²"]:::op
+    R["③ r = (v+ε)^-½"]:::op
+    M1["④ x̂ = x · r"]:::op
+    M2["⑤ y = w ⊙ x̂"]:::op
+    y(["y"]):::op
+
+    %% 0-7 前向
+    x --> P --> M --> R --> M1
+    x --> M1 --> M2
+    w --> M2 --> y
+
+    %% 8-10 pack（只画前向新产生的 tensor）
+    SR["r  0x…bc40"]:::rR
+    SXh["x̂  0x…1140"]:::rXh
+    SR --- R
+    SR --- M1
+    SXh --- M2
+
+    %% 11-18 反向 unpack
+    y -.-> M2
+    M2 -. "w" .-> M1
+    M2 -. "x̂" .-> w
+    M1 -. "r" .-> x
+    M1 -. "x" .-> R
+    R -. "r" .-> M
+    M -.-> P
+    P -. "x" .-> x
+
+    linkStyle 11,17 stroke:#999
+    linkStyle 12 stroke:#6a1b9a,stroke-width:2px
+    linkStyle 13 stroke:#c62828,stroke-width:2px
+    linkStyle 14,16 stroke:#1565c0,stroke-width:2px
+    linkStyle 15,18 stroke:#2e7d32,stroke-width:2px
+```
+
+反向沿虚线 ⑤ → ④ → ③ → ② → ①：⑤ 取 $\hat{x}$、$w$，④ 取 $r$、$x$，③ 取 $r$，① 取 $x$，与 print 的 Loading 顺序一致。`x` 有两条虚线入边，两路梯度在叶子上累加。
+
+#### 3.1.1 Operator Fusion
+
+回看表格：$\partial\hat{x}/\partial x$ 只用到 $r$ 和 $\hat{x}$，而 $\hat{x}=x\cdot r$ 是一次逐元素乘——反向手里有 $x$ 和 $r$ 就能当场算回 $\hat{x}$，不必存那 20 MiB。逐算子写法做不到，因为 ⑤ 的 MulBackward 只知道「我要 $\hat{x}$」，不知道它是 $x\cdot r$ 来的。`torch.compile(RMSNorm(...))` 把 ①–⑤ 追踪成一张图，AOTAutograd 生成一个前向 kernel、一个反向 kernel，并在「存」和「重算」之间选便宜的：
+
+```
+Saving  [4,512,2560] grad_fn=None ptr=0x…9040   # x
+Saving  [2560]       grad_fn=None ptr=0x…2b00   # w
+Saving  [4,512,1]    grad_fn=None ptr=0x…3c40   # r
+Loading [4,512,2560] / [2560] / [4,512,1]        # 同序
+```
+
+整个 RMSNorm 成了一个算子，反向公式由 AOTAutograd 写死：
+
+| op | 前向 | 反向要算的偏导 | 偏导里出现的变量 → 存它 | shape | `grad_fn` | 额外显存 | print 里第几条 |
+|:--|:--|:--|:--|:--|:--|--:|:--|
+| fused | $y = w\odot\big(x\cdot r\big)$，$r=(\tfrac1d\sum x^2+\epsilon)^{-1/2}$ | $\partial y/\partial w = \hat{x}$ | $\hat{x}$ → **不存**，反向用 $x\cdot r$ 重算 | — | — | 0 | — |
+| | | $\partial y/\partial x = r\,w\odot(I-\tfrac1d\hat{x}\hat{x}^{\!\top})$ | $x$ | `[4,512,2560]` | None（叶子） | 0（输入本来就在） | 1 |
+| | | | $w$ | `[2560]` | None（叶子） | 0（参数本来就在） | 2 |
+| | | | $r$ | `[4,512,1]` | None（节点内部量） | **8 KiB** | 3 |
+
+```mermaid
+flowchart LR
+    classDef param fill:#f3e5f5,stroke:#6a1b9a,color:#6a1b9a
+    classDef act fill:#e8f5e9,stroke:#2e7d32,color:#2e7d32,stroke-dasharray:3 3
+    classDef op fill:#eeeeee,stroke:#555
+    classDef rR fill:#e3f2fd,stroke:#1565c0,color:#1565c0
+    classDef bwd fill:#fff,stroke:#c62828,stroke-dasharray:4 3,color:#c62828
+
+    x>"x  0x…9040
+← 上一层输出"]:::act
+    w[("w  0x…2b00
+参数")]:::param
+    F["fused forward
+①②③④⑤ 一个 kernel"]:::op
+    y(["y"]):::op
+    SR["r  0x…3c40"]:::rR
+    B["fused backward
+x̂ = x·r 现场重算
+∂y/∂w, ∂y/∂x 一个 kernel"]:::bwd
+
+    x --> F
+    w --> F
+    F --> y
+    SR --- F
+
+    y -.-> B
+    SR -. "r" .-> B
+    B -. "x" .-> x
+    B -. "w" .-> w
+
+    linkStyle 4 stroke:#999
+    linkStyle 5 stroke:#1565c0,stroke-width:2px
+    linkStyle 6 stroke:#2e7d32,stroke-width:2px
+    linkStyle 7 stroke:#6a1b9a,stroke-width:2px
+```
+
+额外显存从 $r+\hat{x}$ ≈ 20 MiB 降到 $r$ ≈ 8 KiB，代价是反向多一次 $x\cdot r$。
+
+原始输出见 `assets/s3/rmsnorm_saved_tensors.txt`。
+
+### 3.2 Activation Checkpointing
+
+xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，为反向存的仍有 **3655 MiB**（PDF 3651，多的 4 MiB 是 hw1 显式传入的 mask）。剩下的全是矩阵乘的输入，融合动不了：
+
+| MiB | 张量 | 占比 |
+|--:|:--|--:|
+| 1024 ×2 | attention 的 S=QKᵀ、P=softmax(S)，`[b,h,s,s]` | 56% |
+| 320 ×3 | FFN 的 `w1(x)`、`w3(x)`、`silu·gate`，`[b,s,d_ff]` | 26% |
+| 80 ×8 | `[b,s,d]` 级：x、ln1(x)、ln2(x)、Q、K、V、attn 输出、x 转置 | 17% |
+| ~7 | mask、RoPE cos/sin、softmax 统计量、rms | 0.2% |
+
+> shape 和总量是 `saved_tensors_hooks` 实测，MiB 按 shape × 4 B 算，「是什么」按 shape 唯一性反推。
+
+32 层 = 114 GiB，xl@2048 fp32 光激活就装不下。attention 的 2 GiB 靠 §4 FlashAttention，其余靠 checkpointing。
+
+#### 3.2.1 Recomputation
+
+`checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入，反向到这段时重跑一遍前向造出 residual，用完释放。4 层 xl block 实测：
+
+| | ① 前向 pack、活到反向（实测） | ② 反向重算一段临时物化（估） | 峰值 ① + ② |
+|:--|--:|--:|--:|
+| 不 checkpoint | 4 × 3655 = **14621 MiB** | 0 | 14.6 GiB |
+| 每 2 层一个 checkpoint | 2 个入口 × 80 = **160 MiB** | 2 × 3655 = 7310 MiB | 7.5 GiB |
+
+k 段的峰值 ≈ k × 80 MiB + (L/k) × 3655 MiB，k 的取舍是本节推导题。代价：每段前向算两遍，一步 ≈ 2 fwd + bwd，多约 1/3。
+
+画法同 §3.1：实线前向、红虚线反向，挂在算子下的框是它为反向留的东西。**绿色 = 前向 pack、一直占着；红色 = 前向丢掉、反向时重算、用完释放。**
+
+**不 checkpoint**：每层各自 pack 3655 MiB（含输入 x_i），一起活到反向。
+
+```mermaid
+flowchart LR
+    classDef act fill:#e8f5e9,stroke:#2e7d32,color:#2e7d32,stroke-dasharray:3 3
+    classDef keep fill:#e8f5e9,stroke:#2e7d32,color:#2e7d32
+    classDef op fill:#eeeeee,stroke:#555
+
+    x0>"x0"]:::act
+    L1["L1"]:::op
+    x1["x1"]:::keep
+    L2["L2"]:::op
+    x2["x2"]:::keep
+    L3["L3"]:::op
+    x3["x3"]:::keep
+    L4["L4"]:::op
+    y(["y"]):::op
+    x0 --> L1 --> x1 --> L2 --> x2 --> L3 --> x3 --> L4 --> y
+
+    R1["3655 MiB\n含 x0"]:::keep
+    R2["3655 MiB\n含 x1"]:::keep
+    R3["3655 MiB\n含 x2"]:::keep
+    R4["3655 MiB\n含 x3"]:::keep
+    L1 --- R1
+    L2 --- R2
+    L3 --- R3
+    L4 --- R4
+
+    y -.-> L4
+    L4 -. "dx3" .-> x3
+    x3 -.-> L3
+    L3 -. "dx2" .-> x2
+    x2 -.-> L2
+    L2 -. "dx1" .-> x1
+    x1 -.-> L1
+    L1 -. "dx0" .-> x0
+    linkStyle 12,13,14,15,16,17,18,19 stroke:#c62828,stroke-width:2px
+```
+
+**每 2 层一个 checkpoint**：只 pack 入口 x0、x2；x1、x3 和两层的 residual 都在框内，反向到这段时重算。
+
+```mermaid
+flowchart LR
+    classDef act fill:#e8f5e9,stroke:#2e7d32,color:#2e7d32,stroke-dasharray:3 3
+    classDef keep fill:#e8f5e9,stroke:#2e7d32,color:#2e7d32
+    classDef res fill:#fce4ec,stroke:#c62828,color:#c62828
+    classDef op fill:#eeeeee,stroke:#555
+
+    x0>"x0"]:::act
+    x2["x2"]:::keep
+    y(["y"]):::op
+    subgraph A["checkpoint"]
+        LA["L1 L2"]:::op
+    end
+    subgraph B["checkpoint"]
+        LB["L3 L4"]:::op
+    end
+    x0 --> LA --> x2 --> LB --> y
+
+    RA["2 × 3655 MiB（含 x1）\n反向时用 x0 重算"]:::res
+    RB["2 × 3655 MiB（含 x3）\n反向时用 x2 重算"]:::res
+    LA --- RA
+    LB --- RB
+
+    y -.-> LB
+    LB -. "dx2" .-> x2
+    x2 -.-> LA
+    LA -. "dx0" .-> x0
+    linkStyle 6,7,8,9 stroke:#c62828,stroke-width:2px
+```
+
+两段不能并行：L2 反向要 `dx2`，它是 L3 反向的输出。前半段的重算只依赖 x0、理论上能提前，但那样两段红色同时活着，峰值回到 14.6 GiB——串行就是省显存的代价。
+
+> 原始输出 `assets/s3/four_blocks_checkpoint.txt`，实验在 `notes/notes.ipynb` §3.2。

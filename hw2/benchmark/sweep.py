@@ -9,9 +9,8 @@ from datetime import date
 
 import pandas as pd
 import torch
-from tqdm import tqdm
 
-from .config import BenchConfig, BenchResult
+from .config import SWEEP_CONFIGS, BenchConfig, BenchResult, parse_sweep_config
 from .runner import run
 
 
@@ -77,28 +76,30 @@ def _pretty(df: pd.DataFrame) -> str:
     for c in df.columns:
         if df[c].dtype == bool:
             df[c] = df[c].map({True: "✓", False: "·"})
-    df = df.rename(columns={"peak_mem_gb": "peak GB", "seq_len": "seq", "batch_size": "batch"})
+    df = df.rename(columns={"peak_mem_gib": "peak GiB", "seq_len": "seq", "batch_size": "batch"})
     header = "  ".join(f"{k}={v}" for k, v in const.items())
     return f"[{header}]\n" + tabulate(df, headers="keys", tablefmt="rounded_outline", showindex=False, floatfmt=".2f")
 
 
-def sweep(cfgs: list[BenchConfig], out_path: str | None = None, isolate: bool = False) -> list[BenchResult]:
+def sweep(cfgs: list[BenchConfig], out_path: str | None = None, isolate: bool = False,
+          as_frame: bool = False) -> list[BenchResult] | pd.DataFrame:
+    """as_frame=True 返回 DataFrame（notebook 里 display 用），否则返回 BenchResult 列表。"""
     results = []
-    bar = tqdm(cfgs, unit="cfg", dynamic_ncols=True, leave=False)
-    for c in bar:
+    for i, c in enumerate(cfgs, 1):
         tag = f"{c.size} {c.mode} seq={c.seq_len}" + (" no_grad" if c.inference else "") \
             + (" bf16" if c.autocast else "") + (f" warmup={c.warmup}" if c.warmup != 5 else "")
-        bar.set_postfix_str(tag)
+        # 单行原地刷新，不留历史（notebook 里跑完只剩最终表）
+        print(f"\r[{i}/{len(cfgs)}] {tag:<40}", end="", flush=True)
         r = _run_isolated(c) if isolate else run(c)
         results.append(r)
-        ms = f"{r.avg_ms:8.2f} ± {r.std_ms:5.2f} ms" if r.status == "OK" else f"{r.status:>19}"
-        bar.write(f"  {tag:<40} {ms}   peak {r.peak_mem_gb:5.2f} GB")
         if c.is_cuda:
             torch.cuda.empty_cache()
+    print("\r" + " " * 60 + "\r", end="")
 
     df = pd.DataFrame([{k: v for k, v in r.__dict__.items() if k != "times_ms"} for r in results])
     report = df.to_markdown(index=False) + footnote(cfgs)
-    print("\n" + _pretty(df) + "\n")
+    if not as_frame:
+        print("\n" + _pretty(df) + "\n")
 
     if out_path:
         with open(out_path, "w") as f:
@@ -107,4 +108,9 @@ def sweep(cfgs: list[BenchConfig], out_path: str | None = None, isolate: bool = 
         with open(json_path, "w") as f:
             json.dump([r.__dict__ for r in results], f, indent=2, ensure_ascii=False)
         print(f"已写出：{out_path}\n         {json_path}（含逐步原始耗时）")
-    return results
+    return df if as_frame else results
+
+
+def run_config(name: str, out: str, isolate: bool = False) -> pd.DataFrame:
+    """SWEEP_CONFIGS[name] 一把跑完，写到 out（.md + 同名 .json），返回 DataFrame。notebook 入口。"""
+    return sweep(parse_sweep_config(SWEEP_CONFIGS[name]), out, isolate=isolate, as_frame=True)

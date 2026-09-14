@@ -54,7 +54,7 @@ SWEEP_CONFIGS = {
         "mode_and_inference": [("forward", True)],
     },
     # §2.4 (c)：fp32 vs bf16 autocast，只要 forward / fwd_bwd（backward 靠相减）。
-    # 10B 权重就 51 GB，什么精度都装不下，不浪费时间；xl 在 fp32 下 OOM，bf16 值得试。
+    # 10B 权重就 48 GiB，什么精度都装不下，不浪费时间；xl 在 fp32 下 OOM，bf16 值得试。
     "mixed_precision": {
         "model_type": ["basics"],
         "size": ["small", "medium", "large", "xl"],
@@ -67,8 +67,8 @@ SWEEP_CONFIGS = {
         "mode_and_inference": [("forward", False), ("fwd_bwd", False)],
     },
     # §2.5 (b)(c)：xl 在 seq {128, 2048} 下 forward / full 的峰值显存，fp32 与 bf16 各一遍。
-    # 只要 peak_mem_gb 这一列，steps 给 2 就够（峰值和步数无关）。xl@2048 full 预期 OOM，
-    # OOM 行的 peak_mem_gb 是炸掉前的水位，也是数据。
+    # 只要 peak_mem_gib 这一列，steps 给 2 就够（峰值和步数无关）。xl@2048 full 预期 OOM，
+    # OOM 行的 peak_mem_gib 是炸掉前的水位，也是数据。
     "memory_xl": {
         "model_type": ["basics"],
         "size": ["xl"],
@@ -85,16 +85,17 @@ SWEEP_CONFIGS = {
 
 @dataclass
 class BenchConfig:
-    model_type: str
-    size: str
-    mode: str               # forward | fwd_bwd | full
-    inference: bool         # 前向包 no_grad（只能配 mode=forward）
-    warmup: int
-    steps: int
-    batch_size: int
-    seq_len: int
-    vocab_size: int
-    device: str
+    """默认值与 CLI 一致，所以 BenchConfig("xl", 128, "fwd_bwd") 就能用（前三个位置参数：size, seq_len, mode）。"""
+    size: str = "small"
+    seq_len: int = 512
+    mode: str = "forward"   # forward | fwd_bwd | full
+    inference: bool = False # 前向包 no_grad（只能配 mode=forward）
+    warmup: int = 5
+    steps: int = 10
+    batch_size: int = 4
+    vocab_size: int = 10000
+    model_type: str = "basics"
+    device: str = "cuda"
     autocast: bool = False  # 前向 + loss 走 bf16 autocast；反向沿用前向 dtype，最终 .grad 仍为 fp32
     nvtx: bool = False      # 插 NVTX range（供 nsys profile 用），默认关，以免改变 §2.1 的计时基准线
     nvtx_attn: bool = False # 再往 attention 内部插三段 range（§2.2 (e)），需 --nvtx
@@ -147,24 +148,24 @@ class BenchResult:
     std_ms: float
     first_ms: float
     rest_avg_ms: float
-    peak_mem_gb: float
+    peak_mem_gib: float
     status: str                                     # OK | OOM (stage) | ERROR (stage)
     times_ms: list[float] = field(default_factory=list)  # 逐步原始耗时，只进 json 不进表
 
     @classmethod
-    def failed(cls, cfg: BenchConfig, stage: str, peak_gb: float, status: str) -> "BenchResult":
+    def failed(cls, cfg: BenchConfig, stage: str, peak_gib: float, status: str) -> "BenchResult":
         return cls(
             model=cfg.model_type, size=cfg.size, seq_len=cfg.seq_len, batch=cfg.batch_size,
             warmup=cfg.warmup, steps=cfg.steps, mode=cfg.mode,
             inference=cfg.inference, autocast=cfg.autocast,
             avg_ms=float("nan"), std_ms=float("nan"),
             first_ms=float("nan"), rest_avg_ms=float("nan"),
-            peak_mem_gb=round(peak_gb, 2),
+            peak_mem_gib=round(peak_gib, 2),
             status=f"{status} ({stage})",
         )
 
 
-def parse_sweep_config(sweep_def: dict, device: str) -> list[BenchConfig]:
+def parse_sweep_config(sweep_def: dict, device: str = "cuda") -> list[BenchConfig]:
     coupled = sweep_def.get("mode_and_inference", [("forward", False)])
     valid = {f.name for f in fields(BenchConfig)}
     keys = [k for k in sweep_def if k in valid]

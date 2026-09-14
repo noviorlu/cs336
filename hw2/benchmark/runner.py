@@ -102,8 +102,8 @@ def _reset_peak(cfg: BenchConfig) -> None:
         torch.cuda.reset_peak_memory_stats()
 
 
-def _peak_gb(cfg: BenchConfig) -> float:
-    return torch.cuda.max_memory_allocated() / (1024 ** 3) if cfg.is_cuda else 0.0
+def _peak_gib(cfg: BenchConfig) -> float:
+    return torch.cuda.max_memory_allocated() / (1024 ** 3) if cfg.is_cuda else 0.0  # GiB
 
 
 def run(cfg: BenchConfig) -> BenchResult:
@@ -131,7 +131,7 @@ def run(cfg: BenchConfig) -> BenchResult:
                     _sync(cfg)
 
             # ---- 预热 → 测量的分界 ----
-            # peak 计数器清零：peak_mem_gb 只统计测量段。
+            # peak 计数器清零：peak_mem_gib 只统计测量段。
             _reset_peak(cfg)
             probes.live = True
 
@@ -154,13 +154,13 @@ def run(cfg: BenchConfig) -> BenchResult:
             std_ms=round(t.std().item(), 2) if cfg.steps > 1 else 0.0,
             first_ms=round(times[0], 2) if times else float("nan"),
             rest_avg_ms=round(t[1:].mean().item(), 2) if cfg.steps > 1 else float("nan"),
-            peak_mem_gb=round(_peak_gb(cfg), 2),
+            peak_mem_gib=round(_peak_gib(cfg), 2),
             status="OK",
             times_ms=[round(v, 3) for v in times],
         )
 
     except RuntimeError as e:
-        peak = _peak_gb(cfg)
+        peak = _peak_gib(cfg)
         if "out of memory" in str(e).lower():
             return BenchResult.failed(cfg, stage[0], peak, "OOM")
         print(f"\n!! 非 OOM 异常 @ stage={stage[0]}: {e}", file=sys.stderr)

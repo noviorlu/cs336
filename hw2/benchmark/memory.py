@@ -64,7 +64,8 @@ def _sqlite(rep: Path) -> sqlite3.Connection:
     return sqlite3.connect(db)
 
 
-def block_residuals(rep: Path, block: int = 5, top: int = 5):
+def block_residuals(rep: Path | str, block: int = 5, top: int = 5):
+    rep = Path(rep)
     c = _sqlite(rep)
     (b_start, b_end, tid), = c.execute(
         "select start, end, globalTid from NVTX_EVENTS where text = ?", (f"block{block}",)).fetchall()
@@ -123,7 +124,7 @@ def block_residuals(rep: Path, block: int = 5, top: int = 5):
     return res_bytes, by_op
 
 
-def plot_block(rep: Path, block: int = 5, out: Path | None = None):
+def plot_block(rep: Path | str, block: int = 5, out: Path | str | None = None):
     """把 nsys GUI 里那两行画出来：上图整步的 GPU 显存曲线 + 每层 block range；
     下图放大到 block{block} 的前向，标出为反向保存下来的分配（residual）和它们的来源算子。
     数据全部来自 nsys 的 sqlite（CUDA_GPU_MEMORY_USAGE_EVENTS + NVTX_EVENTS），与 GUI 同源。"""
@@ -131,6 +132,7 @@ def plot_block(rep: Path, block: int = 5, out: Path | None = None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    rep = Path(rep)
     c = _sqlite(rep)
     ev = c.execute("select start, bytes, memoryOperationType, address from CUDA_GPU_MEMORY_USAGE_EVENTS "
                    "where memoryOperationType in (0, 1) order by start").fetchall()
@@ -229,7 +231,7 @@ def plot_block(rep: Path, block: int = 5, out: Path | None = None):
     # 下两行共用时间轴，贴紧；上图和中图之间留出标题和注释的空间
     p2, p3 = ax2.get_position(), ax3.get_position()
     ax3.set_position([p3.x0, p2.y0 - p3.height - 0.012, p3.width, p3.height])
-    out = out or rep.with_name(f"{rep.stem}_block{block}.png")
+    out = Path(out) if out else rep.with_name(f"{rep.stem}_block{block}.png")
     fig.savefig(out, dpi=220, bbox_inches="tight"); plt.close(fig)
     print(f"图已写出：{out}")
     return out
