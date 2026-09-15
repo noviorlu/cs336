@@ -38,7 +38,7 @@ def nsys_profile(cfg: BenchConfig, rep: str | Path, *, memory: bool = False,
 def snapshot(cfg: BenchConfig, pickle_path: str | Path, quiet: bool = False) -> bool:
     """在独立子进程里跑一个配置并落 torch 显存快照（§2.5 (a)(e)）。
 
-    独立进程是为了每次都从干净的显存池开始；OOM 也会落盘（runner 里 finally 写）。
+    独立进程是为了每次都从干净的显存池开始；OOM 也会落盘（model_bench 里 finally 写）。
     """
     p = Path(pickle_path)
     p.parent.mkdir(parents=True, exist_ok=True)

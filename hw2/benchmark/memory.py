@@ -1,6 +1,6 @@
 """显存快照——只服务 §2.5 memory_profiling，timeit 计时基准线不经过这里。
 
-挂在 runner.run() 里，从预热开始记到测量结束。为什么不只记测量段：xl@2048 的 full step
+挂在 model_bench.run_model() 里，从预热开始记到测量结束。为什么不只记测量段：xl@2048 的 full step
 在第一个前向就 OOM，那样什么都留不下。代价是时间线第一步带着 cuBLAS workspace 等一次性
 初始化，看图时看第二步（或者 --warmup 0 --steps 1，接受第一步的噪声）。
 

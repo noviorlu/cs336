@@ -1,7 +1,7 @@
 """NVTX 探针——只服务 nsys profile（§2.2），timeit 计时基准线不经过这里。
 
-设计：runner 拿到一个 Probes 对象，在各阶段调用 probes.range / probes.phase；
-Probes 关掉时全部返回 nullcontext，runner 不需要知道 nvtx 是否开着。
+设计：model_bench 拿到一个 Probes 对象，在各阶段调用 probes.range / probes.phase；
+Probes 关掉时全部返回 nullcontext，model_bench 不需要知道 nvtx 是否开着。
 """
 import contextlib
 import math
@@ -30,7 +30,7 @@ class Probes:
         self.enabled = cfg.nvtx and cfg.is_cuda
         self.attn = self.enabled and cfg.nvtx_attn
         self.ops = self.enabled and cfg.nvtx_ops
-        self.live = False   # runner 在 warmup 结束后置 True
+        self.live = False   # model_bench 在 warmup 结束后置 True
 
     def range(self, name: str):
         return nvtx.range(name) if self.enabled else contextlib.nullcontext()
@@ -59,7 +59,7 @@ class Probes:
 
     def emit_ops(self):
         """§2.5 (f)：给每个 aten 算子打 NVTX range（前向 `aten::mm` 等，反向带对应前向的序号）。
-        必须同时包住 forward 和 backward，所以 runner 用它包整个 step。"""
+        必须同时包住 forward 和 backward，所以 model_bench 用它包整个 step。"""
         if self.ops and self.live:
             return torch.autograd.profiler.emit_nvtx()
         return contextlib.nullcontext()

@@ -107,7 +107,7 @@ def _peak_gib(cfg: BenchConfig) -> float:
     return torch.cuda.max_memory_allocated() / (1024 ** 3) if cfg.is_cuda else 0.0  # GiB
 
 
-def run(cfg: BenchConfig) -> BenchResult:
+def run_model(cfg: BenchConfig) -> BenchResult:
     stage = ["init"]
     probes = Probes(cfg)
     model = opt = batch = step_fn = None

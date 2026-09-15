@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 
 from .config import SWEEP_CONFIGS, BenchConfig, BenchResult, parse_sweep_config
-from .runner import run
+from .model_bench import run_model
 
 
 def _run_isolated(cfg: BenchConfig) -> BenchResult:

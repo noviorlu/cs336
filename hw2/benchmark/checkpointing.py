@@ -1,6 +1,6 @@
 """§3.2 (b)：把 model.layers 每 `every` 层包成一个 torch.utils.checkpoint 段。
 
-只服务「扫段长测峰值」这一个实验；关掉（every=None）时 runner 感知不到它。
+只服务「扫段长测峰值」这一个实验；关掉（every=None）时 model_bench 感知不到它。
 段是一个 nn.Module，签名与单层相同（x, mask=, token_positions=），所以 TransformerLM.forward
 里 `for layer in self.layers` 那行不用改——它看到的还是一串「层」，只是每个内部跑 `every` 层。
 """
