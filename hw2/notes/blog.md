@@ -306,13 +306,8 @@ xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 
 
 §2.5(f) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
 
-$$
-\mathrm{RMSNorm}(x)_i = w_i \cdot \frac{x_i}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}}
-\qquad\Longleftrightarrow\qquad
-\underbrace{r = \big(\underbrace{\tfrac{1}{d}\textstyle\sum_j \underbrace{x_j^2}_{①}}_{②} + \epsilon\big)^{-1/2}}_{③},\;
-\underbrace{\hat{x} = x \cdot r}_{④},\;
-\underbrace{y = w \odot \hat{x}}_{⑤}
-$$
+$\mathrm{RMSNorm}(x)_i = w_i \cdot \frac{x_i}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}}$，拆成 5 个 op：
+$\underbrace{r = \big(\underbrace{\tfrac{1}{d}\textstyle\sum_j \underbrace{x_j^2}_{①}}_{②} + \epsilon\big)^{-1/2}}_{③}$，$\underbrace{\hat{x} = x \cdot r}_{④}$，$\underbrace{y = w \odot \hat{x}}_{⑤}$
 
 ```python
 rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)   # ① pow  ② mean  ③ rsqrt
@@ -701,7 +696,7 @@ def ckpt(layers, x):
 
 L 层、每段 e 层、entry 大小 a、一层 saved tensors 大小 r，峰值 = 全部 L/e 个 entry + 正在重算的 e 层：
 
-$$M(e) = \frac{L}{e}a + e\,r$$
+$M(e) = \frac{L}{e}a + e\,r$
 
 e 越小第二项越小，但 entry 数 L/e 越多。只要 **全部 entry 加起来都不到一层 saved（L·a < r）**，第一项永远压不过第二项，显存随 e 单调、最优 e = 1。这里 36 × 5 MiB = 180 MiB < 220 MiB；xl@2048 是 32 × 80 = 2.5 GiB < 3.6 GiB。Transformer 每层很胖，几乎总是如此；只有层数超过 r/a（这里 ≈ 44）时 e = 1 才会比 e = 2 更费。
 
