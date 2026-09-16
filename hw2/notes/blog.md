@@ -111,9 +111,9 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 ### 2.1 时间花在哪（Benchmarking & Profiling）
 
-两个尺度：先用 `timeit` 看整步（作业 2.1），再用 Nsight Systems 拆到每个 kernel（作业 2.2）。
+两个尺度：先用 `timeit` 看整步（(a)–(c)，作业 2.1），再用 Nsight Systems 拆到每个 kernel（(d)–(h)，作业 2.2）。
 
-#### 整步：timeit 计时
+#### (a)–(c) 整步：timeit 计时
 
 **(a) 脚本**
 
@@ -146,11 +146,11 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | medium | 196.8 ± 96.7  | 166.5 ± 0.9 | 167.2 ± 1.8 |
 | large  | 400.9 ± 86.8  | 374.4 ± 2.8 | 375.1 ± 3.2 |
 
-#### 逐 kernel：Nsight Systems 剖析
+#### (d)–(h) 逐 kernel：Nsight Systems 剖析
 
 用 NVIDIA Nsight Systems（`nsys`）采 GPU kernel 级 timeline，代码里用 NVTX range 标出 forward / backward / optimizer 各段。覆盖 small + medium × seq 256 / 512 / 1024（large 只跑得到 512）。
 
-**(a) 前向耗时与 timeit 对得上吗**
+**(d) 前向耗时与 timeit 对得上吗**
 
 **问题**：nsys 里 forward range 的宽度和上面用 `timeit` 量的一致吗。
 
@@ -162,9 +162,9 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | timeit |  9.44 | 16.66 | 51.30 | 23.37 | 47.67 | 146.52 |
 | 相对差 | +7.7% | +5.0% | +2.3% | +5.6% | +4.4% | +2.9% |
 
-**(b)–(e) kernel 分析：GPU 时间花在哪**
+**(e)–(h) kernel 分析：GPU 时间花在哪**
 
-**问题**：(b) 最耗时的 kernel 是哪个，加上反向还是它吗；(c) 矩阵乘之外还有什么占时间；(d) 算上 optimizer 后矩阵乘占比怎么变；(e) attention 内部 softmax 和两次矩阵乘各花多少，和 FLOPs 相称吗。
+**问题**：(e) 最耗时的 kernel 是哪个，加上反向还是它吗；(f) 矩阵乘之外还有什么占时间；(g) 算上 optimizer 后矩阵乘占比怎么变；(h) attention 内部 softmax 和两次矩阵乘各花多少，和 FLOPs 相称吗。
 
 分三步看：先把 nsys 里的 kernel 归类，再看整步的时间怎么分，最后放大到 attention 内部。
 
@@ -185,7 +185,7 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | elementwise | 16% | 23% | 40% | 34% | 39% |
 | reduce | 2% | 2% | 6% | 1% | 2% |
 
-- **(b) 最耗时的 kernel** 是 `cutlass_80_simt_sgemm_128x256_8x4_tn`：前向占 45–54%，加上反向和 optimizer 后仍是第一但只剩 17%。名字拆读：`128x256` 是每个 thread block 负责的输出分块，`tn` 是两个输入的布局（第一个转置）。cuBLAS 按矩阵形状和布局选 tile，同是 Linear 的矩阵乘会散在几个名字下；用每步实例数（24 层 × 7 个 Linear + lm_head = 169）能对出各是哪一步：
+- **(e) 最耗时的 kernel** 是 `cutlass_80_simt_sgemm_128x256_8x4_tn`：前向占 45–54%，加上反向和 optimizer 后仍是第一但只剩 17%。名字拆读：`128x256` 是每个 thread block 负责的输出分块，`tn` 是两个输入的布局（第一个转置）。cuBLAS 按矩阵形状和布局选 tile，同是 Linear 的矩阵乘会散在几个名字下；用每步实例数（24 层 × 7 个 Linear + lm_head = 169）能对出各是哪一步：
 
   | kernel | 每步次数 | 对应 |
   |:--|--:|:--|
@@ -194,8 +194,8 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
   | `sgemm_128x128_nt` + `sgemm_128x64_nt` | 73 + 96 = 169 | 反向 dW = dyᵀ·x |
 
   73 / 96 是 d_model 宽的 QKVO 投影和 d_ff 宽的 FFN 矩阵分到了不同 tile。所以「最大 kernel」就是 Linear 的前向矩阵乘；full step 里它的份额被 dx、dW 两组各 169 次的反向 GEMM 分走。
-- **(c) 矩阵乘之外**是 elementwise + reduce，前向占比从 18%（seq 256）涨到 46%（seq 1024）。它们 FLOPs 极少，占时间是因为每个 kernel 都要把张量完整读一遍写一遍，而 attention 的中间张量随 seq² 涨——第三步量化。
-- **(d) 算上 optimizer**，matmul 占比比前向低 15–17 个百分点，让出的份额被 elementwise 吃掉：反向的梯度累加和 AdamW 的更新全是逐元素。small 同样趋势（forward 1024：matmul 51%）。
+- **(f) 矩阵乘之外**是 elementwise + reduce，前向占比从 18%（seq 256）涨到 46%（seq 1024）。它们 FLOPs 极少，占时间是因为每个 kernel 都要把张量完整读一遍写一遍，而 attention 的中间张量随 seq² 涨——第三步量化。
+- **(g) 算上 optimizer**，matmul 占比比前向低 15–17 个百分点，让出的份额被 elementwise 吃掉：反向的梯度累加和 AdamW 的更新全是逐元素。small 同样趋势（forward 1024：matmul 51%）。
 
 **第三步：attention 内部**。把 attention 拆三段打 NVTX——scores（QKᵀ、/√d、mask）、softmax、PV——统计每段内 kernel 的 GPU 时间，24 层合计，占整个 forward 的比例：
 
@@ -206,7 +206,7 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | PV | 0.5 (2%) | 1.7 (4%) | 5.8 (4%) |
 | 其余（QKVO 投影、RoPE、FFN、RMSNorm、残差加） | 19.8 (88%) | 33.9 (74%) | 65.4 (47%) |
 
-- **(e) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。看每个 op 的算术强度 I = FLOPs / 读写显存 bytes：5090 fp32 算力 1.05e14 FLOPS、带宽 1.79e12 B/s，I 低于两者之比 ≈ 60 的 op 受限于带宽，时间 = bytes / 带宽，与 FLOPs 无关。medium@1024 一层内各 op（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
+- **(h) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。看每个 op 的算术强度 I = FLOPs / 读写显存 bytes：5090 fp32 算力 1.05e14 FLOPS、带宽 1.79e12 B/s，I 低于两者之比 ≈ 60 的 op 受限于带宽，时间 = bytes / 带宽，与 FLOPs 无关。medium@1024 一层内各 op（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
 
   | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 | 带宽下限 | 实测 |
   |:--|--:|--:|--:|--:|--:|--:|
