@@ -1,0 +1,4 @@
+autocast=False: params 0.48 GiB | saved tensors 3.86 GiB ({'torch.int64': 0.0, 'torch.float32': 3.86, 'torch.bool': 0.0}) = 参数本身 0.45 + bf16 权重副本 0.00 + activation 3.41 | fwd 后 allocated 3.90 | peak 4.07
+autocast=True: params 0.48 GiB | saved tensors 2.50 GiB ({'torch.int64': 0.0, 'torch.float32': 0.93, 'torch.bfloat16': 1.57, 'torch.bool': 0.0}) = 参数本身 0.00 + bf16 权重副本 0.23 + activation 2.28 | fwd 后 allocated 3.04 | peak 3.18
+
+峰值变化 -0.89 GiB = 副本 +0.23 + saved tensors 变化 -1.13 → 和 -0.91
