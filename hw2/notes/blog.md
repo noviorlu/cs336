@@ -338,7 +338,7 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) | +1.78 | −5.50 |
 | xl     | OOM → OOM | — | — | — | — | +6.35 | — |
 
-峰值显存是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风；到 xl@128 这种 token 少、权重大的配置就反过来：`no_grad` 前向 +49%（副本全在、没有 activation 可省）；fwd_bwd 看似持平，其实是峰值落在反向末尾、副本那时已释放——见 §2.3(e)。
+这三档的 fwd_bwd 峰值都出现在**前向结束、反向刚开始**的时刻：activation（3.4 / 8.8 / 16.4 GiB）远大于梯度（0.5 / 1.6 / 3.6），反向每层释放的 saved tensors 比新增的梯度多，曲线往下走。所以峰值 = 权重 + 全部 saved tensors，bf16 对它的影响就是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风。前提「峰值在前向末尾」在 xl 上不成立——梯度 12.7 GiB 比 activation 大，峰值挪到反向末尾，这套分解就不适用了，见 (e)。
 
 #### (e) xl 上为什么不省：峰值落在哪一刻
 
