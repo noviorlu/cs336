@@ -197,7 +197,7 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
   | op | FLOPs | 读写 bytes | I | 带宽下限 | 实测 |
   |:--|--:|--:|--:|--:|--:|
-  | Linear（FFN w1，`[4096,1024]×[1024,4096]`） | 3.4e10 | 96 MiB | 340 | 0.06 ms | 算力受限 |
+  | Linear（以 FFN w1 为例：x `[b·s, d_model]` × Wᵀ `[d_model, d_ff]` = `[4096,1024]×[1024,4096]`） | 3.4e10 | 读 x 16 MiB、W 16 MiB，写出 64 MiB | 340 | 0.06 ms | 算力受限 |
   | S = QKᵀ | 8.6e9 | 读 Q、K 32 MiB，写 S 256 MiB | 28 | 0.17 ms | 0.61 ms |
   | S / √d | 6.7e7 | 读写 S 512 MiB | 0.13 | 0.30 ms | 0.34 ms |
   | masked_fill | 0 | 读写 S 512 MiB | 0 | 0.30 ms | 0.35 ms |
