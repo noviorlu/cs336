@@ -96,7 +96,7 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
 
-| Size | 20N token | step (fp32) | fp32 | step (bf16) | bf16 |
+| Size | 20N token | step (fp32) | 总时长 fp32 | step (bf16) | 总时长 bf16 |
 |:-----|--:|--:|--:|--:|--:|
 | small  |  2.6B |  52.8 ms |  18 h |  33 ms |  12 h |
 | medium |  8.5B | 162.7 ms | 187 h（7.8 天） |  95 ms | 109 h（4.5 天） |
@@ -127,7 +127,7 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 反向约为前向的 2 倍（2.02 / 2.02 / 1.93），optimizer 占 7%；测量很稳，标准差 ≤1.4%。xl 前向带图即 OOM，10B 建模型即 OOM。
 
-| Size | forward | backward | optimizer | full |
+| Size | forward (ms) | backward (ms) | optimizer (ms) | full (ms) |
 |:-----|--------:|---------:|----------:|-----:|
 | small  |  17.2 ± 0.4 |  34.8 |  3.7 |  55.7 ± 0.7 |
 | medium |  51.1 ± 0.5 | 103.3 | 12.9 | 167.4 ± 1.6 |
@@ -140,7 +140,7 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 不预热时首步比稳态慢 1.7–6.9×（绝对开销 ~300 ms，来自 kernel 懒加载、cuBLAS 初始化、显存池首次 cudaMalloc），10 步均值虚高 7–59%、标准差从 ~1 ms 涨到 ~100 ms；warmup=1 之后就稳了，模型越小坑越深。
 
-| Size | w=0 | w=1 | w=5 |
+| full step (ms) | w=0 | w=1 | w=5 |
 |:-----|----:|----:|----:|
 | small  |  88.4 ± 103.4 |  55.7 ± 0.5 |  55.7 ± 0.6 |
 | medium | 196.8 ± 96.7  | 166.5 ± 0.9 | 167.2 ± 1.8 |
@@ -156,7 +156,7 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 对得上，nsys 系统性偏高 2.3–7.7%，相对开销随负载增大而缩小。
 
-| | small 256 | small 512 | small 1024 | medium 256 | medium 512 | medium 1024 |
+| forward (ms) | small 256 | small 512 | small 1024 | medium 256 | medium 512 | medium 1024 |
 |:--|--:|--:|--:|--:|--:|--:|
 | nsys   | 10.17 | 17.50 | 52.50 | 24.68 | 49.76 | 150.78 |
 | timeit |  9.44 | 16.66 | 51.30 | 23.37 | 47.67 | 146.52 |
@@ -368,7 +368,7 @@ T 是常数偏移，M(k) 对 k 是直线、斜率 (G − A)/L，峰值必在两�
 
 **(d) small / medium / large @512**（A = 3.4 / 8.8 / 16.4 GiB ≫ G = 0.5 / 1.6 / 3.6，峰值在前向末尾）：
 
-| Size | forward fp32 → bf16 | 加速 | backward fp32 → bf16 | 加速 | 峰值显存 fp32 → bf16（GiB） | 其中权重侧 | 其中 activation 侧 |
+| Size | forward fp32 → bf16 (ms) | 加速 | backward fp32 → bf16 (ms) | 加速 | 峰值显存 fp32 → bf16（GiB） | 其中权重侧 | 其中 activation 侧 |
 |:-----|:--|--:|:--|--:|:--|--:|--:|
 | small  |  17.2 →  9.2 | 1.87× |  33.9 →  20.1 | 1.69× | 4.08 → 3.18 (−21%) | +0.23 | −1.13 |
 | medium |  50.1 → 24.4 | 2.05× | 102.3 →  57.3 | 1.79× | 10.58 → 8.36 (−21%) | +0.77 | −2.95 |
