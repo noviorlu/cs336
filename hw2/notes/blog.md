@@ -228,7 +228,7 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 ### 2.2 显存剖析（Memory Profiling）
 
-用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。五问分两步：先看整步的时间线和峰值（a、b），再放大到一层里面谁最大、谁被留到反向（c、d、e）；bf16 列的解释放在 §2.3(e)。
+用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。五问分两步：先看整步的时间线和峰值（a、b），再放大到一层里面谁最大、谁被留到反向（c、d、e）；bf16 列的解释放在 §2.3(d)(e)。
 
 #### (a)(b) 整步：时间线与峰值
 
@@ -293,7 +293,7 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 
 ### 2.3 混合精度（Mixed Precision）
 
-五问两步：先看精度——低精度数值的坑、autocast 把谁降了精度、为什么留下 LayerNorm（a、b、c）；再看代价换来了什么——速度和显存（d）以及 xl 上为什么显存不省（e）。
+五问两步：先看精度——低精度数值的坑、autocast 把谁降了精度、为什么留下 LayerNorm（a、b、c）；再看代价换来了什么——速度和显存（d、e）。
 
 #### (a)(b)(c) 精度：谁该留在 fp32
 
@@ -315,11 +315,25 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 - (b) autocast 不改存储的权重，只在算子调用时转换输入：矩阵乘的输出（fc1、logits）是 fp16，LayerNorm、loss、梯度留在 fp32。bf16 下模式相同。
 - (c) LayerNorm 敏感的是特征维上的**归约**（均值 / 方差累加，正是 (a) 的场景）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但归约精度比 fp16 更差（(a) 里卡在 4.0 就是它），所以仍要留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，留 fp32 基本免费。
 
-#### (d) bf16 换来多少速度和显存
+#### (d)(e) 代价换来了什么：速度与显存
 
-**问题**：bf16 autocast 相对 fp32，各规格前向和反向快多少，显存省多少。
+**问题**：(d) bf16 autocast 相对 fp32，各规格前向和反向快多少，显存省多少；(e) xl@128 / 2048 开 bf16 后峰值变化多少，为什么趋势不同。
 
-bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加速越高**（大 GEMM 更接近 Tensor Core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。xl 在 bf16 下仍 OOM。加速比是两个效应的乘积：位宽减半（搬的 bytes 少一半），以及**换了算术单元**——纯 fp32 矩阵乘只能走 CUDA core（nsys 里的 `simt_sgemm`，峰值 1.05e14 FLOPS），bf16 才有资格进 Tensor core（2.1e14）。基准关掉 `allow_tf32` 就是为了让 fp32 老老实实走 CUDA core，否则 fp32 也会被偷偷截成 tf32 送进 Tensor core，两组数就不是在比精度了。
+**先说显存的判据**。训练一步的峰值落在哪一刻，决定了 bf16 能不能省出来。记 W = 权重、G = 全部梯度（大小 = W）、A = 前向结束时为反向存的全部 saved tensors。反向从最后一层往前走，到第 k 层（共 L 层）时活着的是：
+
+W + G·k/L + A·(L−k)/L
+
+每走一层新增 G/L 的梯度、释放 A/L 的 saved tensors，所以曲线涨还是降只看 **A 和 G 谁大**：
+
+| | A > G（saved tensors 比一份权重大） | G > A |
+|:--|:--|:--|
+| 反向曲线 | 下坡 | 上坡 |
+| 峰值时刻 | **前向末尾** | **反向末尾** |
+| 峰值 = | W + A | W + G = 2W |
+| bf16 的影响 | A 减少（矩阵乘的输入输出成 bf16）、多一份 bf16 权重副本（+参数量 × 2 B，也是 saved tensor）——两项相抵 | 此刻 saved tensors 和副本都已释放，bf16 **不改变峰值** |
+| 什么时候 | 正常训练：A ∝ token 数 × 层数，喂够 token 就满足 | token 少、模型大：xl 只喂 512 个 token |
+
+**(d) small / medium / large @512**（A = 3.4 / 8.8 / 16.4 GiB ≫ G = 0.5 / 1.6 / 3.6，峰值在前向末尾）：
 
 | Size | forward fp32 → bf16 | 加速 | backward fp32 → bf16 | 加速 | 峰值显存 fp32 → bf16（GiB） | 其中权重侧 | 其中 activation 侧 |
 |:-----|:--|--:|:--|--:|:--|--:|--:|
@@ -328,21 +342,18 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) | +1.78 | −5.50 |
 | xl     | OOM → OOM | — | — | — | — | +6.35 | — |
 
-这三档的 fwd_bwd 峰值都出现在**前向结束、反向刚开始**的时刻：activation（3.4 / 8.8 / 16.4 GiB）远大于梯度（0.5 / 1.6 / 3.6），反向每层释放的 saved tensors 比新增的梯度多，曲线往下走。所以峰值 = 权重 + 全部 saved tensors，bf16 对它的影响就是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风。前提「峰值在前向末尾」在 xl 上不成立——梯度 12.7 GiB 比 activation 大，峰值挪到反向末尾，这套分解就不适用了，见 (e)。
+- 速度：前向快 1.9–2.3×、反向 1.7–1.9×，**模型越大加速越高**（大 GEMM 更接近 Tensor core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。加速比是两个效应的乘积：位宽减半（搬的 bytes 少一半），以及**换了算术单元**——纯 fp32 矩阵乘只能走 CUDA core（nsys 里的 `simt_sgemm`，1.05e14 FLOPS），bf16 才能进 Tensor core（2.1e14）。基准关掉 `allow_tf32` 就是为了让 fp32 老老实实走 CUDA core，否则 fp32 会被截成 tf32 送进 Tensor core，两组数就不是在比精度了。
+- 显存：后两列是用 `saved_tensors_hooks` 把 saved tensors 按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），权重侧和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 不再被存，但它本来就在显存里，副本是净增。activation 侧**减少**但不是减半（small 3.41 → 2.28 = 67%）：RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。activation 远大于副本所以净省；模型越大副本越占上风，省的比例从 −21% 缩到 −18%。
 
-#### (e) xl 上为什么不省：峰值落在哪一刻
+**(e) xl @128 / 2048**（§2.2(a)(b) 峰值表的 bf16 列）：
 
-**问题**：xl@128 / 2048 开 bf16 autocast 后峰值变化多少，为什么和 (d) 的趋势不同。
+| seq | 模式 | fp32 | bf16 | 峰值时刻 | 为什么 |
+|----:|:--|--:|--:|:--|:--|
+| 128 | forward（no_grad） | 12.90 | 19.18 | 前向 | 副本全在（+6.35），没有 saved tensors 可省 |
+| 128 | fwd_bwd | 25.56 | 25.55 | 反向末尾 | A = 32 × 166 MiB = 5.3 < G = 12.7，峰值 = 2W；此刻 saved tensors 和副本都已释放 |
+| 2048 | forward（no_grad） | 21.38 | 25.27 | 前向 | 副本 +6.35，attention 尖峰从 fp32 的 8 GiB 缩到 bf16 的 4 GiB，净 +3.9 |
 
-看 §2.2(a)(b) 峰值表的 bf16 列：xl 上**不省反多 4–6 GiB**（no_grad 前向）或**持平**（fwd_bwd），和 (d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时 no_grad 前向的 +6.3 吻合），activation 侧减少（xl@128 一层存 166 MiB，32 层 5.3 GiB，bf16 下约 3.5）——区别在**峰值落在哪一刻**：
-
-| 反向到第 k 层时活着的 | fp32 | bf16 autocast |
-|:--|:--|:--|
-| 权重 + 已算出的梯度 + 还没用掉的 saved tensors | 12.7 + k/32 × 12.7 + (32−k)/32 × 5.3 | 12.7 + k/32 × 12.7 + (32−k)/32 × (3.5 + 6.35 副本) |
-| 单调性 | 每层新增梯度 12.7/32 > 每层释放 5.3/32 → 一路涨 | 12.7 > 9.85 → 一路涨 |
-| 峰值 | 反向末尾：12.7 + 12.7 = **25.4** | 反向末尾：**25.4**（activation 和副本都已释放） |
-
-一般地，反向到第 k 层时活着的是 W + G·k/L + A·(L−k)/L（W 权重、G 全部梯度 = W 的大小、A 全部 saved tensors），涨还是降只看 **G 和 A 谁大**。A ∝ token 数 × 层数，正常训练 A ≫ G，峰值在前向末尾；xl@128 只有 512 个 token 喂 3.41B 参数，A = 5.3 < G = 12.7，曲线一路上涨，峰值在反向末尾——那一刻 activation 无论什么精度都已归零，副本也释放完，bf16 省的 1.8 GiB 对峰值没有贡献。small@512 是反过来的比例（权重 0.48、activation 3.4）：反向每层释放的比新增的多，曲线下降，峰值在**前向末尾**，activation 全在，减半直接体现为 4.08 → 3.18。一句话：bf16 减 activation 是真的，但只有峰值落在「activation 全在」的时刻才看得见；这也是 (d) 里省的比例随模型变大而缩小的原因。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
+xl 上 bf16 **不省反多**（no_grad 前向）或**持平**（fwd_bwd）不是机制不同，是落在了判据表的右列。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
 
 ---
 
