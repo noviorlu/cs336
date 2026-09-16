@@ -266,6 +266,8 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | −18% |
 | xl     | OOM → OOM | — | — | — | — |
 
+峰值显存是两项相抵：为反向存的 activation 位宽减半（small 省 ~1.5 GiB），但 autocast 会多存一份 bf16 权重副本（+参数量 × 2 B，small +0.26 GiB）。这里 activation 占大头所以净省；模型越大副本越贵、省得越少（−21% → −18%）；到 xl@128 这种权重远大于 activation 的配置就反过来变多了——见 §2.4(c)。
+
 ### 2.4 显存剖析（Memory Profiling）
 
 用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。
