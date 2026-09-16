@@ -1,6 +1,6 @@
 # 单卡 5090 上的 Transformer 训练：算力、显存与 checkpoint
 
-Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验记录。模型是作业 1 里从零写的 Transformer LM（RMSNorm + RoPE + SwiGLU，pre-norm），本篇覆盖作业的 §2 Profiling & Benchmarking 和 §3 Single-GPU Memory（§2、§3 沿用作业编号，§1 是自己加的背景和纸面估算）。每小节先一句话说清问题，再 1–2 句作答加一张佐证表。
+Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验记录。模型是作业 1 里从零写的 Transformer LM（RMSNorm + RoPE + SwiGLU，pre-norm），本篇覆盖作业的 §2 Profiling & Benchmarking 和 §3 Single-GPU Memory（§2、§3 沿用作业编号，只把作业的 2.3 混合精度和 2.4 显存剖析对调——先看时间、再看显存、最后看混合精度怎么改这两者；§1 是自己加的背景和纸面估算）。每小节先一句话说清问题，再 1–2 句作答加一张佐证表。
 
 > 硬件 RTX 5090 32 GB（`torch` 可用 31.3 GiB；下文显存一律 GiB = 2³⁰ B，即 `max_memory_allocated()/1024³`），torch 2.11.0+cu130，fp32 基准 `allow_tf32=False`；除注明外 `batch=4, seq=512`，warmup 5 / measure 10。
 
@@ -15,12 +15,12 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
    - 现象：seq 从 256 到 1024，前向里矩阵乘的占比从 82% 掉到 54%，让出的份额全被 attention 里几个几乎不算数的操作吃掉——softmax（hw1 版拆成 5 个 kernel，把 256 MiB 的分数矩阵 S 读写 8 遍）用了 PV 矩阵乘 5.6× 的时间；`/√d` 和 causal mask 各把 S 读写一遍，两个「零 FLOPs」操作加起来抵一次矩阵乘。
    - 原因：eager 模式每个算子是独立 kernel，都要把整个张量过一遍显存；这些 op 的算术强度（FLOPs / bytes）远低于 5090 的 60，时间 = bytes / 带宽，与 FLOPs 无关；S 是 seq² 大，seq 翻 4 倍它们翻 16 倍，矩阵乘只翻 4 倍。
    - 做法：融合，让 S 少落几次显存（fused softmax、FlashAttention）。
-4. **bf16 混合精度：快 2×、省 20% 显存，代价是归约精度**（§2.3）
+4. **bf16 混合精度：快 2×、省 20% 显存，代价是归约精度**（§2.4）
    - 现象：bf16 autocast 前向快 1.9–2.3×、反向 1.7–1.9×，模型越大越快；训练峰值显存省 18–21%。但 `s += 0.01` 用 bf16 累加器到 4.0 就加不动，fp16 累加器漂到 9.95。
    - 原因：加速是两个效应相乘——搬的 bytes 减半，以及纯 fp32 矩阵乘只能走 CUDA core、bf16 才能进 Tensor core（5090 快 2×，H100 快 15×）。显存是两项相抵——autocast 把 fp32 权重转成 bf16 副本再算、反向存的是副本（+参数量 × 2 B），而为反向存的 activation 变成 bf16（约减 1/3）；训练时 activation 远大于权重所以净省，权重占大头时（3.41B 模型只喂 512 个 token 的纯前向）反而多 6.3 GiB；训练的峰值在反向末尾，那时副本已释放，所以副本顶的是前向。精度问题在累加器：bf16 只有 7 位尾数，4.0 + 0.01 舍回 4.0，加数是什么无所谓。
    - 做法：归约类算子（LayerNorm / RMSNorm 的均值方差、softmax 的求和、loss）留在 fp32——autocast 默认就这么做，它们只占前向 2–7%，基本免费；矩阵乘用 bf16 吃全部加速。
 5. **autograd 为反向存什么**（§3.1）：一个算子的局部导数里出现什么张量就存什么，存的是引用不是拷贝。RMSNorm 拆成 5 个算子，真正多占显存的只有归一化系数 r 和归一化后的 x̂；`torch.compile` 把 5 个算子融合成 1 个后，x̂ 不再存、反向时重算。
-6. **显存大头是 attention**（§2.4/§3.1）：3.41B 模型、序列 2048，一层 Transformer block 为反向存 3655 MiB，其中 56% 是 attention 分数矩阵 S = QKᵀ 和概率矩阵 P = softmax(S)——两个 `[batch, heads, seq, seq]` 张量，随序列长度平方增长，32 层合计 114 GiB。
+6. **显存大头是 attention**（§2.3/§3.1）：3.41B 模型、序列 2048，一层 Transformer block 为反向存 3655 MiB，其中 56% 是 attention 分数矩阵 S = QKᵀ 和概率矩阵 P = softmax(S)——两个 `[batch, heads, seq, seq]` 张量，随序列长度平方增长，32 层合计 114 GiB。
 7. **激活检查点（activation checkpointing）是推迟不是压缩**（§3.2）：前向只留每段的输入，反向到该段时重算段内张量。峰值显存 = 所有段输入 + 一段的中间张量；不管怎么分段都恰好多算一次前向（实测慢 28–33%）。Transformer 每层中间张量远大于层输入，所以最省显存的分法就是每层一段，段长没有最优的中间值；教科书上的递归二分能把显存压到 O(log 层数) 但计算涨到 O(层数 · log 层数)，实践不用。
 8. **检查点动不了 S 和 P**：反向重算时它们仍要完整落在显存里。要消掉得改 attention 的 kernel 本身——[第二篇](blog2.md) FlashAttention。
 
@@ -90,11 +90,11 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | xl     | 12.7 |  50.8 |    — |     — | ✗ 静态就超 |
 | 10B    | 47.8 | 191.2 |    — |     — | ✗ 权重就超 |
 
-xl 卡在 Adam 状态（§2.4(b) 实测 OOM @ optimizer），10B 建模型即 OOM。
+xl 卡在 Adam 状态（§2.3(b) 实测 OOM @ optimizer），10B 建模型即 OOM。
 
 ### 1.5 训练 20N token 要多久
 
-用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
+用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.4(d) 的 fwd_bwd 加速换算。
 
 | Size | 20N token | step (fp32) | fp32 | step (bf16) | bf16 |
 |:-----|--:|--:|--:|--:|--:|
@@ -222,7 +222,86 @@ xl 卡在 Adam 状态（§2.4(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 **结论**：GPU 时间看的是「张量被搬了几遍」，不是 FLOPs。解法只有一种——融合，让 S 少落几次显存：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
 
-### 2.3 混合精度（Mixed Precision）
+### 2.3 显存剖析（Memory Profiling）
+
+用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。六问分三步：先看整步的时间线和峰值（a、b），再看混合精度改了什么（c），最后放大到一层里面谁最大、谁被留到反向（d、e、f）。
+
+#### (a)(b) 整步：时间线与峰值
+
+**问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
+
+峰值显存（GiB；bf16 列供 (c) 用）：
+
+| seq | 模式 | fp32 | bf16 autocast |
+|----:|:--|:--|:--|
+| 128  | forward（no_grad） | 12.90 | 19.18 |
+| 128  | fwd_bwd | 25.56 | 25.55 |
+| 128  | full | OOM @ optimizer（≈ 28–29） | OOM @ optimizer（≈ 28–29） |
+| 2048 | forward（no_grad） | 21.38 | 25.27 |
+| 2048 | fwd_bwd / full | OOM @ forward（25.96） | OOM @ forward（26.78） |
+
+OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同机其它进程影响，两次跑差 1 GiB 以内。
+
+![xl 纯前向：seq 128（上，平）vs seq 2048（下，32 根尖峰）](assets/s2/mem_xl_forward_128_vs_2048.png)
+![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
+
+- (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向坡度变缓但仍在爬（每层释放 ~166 MiB saved tensors、同时新分配 ~410 MiB 梯度，净增，见 (f)）；optimizer 一开始就垂直冲到 ~28.6 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）不留东西，seq 128 时几乎是平的（12.8 GiB 基线上多 0.08 GiB）；seq 2048 的图却有 32 根尖峰——每层 attention 算到一半时，`[4, 32, 2048, 2048]` 的 2 GiB 分数矩阵有 ~4 份同时活着（`QKᵀ`、`/√d`、`masked_fill`、softmax 的中间量，链式写法里前一份要等下一份算完才释放），12.8 + 4 × 2 ≈ 21.4 GiB 就是峰；`softmax·V` 一算完全部释放，掉回基线。横轴是分配事件序号不是时间，尖峰看着窄，实际 attention 占前向近一半时间（§2.2）。
+- (b) xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：卡的不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。seq 2048 连 fwd_bwd 都过不了前向：基线 12.8 + 逐层累积的 saved tensors + 每层 8 GiB 的 attention 尖峰，25.96 GiB 时撞墙——第二篇 FlashAttention 消掉的正是这根尖峰。
+
+> 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
+
+#### (c) 混合精度的影响
+
+**问题**：开 bf16 autocast 后峰值变化多少。
+
+看上表的 bf16 列：xl 上**不省反多 4–6 GiB**（no_grad 前向）或**持平**（fwd_bwd），和 §2.4(d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时 no_grad 前向的 +6.3 吻合），activation 侧减少（xl@128 一层存 166 MiB，32 层 5.3 GiB，bf16 下约 3.5）——区别在**峰值落在哪一刻**：
+
+| 反向到第 k 层时活着的 | fp32 | bf16 autocast |
+|:--|:--|:--|
+| 权重 + 已算出的梯度 + 还没用掉的 saved tensors | 12.7 + k/32 × 12.7 + (32−k)/32 × 5.3 | 12.7 + k/32 × 12.7 + (32−k)/32 × (3.5 + 6.35 副本) |
+| 单调性 | 每层新增梯度 12.7/32 > 每层释放 5.3/32 → 一路涨 | 12.7 > 9.85 → 一路涨 |
+| 峰值 | 反向末尾：12.7 + 12.7 = **25.4** | 反向末尾：**25.4**（activation 和副本都已释放） |
+
+xl 每层新增的梯度比释放的 saved tensors 大，曲线一路上涨，峰值在反向末尾——那一刻 activation 无论什么精度都已归零，副本也释放完，bf16 省的 1.8 GiB 对峰值没有贡献。small@512 是反过来的比例（权重 0.48、activation 3.4）：反向每层释放的比新增的多，曲线下降，峰值在**前向末尾**，activation 全在，减半直接体现为 4.08 → 3.18。一句话：bf16 减 activation 是真的，但只有峰值落在「activation 全在」的时刻才看得见；这也是 §2.4(d) 里省的比例随模型变大而缩小的原因。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
+
+#### (d)(e)(f) 一层里的显存：谁最大、谁被留到反向
+
+**问题**：(d) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大；(e) 时间线上最大的分配是什么、多大、从哪行代码来；(f) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少。
+
+- (d) 残差流张量 `[batch, seq, d_model]` = `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是 Transformer 里"一层传给下一层"的那个张量，下面拿它当尺子。
+- (e) 最大的分配是它的 25 倍。照 §2.2 的办法，把一层 block 前向按子模块、逐 op 列出每个 op 分配的输出张量（xl，batch 4，32 头，d_head 80；大小按 shape × 4 B，与时间线上的 malloc 一致）：
+
+  | 子模块 | op | 分配的张量 | seq 2048 | seq 128 |
+  |:--|:--|:--|--:|--:|
+  | RMSNorm ×2 | `x²` 均值、rsqrt、`x·r`、`w⊙x̂` | `[b, s, d]` = `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
+  | attention 投影 | `Q = x·Wqᵀ`、K、V、RoPE(Q)、RoPE(K) | `[4, s, 2560]` | 80 MiB × 5 | 5 MiB × 5 |
+  | **attention 核心** | `S = QKᵀ`（einsum） | `[b, h, s, s]` = `[4, 32, s, s]` | **2 GiB** | 8 MiB |
+  | | `S / √d` | 同上 | **2 GiB** | 8 MiB |
+  | | `masked_fill(−inf)` | 同上 | **2 GiB** | 8 MiB |
+  | | softmax：`x − max`、`exp`、`/ sum` | 同上 × 3 | **2 GiB × 3** | 8 MiB × 3 |
+  | | `O = PV`、`O·Woᵀ` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
+  | FFN | `w1(x)`、`w3(x)`、`SiLU`、门积 | `[b, s, d_ff]` = `[4, s, 10240]` | 320 MiB × 4 | 20 MiB × 4 |
+  | | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB |
+  | 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
+
+  时间线上最大的分配就是 attention 核心那 6 份 **2 GiB**（调用栈 `model.py:253-257`、`nn_utils.py:15-24`），全是同一个 `[b, h, s, s]` 形状的链式中间量，也就是 (a) 里的尖峰；次大是 FFN 的 4 份 320 MiB。只有 attention 核心那一组随 seq² 涨（2048 → 128 缩 256 倍），其余都随 seq 线性涨（缩 16 倍）：seq 128 时 attention 只有 8 MiB、最大的反而是 FFN 的 20 MiB，seq 一长 attention 就成了显存主角——这是第二篇 FlashAttention 的动机。
+- (f) 临时分配不等于留到反向。xl@128（fwd_bwd）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还活着——这就是为反向保存的 saved tensors，占 58%。按 malloc 发生时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
+
+  | 来源算子 | saved tensors | 占比 | 是什么 |
+  |:--|--:|--:|:--|
+  | `aten::mul`     | 60 MiB | 36% | SwiGLU 的门积和 SiLU 的 `x·σ(x)`（`[4,128,10240]` 各 20 MiB） |
+  | `aten::bmm`     | 40 MiB | 24% | attention 的 q/k/v 与 `softmax·V` 输出 |
+  | `aten::empty`   | 20 MiB | 12% | FFN 线性层的输出本身（einsum 先 `empty` 再由 GEMM 写入） |
+  | `aten::sigmoid` | 20 MiB | 12% | SiLU 里的 `σ(x)` |
+  | `aten::add`     | 10 MiB |  6% | 残差加 |
+
+  seq 128 时大头是 FFN 的 `d_ff` 宽中间量而不是 attention（分数矩阵只有 8 MiB），和 (e) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB，净增 249 MiB；释放的里有 161 MiB 是上面的 saved tensors，所以反向新产生的张量 = 249 + 161 = **410 MiB**。预期：这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB = 405 MiB，误差 1%。这就是 (a) 里反向「不下坡」的原因：每层释放 166、新增 410，净值继续爬。
+
+![block5 saved tensors](assets/s2/nsys_block5_memory.png)
+
+> 采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`，`--nvtx-ops` 给每层打 `block{i}` range、`emit_nvtx` 给每个 aten 算子打带 `seq` 编号的 range；归因脚本 `python -m benchmark.memory`。不关 caching allocator 的话 nsys 只看到显存池的增长，看不到单个张量；关了之后 `cudaFree` 过的地址会被复用，分配和释放要按「之后的第一次 free」配对，直接按地址集合会多算 60 MiB。图从 nsys 的 sqlite 导出直接画：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配。
+
+### 2.4 混合精度（Mixed Precision）
 
 四问一条线：先看低精度数值本身的坑（a），再看 autocast 具体把哪些张量降了精度（b）、为什么偏偏留下 LayerNorm（c），最后看换来的速度和显存（d）。
 
@@ -269,86 +348,7 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) | +1.78 | −5.50 |
 | xl     | OOM → OOM | — | — | — | — | +6.35 | — |
 
-峰值显存是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook §2.3(d)，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风；到 xl@128 这种 token 少、权重大的配置就反过来：`no_grad` 前向 +49%（副本全在、没有 activation 可省）；fwd_bwd 看似持平，其实是峰值落在反向末尾、副本那时已释放——见 §2.4(c)。
-
-### 2.4 显存剖析（Memory Profiling）
-
-用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。六问分三步：先看整步的时间线和峰值（a、b），再看混合精度改了什么（c），最后放大到一层里面谁最大、谁被留到反向（d、e、f）。
-
-#### (a)(b) 整步：时间线与峰值
-
-**问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
-
-峰值显存（GiB；bf16 列供 (c) 用）：
-
-| seq | 模式 | fp32 | bf16 autocast |
-|----:|:--|:--|:--|
-| 128  | forward（no_grad） | 12.90 | 19.18 |
-| 128  | fwd_bwd | 25.56 | 25.55 |
-| 128  | full | OOM @ optimizer（≈ 28–29） | OOM @ optimizer（≈ 28–29） |
-| 2048 | forward（no_grad） | 21.38 | 25.27 |
-| 2048 | fwd_bwd / full | OOM @ forward（25.96） | OOM @ forward（26.78） |
-
-OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同机其它进程影响，两次跑差 1 GiB 以内。
-
-![xl 纯前向：seq 128（上，平）vs seq 2048（下，32 根尖峰）](assets/s2/mem_xl_forward_128_vs_2048.png)
-![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
-
-- (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向坡度变缓但仍在爬（每层释放 ~166 MiB saved tensors、同时新分配 ~410 MiB 梯度，净增，见 (f)）；optimizer 一开始就垂直冲到 ~28.6 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）不留东西，seq 128 时几乎是平的（12.8 GiB 基线上多 0.08 GiB）；seq 2048 的图却有 32 根尖峰——每层 attention 算到一半时，`[4, 32, 2048, 2048]` 的 2 GiB 分数矩阵有 ~4 份同时活着（`QKᵀ`、`/√d`、`masked_fill`、softmax 的中间量，链式写法里前一份要等下一份算完才释放），12.8 + 4 × 2 ≈ 21.4 GiB 就是峰；`softmax·V` 一算完全部释放，掉回基线。横轴是分配事件序号不是时间，尖峰看着窄，实际 attention 占前向近一半时间（§2.2）。
-- (b) xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：卡的不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。seq 2048 连 fwd_bwd 都过不了前向：基线 12.8 + 逐层累积的 saved tensors + 每层 8 GiB 的 attention 尖峰，25.96 GiB 时撞墙——第二篇 FlashAttention 消掉的正是这根尖峰。
-
-> 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
-
-#### (c) 混合精度的影响
-
-**问题**：开 bf16 autocast 后峰值变化多少。
-
-看上表的 bf16 列：xl 上**不省反多 4–6 GiB**（no_grad 前向）或**持平**（fwd_bwd），和 §2.3(d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时 no_grad 前向的 +6.3 吻合），activation 侧减少（xl@128 一层存 166 MiB，32 层 5.3 GiB，bf16 下约 3.5）——区别在**峰值落在哪一刻**：
-
-| 反向到第 k 层时活着的 | fp32 | bf16 autocast |
-|:--|:--|:--|
-| 权重 + 已算出的梯度 + 还没用掉的 saved tensors | 12.7 + k/32 × 12.7 + (32−k)/32 × 5.3 | 12.7 + k/32 × 12.7 + (32−k)/32 × (3.5 + 6.35 副本) |
-| 单调性 | 每层新增梯度 12.7/32 > 每层释放 5.3/32 → 一路涨 | 12.7 > 9.85 → 一路涨 |
-| 峰值 | 反向末尾：12.7 + 12.7 = **25.4** | 反向末尾：**25.4**（activation 和副本都已释放） |
-
-xl 每层新增的梯度比释放的 saved tensors 大，曲线一路上涨，峰值在反向末尾——那一刻 activation 无论什么精度都已归零，副本也释放完，bf16 省的 1.8 GiB 对峰值没有贡献。small@512 是反过来的比例（权重 0.48、activation 3.4）：反向每层释放的比新增的多，曲线下降，峰值在**前向末尾**，activation 全在，减半直接体现为 4.08 → 3.18。一句话：bf16 减 activation 是真的，但只有峰值落在「activation 全在」的时刻才看得见；这也是 §2.3(d) 里省的比例随模型变大而缩小的原因。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
-
-#### (d)(e)(f) 一层里的显存：谁最大、谁被留到反向
-
-**问题**：(d) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大；(e) 时间线上最大的分配是什么、多大、从哪行代码来；(f) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少。
-
-- (d) 残差流张量 `[batch, seq, d_model]` = `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是 Transformer 里"一层传给下一层"的那个张量，下面拿它当尺子。
-- (e) 最大的分配是它的 25 倍。照 §2.2 的办法，把一层 block 前向按子模块、逐 op 列出每个 op 分配的输出张量（xl，batch 4，32 头，d_head 80；大小按 shape × 4 B，与时间线上的 malloc 一致）：
-
-  | 子模块 | op | 分配的张量 | seq 2048 | seq 128 |
-  |:--|:--|:--|--:|--:|
-  | RMSNorm ×2 | `x²` 均值、rsqrt、`x·r`、`w⊙x̂` | `[b, s, d]` = `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
-  | attention 投影 | `Q = x·Wqᵀ`、K、V、RoPE(Q)、RoPE(K) | `[4, s, 2560]` | 80 MiB × 5 | 5 MiB × 5 |
-  | **attention 核心** | `S = QKᵀ`（einsum） | `[b, h, s, s]` = `[4, 32, s, s]` | **2 GiB** | 8 MiB |
-  | | `S / √d` | 同上 | **2 GiB** | 8 MiB |
-  | | `masked_fill(−inf)` | 同上 | **2 GiB** | 8 MiB |
-  | | softmax：`x − max`、`exp`、`/ sum` | 同上 × 3 | **2 GiB × 3** | 8 MiB × 3 |
-  | | `O = PV`、`O·Woᵀ` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
-  | FFN | `w1(x)`、`w3(x)`、`SiLU`、门积 | `[b, s, d_ff]` = `[4, s, 10240]` | 320 MiB × 4 | 20 MiB × 4 |
-  | | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB |
-  | 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
-
-  时间线上最大的分配就是 attention 核心那 6 份 **2 GiB**（调用栈 `model.py:253-257`、`nn_utils.py:15-24`），全是同一个 `[b, h, s, s]` 形状的链式中间量，也就是 (a) 里的尖峰；次大是 FFN 的 4 份 320 MiB。只有 attention 核心那一组随 seq² 涨（2048 → 128 缩 256 倍），其余都随 seq 线性涨（缩 16 倍）：seq 128 时 attention 只有 8 MiB、最大的反而是 FFN 的 20 MiB，seq 一长 attention 就成了显存主角——这是第二篇 FlashAttention 的动机。
-- (f) 临时分配不等于留到反向。xl@128（fwd_bwd）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还活着——这就是为反向保存的 saved tensors，占 58%。按 malloc 发生时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
-
-  | 来源算子 | saved tensors | 占比 | 是什么 |
-  |:--|--:|--:|:--|
-  | `aten::mul`     | 60 MiB | 36% | SwiGLU 的门积和 SiLU 的 `x·σ(x)`（`[4,128,10240]` 各 20 MiB） |
-  | `aten::bmm`     | 40 MiB | 24% | attention 的 q/k/v 与 `softmax·V` 输出 |
-  | `aten::empty`   | 20 MiB | 12% | FFN 线性层的输出本身（einsum 先 `empty` 再由 GEMM 写入） |
-  | `aten::sigmoid` | 20 MiB | 12% | SiLU 里的 `σ(x)` |
-  | `aten::add`     | 10 MiB |  6% | 残差加 |
-
-  seq 128 时大头是 FFN 的 `d_ff` 宽中间量而不是 attention（分数矩阵只有 8 MiB），和 (e) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB，净增 249 MiB；释放的里有 161 MiB 是上面的 saved tensors，所以反向新产生的张量 = 249 + 161 = **410 MiB**。预期：这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB = 405 MiB，误差 1%。这就是 (a) 里反向「不下坡」的原因：每层释放 166、新增 410，净值继续爬。
-
-![block5 saved tensors](assets/s2/nsys_block5_memory.png)
-
-> 采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`，`--nvtx-ops` 给每层打 `block{i}` range、`emit_nvtx` 给每个 aten 算子打带 `seq` 编号的 range；归因脚本 `python -m benchmark.memory`。不关 caching allocator 的话 nsys 只看到显存池的增长，看不到单个张量；关了之后 `cudaFree` 过的地址会被复用，分配和释放要按「之后的第一次 free」配对，直接按地址集合会多算 60 MiB。图从 nsys 的 sqlite 导出直接画：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配。
+峰值显存是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风；到 xl@128 这种 token 少、权重大的配置就反过来：`no_grad` 前向 +49%（副本全在、没有 activation 可省）；fwd_bwd 看似持平，其实是峰值落在反向末尾、副本那时已释放——见 §2.3(c)。
 
 ---
 
@@ -358,7 +358,7 @@ xl 每层新增的梯度比释放的 saved tensors 大，曲线一路上涨，�
 
 **问题**：autograd 到底为反向存了哪些张量？先用最小的例子 RMSNorm 看清楚，再看 `torch.compile` 融合后有什么变化。
 
-§2.4(f) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
+§2.3(f) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
 
 $\mathrm{RMSNorm}(x)_i = w_i \cdot \frac{x_i}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}}$，拆成 5 个 op：
 $\underbrace{r = \big(\underbrace{\tfrac{1}{d}\textstyle\sum_j \underbrace{x_j^2}_{①}}_{②} + \epsilon\big)^{-1/2}}_{③}$，$\underbrace{\hat{x} = x \cdot r}_{④}$，$\underbrace{y = w \odot \hat{x}}_{⑤}$
