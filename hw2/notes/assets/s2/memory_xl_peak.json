@@ -9,15 +9,38 @@
     "mode": "forward",
     "inference": true,
     "autocast": false,
-    "avg_ms": 80.28,
-    "std_ms": 2.52,
-    "first_ms": 78.5,
-    "rest_avg_ms": 82.07,
-    "peak_mem_gib": 12.91,
+    "avg_ms": 79.78,
+    "std_ms": 0.05,
+    "first_ms": 79.74,
+    "rest_avg_ms": 79.82,
+    "peak_mem_gib": 12.9,
     "status": "OK",
+    "checkpoint_every": null,
     "times_ms": [
-      78.498,
-      82.067
+      79.743,
+      79.82
+    ]
+  },
+  {
+    "model": "basics",
+    "size": "xl",
+    "seq_len": 128,
+    "batch": 4,
+    "warmup": 2,
+    "steps": 2,
+    "mode": "fwd_bwd",
+    "inference": false,
+    "autocast": false,
+    "avg_ms": 237.65,
+    "std_ms": 0.79,
+    "first_ms": 238.2,
+    "rest_avg_ms": 237.09,
+    "peak_mem_gib": 25.56,
+    "status": "OK",
+    "checkpoint_every": null,
+    "times_ms": [
+      238.204,
+      237.087
     ]
   },
   {
@@ -34,8 +57,9 @@
     "std_ms": NaN,
     "first_ms": NaN,
     "rest_avg_ms": NaN,
-    "peak_mem_gib": 29.25,
+    "peak_mem_gib": 28.38,
     "status": "OOM (optimizer)",
+    "checkpoint_every": null,
     "times_ms": []
   },
   {
@@ -48,15 +72,38 @@
     "mode": "forward",
     "inference": true,
     "autocast": true,
-    "avg_ms": 35.55,
-    "std_ms": 0.21,
-    "first_ms": 35.4,
-    "rest_avg_ms": 35.7,
-    "peak_mem_gib": 19.19,
+    "avg_ms": 34.99,
+    "std_ms": 0.14,
+    "first_ms": 35.09,
+    "rest_avg_ms": 34.89,
+    "peak_mem_gib": 19.18,
     "status": "OK",
+    "checkpoint_every": null,
     "times_ms": [
-      35.398,
-      35.696
+      35.093,
+      34.89
+    ]
+  },
+  {
+    "model": "basics",
+    "size": "xl",
+    "seq_len": 128,
+    "batch": 4,
+    "warmup": 2,
+    "steps": 2,
+    "mode": "fwd_bwd",
+    "inference": false,
+    "autocast": true,
+    "avg_ms": 132.32,
+    "std_ms": 4.54,
+    "first_ms": 129.11,
+    "rest_avg_ms": 135.53,
+    "peak_mem_gib": 25.55,
+    "status": "OK",
+    "checkpoint_every": null,
+    "times_ms": [
+      129.115,
+      135.534
     ]
   },
   {
@@ -73,8 +120,9 @@
     "std_ms": NaN,
     "first_ms": NaN,
     "rest_avg_ms": NaN,
-    "peak_mem_gib": 29.24,
+    "peak_mem_gib": 28.46,
     "status": "OOM (optimizer)",
+    "checkpoint_every": null,
     "times_ms": []
   },
   {
@@ -87,16 +135,36 @@
     "mode": "forward",
     "inference": true,
     "autocast": false,
-    "avg_ms": 2084.46,
-    "std_ms": 33.38,
-    "first_ms": 2060.85,
-    "rest_avg_ms": 2108.06,
-    "peak_mem_gib": 21.39,
+    "avg_ms": 2051.48,
+    "std_ms": 4.12,
+    "first_ms": 2054.4,
+    "rest_avg_ms": 2048.57,
+    "peak_mem_gib": 21.38,
     "status": "OK",
+    "checkpoint_every": null,
     "times_ms": [
-      2060.852,
-      2108.062
+      2054.397,
+      2048.568
     ]
+  },
+  {
+    "model": "basics",
+    "size": "xl",
+    "seq_len": 2048,
+    "batch": 4,
+    "warmup": 2,
+    "steps": 2,
+    "mode": "fwd_bwd",
+    "inference": false,
+    "autocast": false,
+    "avg_ms": NaN,
+    "std_ms": NaN,
+    "first_ms": NaN,
+    "rest_avg_ms": NaN,
+    "peak_mem_gib": 25.96,
+    "status": "OOM (forward)",
+    "checkpoint_every": null,
+    "times_ms": []
   },
   {
     "model": "basics",
@@ -112,8 +180,9 @@
     "std_ms": NaN,
     "first_ms": NaN,
     "rest_avg_ms": NaN,
-    "peak_mem_gib": 25.97,
+    "peak_mem_gib": 25.96,
     "status": "OOM (forward)",
+    "checkpoint_every": null,
     "times_ms": []
   },
   {
@@ -126,16 +195,36 @@
     "mode": "forward",
     "inference": true,
     "autocast": true,
-    "avg_ms": 1074.68,
-    "std_ms": 3.8,
-    "first_ms": 1077.37,
-    "rest_avg_ms": 1072.0,
-    "peak_mem_gib": 25.28,
+    "avg_ms": 1056.4,
+    "std_ms": 0.06,
+    "first_ms": 1056.45,
+    "rest_avg_ms": 1056.36,
+    "peak_mem_gib": 25.27,
     "status": "OK",
+    "checkpoint_every": null,
     "times_ms": [
-      1077.369,
-      1071.999
+      1056.45,
+      1056.359
     ]
+  },
+  {
+    "model": "basics",
+    "size": "xl",
+    "seq_len": 2048,
+    "batch": 4,
+    "warmup": 2,
+    "steps": 2,
+    "mode": "fwd_bwd",
+    "inference": false,
+    "autocast": true,
+    "avg_ms": NaN,
+    "std_ms": NaN,
+    "first_ms": NaN,
+    "rest_avg_ms": NaN,
+    "peak_mem_gib": 26.78,
+    "status": "OOM (forward)",
+    "checkpoint_every": null,
+    "times_ms": []
   },
   {
     "model": "basics",
@@ -151,8 +240,9 @@
     "std_ms": NaN,
     "first_ms": NaN,
     "rest_avg_ms": NaN,
-    "peak_mem_gib": 26.79,
+    "peak_mem_gib": 26.78,
     "status": "OOM (forward)",
+    "checkpoint_every": null,
     "times_ms": []
   }
 ]

@@ -90,7 +90,7 @@ def sweep(cfgs: list[BenchConfig], out_path: str | None = None, isolate: bool = 
             + (" bf16" if c.autocast else "") + (f" warmup={c.warmup}" if c.warmup != 5 else "")
         # 单行原地刷新，不留历史（notebook 里跑完只剩最终表）
         print(f"\r[{i}/{len(cfgs)}] {tag:<40}", end="", flush=True)
-        r = _run_isolated(c) if isolate else run(c)
+        r = _run_isolated(c) if isolate else run_model(c)
         results.append(r)
         if c.is_cuda:
             torch.cuda.empty_cache()

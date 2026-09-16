@@ -78,7 +78,7 @@ SWEEP_CONFIGS = {
         "warmup": [2],
         "steps": [2],
         "autocast": [False, True],
-        "mode_and_inference": [("forward", True), ("full", False)],
+        "mode_and_inference": [("forward", True), ("fwd_bwd", False), ("full", False)],
     },
     # §3.2 (b)：扫 checkpoint 段长（每段几层）看 fwd_bwd 的峰值显存和 step 时间。
     # 题面 xl@2048 batch 4 在 5090 上任何段长都 OOM（参数+梯度 25.4 GiB），large@2048 batch 4 也只有

@@ -1,6 +1,6 @@
-"""timeit 计时核心：建模型 → 预热 → 逐步计时 → 汇总。一次 run() 对应表里的一行。
+"""timeit 计时核心：建模型 → 预热 → 逐步计时 → 汇总。一次 run_model() 对应表里的一行。
 
-阶段划分（§2.5 的显存采样会挂在同一条线上，见 run() 里的注释）：
+阶段划分（§2.5 的显存采样会挂在同一条线上，见 run_model() 里的注释）：
 
     setup  ──▶  warmup  ──▶  [reset peak / probes.live=True]  ──▶  measure  ──▶  teardown
 """
@@ -52,7 +52,7 @@ def make_step_fn(
     batch: Tuple[torch.Tensor, torch.Tensor],
     cfg: BenchConfig,
     probes: Probes,
-    stage: list,            # 单元素 list，异常时告诉 run() 死在哪个阶段
+    stage: list,            # 单元素 list，异常时告诉 run_model() 死在哪个阶段
 ) -> Callable[[], None]:
     x, y = batch
 
