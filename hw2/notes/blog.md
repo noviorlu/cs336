@@ -259,14 +259,14 @@ xl 卡在 Adam 状态（§2.4(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加速越高**（大 GEMM 更接近 Tensor Core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。xl 在 bf16 下仍 OOM。加速比是两个效应的乘积：位宽减半（搬的 bytes 少一半），以及**换了算术单元**——纯 fp32 矩阵乘只能走 CUDA core（nsys 里的 `simt_sgemm`，峰值 1.05e14 FLOPS），bf16 才有资格进 Tensor core（2.1e14）。基准关掉 `allow_tf32` 就是为了让 fp32 老老实实走 CUDA core，否则 fp32 也会被偷偷截成 tf32 送进 Tensor core，两组数就不是在比精度了。
 
-| Size | forward fp32 → bf16 | 加速 | backward fp32 → bf16 | 加速 | 峰值显存 fp32 → bf16（GiB） |
-|:-----|:--|--:|:--|--:|:--|
-| small  |  17.2 →  9.2 | 1.87× |  33.9 →  20.1 | 1.69× | 4.08 → 3.18 (−21%) |
-| medium |  50.1 → 24.4 | 2.05× | 102.3 →  57.3 | 1.79× | 10.58 → 8.36 (−21%) |
-| large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) |
-| xl     | OOM → OOM | — | — | — | — |
+| Size | forward fp32 → bf16 | 加速 | backward fp32 → bf16 | 加速 | 峰值显存 fp32 → bf16（GiB） | 其中权重侧 | 其中 activation 侧 |
+|:-----|:--|--:|:--|--:|:--|--:|--:|
+| small  |  17.2 →  9.2 | 1.87× |  33.9 →  20.1 | 1.69× | 4.08 → 3.18 (−21%) | +0.23 | −1.13 |
+| medium |  50.1 → 24.4 | 2.05× | 102.3 →  57.3 | 1.79× | 10.58 → 8.36 (−21%) | +0.78 | −3.00 |
+| large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) | +1.81 | −5.48 |
+| xl     | OOM → OOM | — | — | — | — | +6.35 | — |
 
-显存为什么是减：峰值变化是两项相抵。用 `saved_tensors_hooks` 把 small 为反向存的张量按来源数一遍（notebook §2.3(d)，`autocast_saved_tensors.txt`）：
+后两列：权重侧 = bf16 权重副本 = 参数量 × 2 B，activation 侧 = 峰值差 − 权重侧；small 一行是实测——用 `saved_tensors_hooks` 把为反向存的张量按来源数一遍（notebook §2.3(d)，`autocast_saved_tensors.txt`）：
 
 | small fwd_bwd @ 512 | fp32 | bf16 autocast |
 |:--|--:|--:|
