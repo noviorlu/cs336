@@ -308,16 +308,16 @@ xl 上**不省反多 4–6 GiB**，和 §2.3(d) 里 small/medium/large 省 20% �
 
 **问题**：(d) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大；(e) 时间线上最大的分配是什么、多大、从哪行代码来；(f) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少。
 
-- (d) 先立一把尺子：残差流张量 `[4, 2048, 2560] × 4 B = 80 MiB`（seq 128 时 5 MiB），每 token 10 KiB。
-- (e) 最大的分配比这把尺子大 25 倍：xl@2048 前向最大的是 **2 GiB**，全部来自 attention 的 `[4, 32, 2048, 2048]` fp32 分数矩阵，每层临时造 6 份（`QKᵀ` einsum、`/√d`、`masked_fill`、softmax 里的 `x − max`、`exp`、除法），调用栈指向 `model.py:253-257` 和 `nn_utils.py:15-24`；次大的 320 MiB 是 SwiGLU 的 `[4, 2048, 10240]` 中间量。
+- (d) 残差流张量 `[batch, seq, d_model]` = `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是 Transformer 里"一层传给下一层"的那个张量，下面拿它当尺子。
+- (e) 最大的分配是它的 25 倍。把 xl@2048 一层前向里分配过的张量按大小列出来（时间线上每个 malloc 的大小 + 调用栈）：
 
-  | 大小 | 每层次数 | 来源 |
-  |--:|--:|:--|
-  | 2048 MiB | 6 | attention 分数矩阵 `[b, h, s, s]`：einsum、缩放、mask、softmax 三步 |
-  |  320 MiB | 4 | SwiGLU 中间量 `[b, s, d_ff]`：w1、w3、SiLU、门积 |
-  |   80 MiB | — | 残差流 `[b, s, d]` |
+  | 一层前向里分配的张量 | 形状 | 大小 | 每层分配几次 | 从哪来 | 随 seq 怎么涨 |
+  |:--|:--|--:|--:|:--|:--|
+  | attention 分数矩阵 S 及其中间量 | `[4, 32, 2048, 2048]` | **2 GiB** | 6 | `QKᵀ` einsum、`/√d`、`masked_fill`、softmax 的 `x − max`、`exp`、除法（`model.py:253-257`、`nn_utils.py:15-24`） | seq² |
+  | SwiGLU 中间量 | `[4, 2048, 10240]` | 320 MiB | 4 | `w1(x)`、`w3(x)`、SiLU、门积 | seq |
+  | 残差流（尺子） | `[4, 2048, 2560]` | 80 MiB | 2 | 两次残差加 | seq |
 
-  seq 128 时排序反过来：最大的是 SwiGLU 的 20 MiB，attention 分数只有 8 MiB。分数矩阵随 seq² 涨、其它随 seq 线性涨，seq 一长 attention 就成了显存主角——这是第二篇 FlashAttention 的动机。
+  seq 2048 时 attention 的 6 份 2 GiB 是绝对主角；seq 128 时排序反过来——分数矩阵只有 8 MiB，最大的是 SwiGLU 的 20 MiB。分数矩阵随 seq² 涨、其它随 seq 线性涨，seq 一长 attention 就成了显存主角——这是第二篇 FlashAttention 的动机。
 - (f) 临时分配不等于留到反向。xl@128（fwd_bwd）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还活着——这就是为反向保存的 saved tensors，占 58%。按 malloc 发生时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
 
   | 来源算子 | saved tensors | 占比 | 是什么 |
