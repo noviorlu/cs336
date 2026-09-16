@@ -15,9 +15,9 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
    - 现象：seq 从 256 到 1024，前向里矩阵乘的占比从 82% 掉到 54%，让出的份额全被 attention 里几个几乎不算数的操作吃掉——softmax（hw1 版拆成 5 个 kernel，把 256 MiB 的分数矩阵 S 读写 8 遍）用了 PV 矩阵乘 5.6× 的时间；`/√d` 和 causal mask 各把 S 读写一遍，两个「零 FLOPs」操作加起来抵一次矩阵乘。
    - 原因：eager 模式每个算子是独立 kernel，都要把整个张量过一遍显存；这些 op 的算术强度（FLOPs / bytes）远低于 5090 的 60，时间 = bytes / 带宽，与 FLOPs 无关；S 是 seq² 大，seq 翻 4 倍它们翻 16 倍，矩阵乘只翻 4 倍。
    - 做法：融合，让 S 少落几次显存（fused softmax、FlashAttention）。
-4. **混合精度**（§2.3–2.5）：数值精度由累加器的 dtype 决定，bf16 累加器 `s += 0.01` 到 4.0 就加不动。bf16 自动混合精度让前向快 1.9–2.3×、反向 1.7–1.9×，模型越大越快——一半来自 bytes 减半，一半来自 fp32 只能用 CUDA core 而 bf16 能进吞吐高一个量级的 Tensor core；但**显存不省反多**——autocast 会多存一份 bf16 权重副本（3.41B 模型 +6.3 GiB），只有中间激活远大于权重时才省。
+4. **混合精度**（§2.3）：数值精度由累加器的 dtype 决定，bf16 累加器 `s += 0.01` 到 4.0 就加不动。bf16 自动混合精度让前向快 1.9–2.3×、反向 1.7–1.9×，模型越大越快——一半来自 bytes 减半，一半来自 fp32 只能用 CUDA core 而 bf16 能进吞吐高一个量级的 Tensor core；但**显存不省反多**——autocast 会多存一份 bf16 权重副本（3.41B 模型 +6.3 GiB），只有中间激活远大于权重时才省。
 5. **autograd 为反向存什么**（§3.1）：一个算子的局部导数里出现什么张量就存什么，存的是引用不是拷贝。RMSNorm 拆成 5 个算子，真正多占显存的只有归一化系数 r 和归一化后的 x̂；`torch.compile` 把 5 个算子融合成 1 个后，x̂ 不再存、反向时重算。
-6. **显存大头是 attention**（§2.5/§3.1）：3.41B 模型、序列 2048，一层 Transformer block 为反向存 3655 MiB，其中 56% 是 attention 分数矩阵 S = QKᵀ 和概率矩阵 P = softmax(S)——两个 `[batch, heads, seq, seq]` 张量，随序列长度平方增长，32 层合计 114 GiB。
+6. **显存大头是 attention**（§2.4/§3.1）：3.41B 模型、序列 2048，一层 Transformer block 为反向存 3655 MiB，其中 56% 是 attention 分数矩阵 S = QKᵀ 和概率矩阵 P = softmax(S)——两个 `[batch, heads, seq, seq]` 张量，随序列长度平方增长，32 层合计 114 GiB。
 7. **激活检查点（activation checkpointing）是推迟不是压缩**（§3.2）：前向只留每段的输入，反向到该段时重算段内张量。峰值显存 = 所有段输入 + 一段的中间张量；不管怎么分段都恰好多算一次前向（实测慢 28–33%）。Transformer 每层中间张量远大于层输入，所以最省显存的分法就是每层一段，段长没有最优的中间值；教科书上的递归二分能把显存压到 O(log 层数) 但计算涨到 O(层数 · log 层数)，实践不用。
 8. **检查点动不了 S 和 P**：反向重算时它们仍要完整落在显存里。要消掉得改 attention 的 kernel 本身——[第二篇](blog2.md) FlashAttention。
 
@@ -87,11 +87,11 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | xl     | 12.7 |  50.8 |    — |     — | ✗ 静态就超 |
 | 10B    | 47.8 | 191.2 |    — |     — | ✗ 权重就超 |
 
-xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OOM。
+xl 卡在 Adam 状态（§2.4(b) 实测 OOM @ optimizer），10B 建模型即 OOM。
 
 ### 1.5 训练 20N token 要多久
 
-用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.4(c) 的 fwd_bwd 加速换算。
+用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
 
 | Size | 20N token | step (fp32) | fp32 | step (bf16) | bf16 |
 |:-----|--:|--:|--:|--:|--:|
@@ -219,11 +219,15 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 **结论**：GPU 时间看的是「张量被搬了几遍」，不是 FLOPs。解法只有一种——融合，让 S 少落几次显存：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
 
-### 2.3 混合精度累加（Mixed Precision Accumulation）
+### 2.3 混合精度（Mixed Precision）
+
+四问一条线：先看低精度数值本身的坑（a），再看 autocast 具体把哪些张量降了精度（b）、为什么偏偏留下 LayerNorm（c），最后看换来的速度和显存（d）。
+
+#### (a) 精度由累加器决定
 
 **问题**：`s = 0; 重复 1000 次 s += 0.01`，累加器和加数分别用 fp32 / fp16 / bf16，结果各是多少，为什么。
 
-精度由**累加器**的 dtype 决定，加数是什么无所谓：fp16 累加器漂到 9.95，bf16 累加器（7 位尾数）在 4.0 就再也加不动；fp32 累加器无论加数是 fp16/bf16 还是手动转过，都落在 10.00x（偏差来自 0.01 在 16 位里本身存不准）。
+精度由**累加器**的 dtype 决定，加数是什么无所谓：fp16 累加器漂到 9.95，bf16 累加器（7 位尾数）在 4.0 就再也加不动——4.0 + 0.01 在 bf16 里舍回 4.0；fp32 累加器无论加数是 fp16/bf16 还是手动转过，都落在 10.00x（偏差来自 0.01 在 16 位里本身存不准）。
 
 | 累加 | 结果 |
 |:--|--:|
@@ -233,9 +237,7 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | `s(bf16) += x(bf16)` | **4.0000** |
 | `s(fp32) += x(bf16)` | 10.0098 |
 
-### 2.4 混合精度基准（Benchmarking Mixed Precision）
-
-#### (a) fp16 autocast 下各组件 dtype
+#### (b) autocast 改了谁的 dtype
 
 **问题**：一个 `Linear → ReLU → LayerNorm → Linear` 的玩具模型，参数是 fp32，包在 `torch.autocast(fp16)` 里训练，参数、各层输出、logits、loss、梯度分别是什么 dtype。
 
@@ -245,13 +247,13 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 |:--|:--|:--|:--|:--|:--|
 | fp32 | fp16 | fp32 | fp16 | fp32 | fp32 |
 
-#### (b) LayerNorm 为什么特殊
+#### (c) LayerNorm 为什么留在 fp32
 
 **问题**：autocast 为什么把 LayerNorm 留在 fp32；换成 bf16 后还有必要吗。
 
-敏感的是特征维上的**归约**（均值/方差累加）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但尾数只有 7 位、归约精度比 fp16 更差（§2.3 卡在 4.0 就是它），所以仍需保留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，保留 fp32 基本免费。
+敏感的是特征维上的**归约**（均值/方差累加，正是 (a) 的场景）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但尾数只有 7 位、归约精度比 fp16 更差（(a) 里卡在 4.0 就是它），所以仍需保留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，保留 fp32 基本免费。
 
-#### (c) bf16 vs fp32
+#### (d) bf16 换来多少速度和显存
 
 **问题**：bf16 autocast 相对 fp32，各规格前向和反向快多少，显存省多少。
 
@@ -264,7 +266,7 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | −18% |
 | xl     | OOM → OOM | — | — | — | — |
 
-### 2.5 显存剖析（Memory Profiling）
+### 2.4 显存剖析（Memory Profiling）
 
 用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。
 
@@ -294,7 +296,7 @@ xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：不是 activation
 
 **问题**：开 bf16 autocast 后峰值变化多少。
 
-**不省反多 4–6 GiB**：no_grad 前向 12.9 → 19.2 GiB（128）、21.4 → 25.3 GiB（2048），多出的是一份 bf16 权重副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合）减去 activation 省下的 1–2 GiB；fwd_bwd 持平（25.56 vs 25.55）。副本在推理时是 autocast 的 cast 缓存（可关，或干脆 `model.to(bf16)`），训练时是反向 `dx = dy·Wᵀ` 的输入（autograd 存的 saved tensor，关缓存也省不掉）。只有 activation 远大于权重时 autocast 才省显存（§2.4(c) 里 small 省 21%）。
+**不省反多 4–6 GiB**：no_grad 前向 12.9 → 19.2 GiB（128）、21.4 → 25.3 GiB（2048），多出的是一份 bf16 权重副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合）减去 activation 省下的 1–2 GiB；fwd_bwd 持平（25.56 vs 25.55）。副本在推理时是 autocast 的 cast 缓存（可关，或干脆 `model.to(bf16)`），训练时是反向 `dx = dy·Wᵀ` 的输入（autograd 存的 saved tensor，关缓存也省不掉）。只有 activation 远大于权重时 autocast 才省显存（§2.3(d) 里 small 省 21%）。
 
 | seq | 模式 | fp32 | bf16 |
 |----:|:--|--:|--:|
@@ -326,9 +328,9 @@ xl@2048 前向最大的分配是 **2 GiB**，全部来自 attention 的 `[4, 32,
 
 **问题**：一层 block 前向时分配的显存里，有多少要留到反向；反向时又新分配多少。
 
-xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还没释放——这就是为反向保存的 saved tensors，占该层前向分配的 58%。按包着每次分配的最内层 `aten::*` range 归因，前五个来源占 saved tensors 的 90%：`aten::mul` 60 MiB（36%，SwiGLU 的门积和 SiLU 的 `x·σ(x)`，`[4,128,10240]` fp32 各 20 MiB）、`aten::bmm` 40 MiB（24%，attention 的 q/k/v 与 `softmax·V`）、`aten::empty` 20 MiB（12%，`w1(x)`/`w3(x)` 的输出，einsum 先 `empty` 再写入）、`aten::sigmoid` 20 MiB（12%，SiLU 里的 `σ(x)`）、`aten::add` 10 MiB（6%，残差相加）。算子名要读成「malloc 发生时正在跑的算子」而非「张量属于谁」。可以看到大头是 FFN 的 `d_ff` 宽中间量而不是 attention——seq=128 时 `[b,h,s,s]` 分数矩阵只有 8 MiB，§2.5(e) 里 seq=2048 时它才变成 2 GiB 的主角。
+xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还没释放——这就是为反向保存的 saved tensors，占该层前向分配的 58%。按包着每次分配的最内层 `aten::*` range 归因，前五个来源占 saved tensors 的 90%：`aten::mul` 60 MiB（36%，SwiGLU 的门积和 SiLU 的 `x·σ(x)`，`[4,128,10240]` fp32 各 20 MiB）、`aten::bmm` 40 MiB（24%，attention 的 q/k/v 与 `softmax·V`）、`aten::empty` 20 MiB（12%，`w1(x)`/`w3(x)` 的输出，einsum 先 `empty` 再写入）、`aten::sigmoid` 20 MiB（12%，SiLU 里的 `σ(x)`）、`aten::add` 10 MiB（6%，残差相加）。算子名要读成「malloc 发生时正在跑的算子」而非「张量属于谁」。可以看到大头是 FFN 的 `d_ff` 宽中间量而不是 attention——seq=128 时 `[b,h,s,s]` 分数矩阵只有 8 MiB，§2.4(e) 里 seq=2048 时它才变成 2 GiB 的主角。
 
-反向时用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来（反向在 autograd 工作线程上跑，自己插的 range 覆盖不到），这一段窗口内分配 1203 MiB、释放 954 MiB，**净增 249 MiB**；其中释放的 954 MiB 里有 161 MiB 是上面那些 saved tensors。所以反向新产生的张量 = 净增 + 释放的 saved tensors = **410 MiB**。预期值：这一层 104.9M 参数的权重梯度 × 4 B = 400 MiB，加上传给前一层的输入梯度 `[4,128,2560]` × 4 B = 5 MiB，合 405 MiB，误差 1%——符合预期。这也解释了 §2.5(a) 时间线里反向为什么"不下坡"：每层释放 166 MiB、新增 410 MiB，净值必然继续爬。
+反向时用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来（反向在 autograd 工作线程上跑，自己插的 range 覆盖不到），这一段窗口内分配 1203 MiB、释放 954 MiB，**净增 249 MiB**；其中释放的 954 MiB 里有 161 MiB 是上面那些 saved tensors。所以反向新产生的张量 = 净增 + 释放的 saved tensors = **410 MiB**。预期值：这一层 104.9M 参数的权重梯度 × 4 B = 400 MiB，加上传给前一层的输入梯度 `[4,128,2560]` × 4 B = 5 MiB，合 405 MiB，误差 1%——符合预期。这也解释了 §2.4(a) 时间线里反向为什么"不下坡"：每层释放 166 MiB、新增 410 MiB，净值必然继续爬。
 
 | 来源算子 | saved tensors | 占比 | 是什么 |
 |:--|--:|--:|:--|
@@ -353,7 +355,7 @@ xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 
 
 **问题**：autograd 到底为反向存了哪些张量？先用最小的例子 RMSNorm 看清楚，再看 `torch.compile` 融合后有什么变化。
 
-§2.5(f) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
+§2.4(f) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
 
 $\mathrm{RMSNorm}(x)_i = w_i \cdot \frac{x_i}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}}$，拆成 5 个 op：
 $\underbrace{r = \big(\underbrace{\tfrac{1}{d}\textstyle\sum_j \underbrace{x_j^2}_{①}}_{②} + \epsilon\big)^{-1/2}}_{③}$，$\underbrace{\hat{x} = x \cdot r}_{④}$，$\underbrace{y = w \odot \hat{x}}_{⑤}$
