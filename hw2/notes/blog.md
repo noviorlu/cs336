@@ -17,7 +17,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
    - 做法：融合，让 S 少落几次显存（fused softmax、FlashAttention）。
 4. **bf16 混合精度：快 2×、省 20% 显存，代价是归约精度**（§2.3）
    - 现象：bf16 autocast 前向快 1.9–2.3×、反向 1.7–1.9×，模型越大越快；训练峰值显存省 18–21%。但 `s += 0.01` 用 bf16 累加器到 4.0 就加不动，fp16 累加器漂到 9.95。
-   - 原因：加速是两个效应相乘——搬的 bytes 减半，以及纯 fp32 矩阵乘只能走 CUDA core、bf16 才能进 Tensor core（5090 快 2×，H100 快 15×）。显存是两项相抵——autocast 把 fp32 权重转成 bf16 副本再算、反向存的是副本（+参数量 × 2 B），而为反向存的 activation 变成 bf16（约减 1/3）；训练时 activation 远大于权重所以净省，权重占大头时（3.41B 模型只喂 512 个 token）反而多 6.3 GiB。精度问题在累加器：bf16 只有 7 位尾数，4.0 + 0.01 舍回 4.0，加数是什么无所谓。
+   - 原因：加速是两个效应相乘——搬的 bytes 减半，以及纯 fp32 矩阵乘只能走 CUDA core、bf16 才能进 Tensor core（5090 快 2×，H100 快 15×）。显存是两项相抵——autocast 把 fp32 权重转成 bf16 副本再算、反向存的是副本（+参数量 × 2 B），而为反向存的 activation 变成 bf16（约减 1/3）；训练时 activation 远大于权重所以净省，权重占大头时（3.41B 模型只喂 512 个 token 的纯前向）反而多 6.3 GiB；训练的峰值在反向末尾，那时副本已释放，所以副本顶的是前向。精度问题在累加器：bf16 只有 7 位尾数，4.0 + 0.01 舍回 4.0，加数是什么无所谓。
    - 做法：归约类算子（LayerNorm / RMSNorm 的均值方差、softmax 的求和、loss）留在 fp32——autocast 默认就这么做，它们只占前向 2–7%，基本免费；矩阵乘用 bf16 吃全部加速。
 5. **autograd 为反向存什么**（§3.1）：一个算子的局部导数里出现什么张量就存什么，存的是引用不是拷贝。RMSNorm 拆成 5 个算子，真正多占显存的只有归一化系数 r 和归一化后的 x̂；`torch.compile` 把 5 个算子融合成 1 个后，x̂ 不再存、反向时重算。
 6. **显存大头是 attention**（§2.4/§3.1）：3.41B 模型、序列 2048，一层 Transformer block 为反向存 3655 MiB，其中 56% 是 attention 分数矩阵 S = QKᵀ 和概率矩阵 P = softmax(S)——两个 `[batch, heads, seq, seq]` 张量，随序列长度平方增长，32 层合计 114 GiB。
@@ -269,7 +269,7 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) | +1.78 | −5.50 |
 | xl     | OOM → OOM | — | — | — | — | +6.35 | — |
 
-峰值显存是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook §2.3(d)，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风；到 xl@128 这种 token 少、权重大的配置就持平（fwd_bwd）甚至 +49%（`no_grad` 推理式前向，没有 activation 可省）——见 §2.4(c)。
+峰值显存是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook §2.3(d)，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风；到 xl@128 这种 token 少、权重大的配置就反过来：`no_grad` 前向 +49%（副本全在、没有 activation 可省）；fwd_bwd 看似持平，其实是峰值落在反向末尾、副本那时已释放——见 §2.4(c)。
 
 ### 2.4 显存剖析（Memory Profiling）
 
@@ -301,7 +301,7 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 
 **问题**：开 bf16 autocast 后峰值变化多少。
 
-看上表的 bf16 列：xl 上**不省反多 4–6 GiB**，和 §2.3(d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合），activation 侧减少——只是 xl 只喂 512 个 token，activation 才 1–2 GiB，省的盖不住副本；fwd_bwd 恰好持平（25.56 vs 25.55）。推理时这份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
+看上表的 bf16 列：xl 上**不省反多 4–6 GiB**，和 §2.3(d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合），activation 侧减少——只是 xl 只喂 512 个 token，activation 才 1–2 GiB，省的盖不住副本。fwd_bwd 两者都是 25.5 不是抵消：这个峰值出现在反向结束时（权重 12.7 + 全部梯度 12.7），而 bf16 副本是 saved tensor，每层反向用完即释放，走到最后一层时副本已经全没了——副本顶显存的时刻是前向，所以 no_grad 前向那行差得最多。推理时这份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
 
 #### (d)(e)(f) 一层里的显存：谁最大、谁被留到反向
 
