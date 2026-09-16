@@ -287,8 +287,8 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 ![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
 ![xl seq=2048 forward](assets/s2/mem_xl_seq2048_forward.png)
 
-- (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向坡度变缓但仍在爬（每层释放 ~166 MiB saved tensors、同时新分配 ~410 MiB 梯度，净增，见 (f)）；optimizer 一开始就垂直冲到 29.35 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）几乎是平的——xl@128 只在 12.8 GiB 基线上多 0.08 GiB 临时量。
-- (b) xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：卡的不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。seq 2048 连 fwd_bwd 都过不了前向。
+- (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向坡度变缓但仍在爬（每层释放 ~166 MiB saved tensors、同时新分配 ~410 MiB 梯度，净增，见 (f)）；optimizer 一开始就垂直冲到 29.35 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）不留东西，seq 128 时几乎是平的（12.8 GiB 基线上多 0.08 GiB）；seq 2048 的图却有 32 根尖峰——每层 attention 算到一半时，`[4, 32, 2048, 2048]` 的 2 GiB 分数矩阵有 ~4 份同时活着（`QKᵀ`、`/√d`、`masked_fill`、softmax 的中间量，链式写法里前一份要等下一份算完才释放），12.8 + 4 × 2 ≈ 21.4 GiB 就是峰；`softmax·V` 一算完全部释放，掉回基线。横轴是分配事件序号不是时间，尖峰看着窄，实际 attention 占前向近一半时间（§2.2）。
+- (b) xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：卡的不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。seq 2048 连 fwd_bwd 都过不了前向：基线 12.8 + 逐层累积的 saved tensors + 每层 8 GiB 的 attention 尖峰，25.96 GiB 时撞墙——第二篇 FlashAttention 消掉的正是这根尖峰。
 
 > 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
 
