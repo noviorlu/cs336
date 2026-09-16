@@ -206,7 +206,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | PV | 0.5 (2%) | 1.7 (4%) | 5.8 (4%) |
 | 其余（QKVO 投影、RoPE、FFN、RMSNorm、残差加） | 19.8 (88%) | 33.9 (74%) | 65.4 (47%) |
 
-- **(h) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。看每个 op 的算术强度 I = FLOPs / 读写显存 bytes：5090 fp32 算力 1.05e14 FLOPS、带宽 1.79e12 B/s，I 低于两者之比 ≈ 60 的 op 受限于带宽，时间 = bytes / 带宽，与 FLOPs 无关。medium@1024 一层内各 op（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
+- **(h) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。要解释这个，给每个 op 算两个「至少要多久」：**算力下限** = FLOPs / 1.05e14（5090 fp32 峰值算力，数据瞬间到位也得算这么久）和**带宽下限** = bytes / 1.79e12（显存带宽，算得无限快也得搬这么久）。实际耗时不可能低于两者中大的那个：算力下限大叫 compute-bound，带宽下限大叫 memory-bound。两者之比就是算术强度 I = FLOPs / bytes 与 ridge point 1.05e14 / 1.79e12 ≈ 60 的比较——I < 60 即 memory-bound。下表 medium@1024 一层内各 op：前 4 列纸面算，「实测」是 nsys 里对应 kernel 的 GPU 时间，粗体是该 op 的瓶颈（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
 
   | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 |
   |:--|--:|--:|--:|--:|--:|--:|
@@ -217,7 +217,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
   | P = softmax(S)（hw1 版：max、减、exp、sum、除 5 个 kernel） | 3.4e8 | 每个 kernel 读写一遍 S 大小的张量，合计 8 遍 2 GiB，最后写出 P | 0.16 | ~0 | **1.2 ms** | 1.35 ms |
   | O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 8.6e9 | 读 P 256 MiB、V 8 MiB，写 O 8 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms |
 
-  算力下限 = FLOPs / 1.05e14（带宽无限也至少要这么久），带宽下限 = bytes / 1.79e12（算力无限也至少要这么久），粗体是两者中更大的那个，即该 op 的瓶颈——算力下限大叫 **compute-bound**，带宽下限大叫 **memory-bound**；实测是 nsys 里对应 kernel 的 GPU 时间（Linear 取前向 169 次 `sgemm_128x256_tn` 中 FFN 宽度那类的均值）。
+  实测怎么读：贴着粗体下限（`/√d` 0.34 vs 0.30，softmax 1.35 vs 1.2，PV 0.24 vs 0.16）说明 kernel 已到硬件极限，再快只能靠改下限本身——减 bytes（融合）或减 FLOPs；远高于下限（QKᵀ 0.61 vs 0.17）说明实现没到位，换 kernel 就能收回来。Linear 的实测取前向 169 次 `sgemm_128x256_tn` 中 FFN 宽度那类的均值。
 
   只有 Linear 的瓶颈是算力；attention 里每个 op 的 I 都在 60 以下，瓶颈是带宽，实测也都贴着带宽下限——时间由「S 被搬了几遍」决定：
   - softmax 是 hw1 自己写的（减 max、exp、sum、除），拆成 5 个 kernel 搬 8 遍，所以最贵；`/√d` 和 mask 各搬 2 遍，两个「零成本」操作加起来抵一次矩阵乘。
