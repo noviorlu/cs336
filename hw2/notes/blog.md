@@ -279,10 +279,15 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 
 **问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
 
-| seq | forward（no_grad） | fwd_bwd | full |
-|----:|------:|------:|:-----|
-| 128  | 12.90 | 25.56 | OOM @ optimizer（29.35） |
-| 2048 | 21.38 | OOM @ forward（25.96） | OOM @ forward |
+峰值显存（GiB；bf16 列供 (c) 用）：
+
+| seq | 模式 | fp32 | bf16 autocast |
+|----:|:--|:--|:--|
+| 128  | forward（no_grad） | 12.90 | 19.18 |
+| 128  | fwd_bwd | 25.56 | 25.55 |
+| 128  | full | OOM @ optimizer（29.35） | OOM @ optimizer（29.24） |
+| 2048 | forward（no_grad） | 21.38 | 25.27 |
+| 2048 | fwd_bwd / full | OOM @ forward（25.96） | OOM @ forward（26.79） |
 
 ![xl 纯前向：seq 128（上，平）vs seq 2048（下，32 根尖峰）](assets/s2/mem_xl_forward_128_vs_2048.png)
 ![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
@@ -296,13 +301,7 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 
 **问题**：开 bf16 autocast 后峰值变化多少。
 
-| seq | 模式 | fp32 | bf16 |
-|----:|:--|--:|--:|
-| 128  | forward（no_grad） | 12.90 | 19.18 |
-| 128  | fwd_bwd | 25.56 | 25.55 |
-| 2048 | forward（no_grad） | 21.38 | 25.27 |
-
-xl 上**不省反多 4–6 GiB**，和 §2.3(d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合），activation 侧减少——只是 xl 只喂 512 个 token，activation 才 1–2 GiB，省的盖不住副本；fwd_bwd 恰好持平（25.56 vs 25.55）。推理时这份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
+看上表的 bf16 列：xl 上**不省反多 4–6 GiB**，和 §2.3(d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合），activation 侧减少——只是 xl 只喂 512 个 token，activation 才 1–2 GiB，省的盖不住副本；fwd_bwd 恰好持平（25.56 vs 25.55）。推理时这份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
 
 #### (d)(e)(f) 一层里的显存：谁最大、谁被留到反向
 
