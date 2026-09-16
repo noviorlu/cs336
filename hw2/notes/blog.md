@@ -228,7 +228,28 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 ### 2.2 显存剖析（Memory Profiling）
 
-用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。五问分两步：先看整步的时间线和峰值（a、b），再放大到一层里面谁最大、谁被留到反向（c、d、e）；bf16 列的解释放在 §2.3(d)(e)。
+先像 §2.1(b) 那样把各规格四种模式的峰值列出来（`batch=4, seq=512`，`max_memory_allocated`，预热后清零，`stages_b4_seq512.md`），单位 GiB：
+
+| Size | 权重 W | forward（no_grad） | forward（带图） | fwd_bwd | full |
+|:-----|--:|--:|--:|--:|--:|
+| small  |  0.48 |  0.72 |  3.98 |  4.08 |  5.04 |
+| medium |  1.58 |  1.90 | 10.49 | 10.58 | 13.74 |
+| large  |  3.61 |  4.11 | 20.19 | 20.28 | 27.51 |
+| xl     | 12.70 | 13.47 | OOM @ forward（29.06） | OOM | OOM |
+| 10B    | 47.8  | OOM @ init | — | — | — |
+
+四列各是什么，用 §2.3 的记号（A = 为反向存的 saved tensors，G = 梯度 = W）：
+
+| 模式 | 峰值 ≈ | 例：medium |
+|:--|:--|:--|
+| forward（no_grad） | W + 一层的临时量 | 1.58 + 0.3 |
+| forward（带图） | W + A（前向末尾，什么都还没释放） | 1.58 + 8.9 |
+| fwd_bwd | W + max(A, G) + T | A ≫ G → 和上一列几乎相同（+0.09 的 T） |
+| full | 3W + A（AdamW 的 m、v 各一份 W 常驻，`.grad` 每步 `set_to_none` 后重建；峰值仍在前向末尾） | 4.74 + 8.9 = 13.6 ✓ |
+
+三条读法：(1) 四个规格里 A 都远大于 W——batch 4 × seq 512 的 activation 是权重的 2.5–7 倍，所以带图前向一开就是峰值，反向和 optimizer 只加零头；(2) full 比 fwd_bwd 多的恰好是 2W（Adam 状态），xl 的 2W = 25.4 光这一项就把 5090 填满，和 §1.4 的纸面账一致；(3) xl 连带图前向都 OOM，所以下面 xl 的实验只能降到 seq 128。
+
+后面用 `torch.cuda.memory._record_memory_history` 记显存分配历史（拖进 pytorch.org/memory_viz 看时间线），xl，`batch=4`。五问分两步：先看整步的时间线和峰值（a、b），再放大到一层里面谁最大、谁被留到反向（c、d、e）；bf16 列的解释放在 §2.3(d)(e)。
 
 #### (a)(b) 整步：时间线与峰值
 
