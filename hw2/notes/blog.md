@@ -201,7 +201,7 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
   | S = QKᵀ | 8.6e9 | 读 Q、K 32 MiB，写 S 256 MiB | 28 | 0.17 ms | 0.61 ms |
   | S / √d | 6.7e7 | 读写 S 512 MiB | 0.13 | 0.30 ms | 0.34 ms |
   | masked_fill | 0 | 读写 S 512 MiB | 0 | 0.30 ms | 0.35 ms |
-  | softmax（5 个 kernel） | 3.4e8 | S 读写 8 遍 2 GiB | 0.16 | 1.2 ms | 1.35 ms |
+  | P = softmax(S)（5 个 kernel） | 3.4e8 | S 读写 8 遍 2 GiB，写 P | 0.16 | 1.2 ms | 1.35 ms |
   | O = PV | 8.6e9 | 读 P 256 MiB、V 8 MiB，写 O 8 MiB | 30 | 0.16 ms | 0.24 ms |
 
   除了 Linear，每个 op 的 I 都在 60 以下，实测都贴着带宽下限——时间由「S 被搬了几遍」决定：
