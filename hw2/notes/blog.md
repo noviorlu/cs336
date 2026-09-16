@@ -321,7 +321,7 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 
 **先说显存的判据**。训练一步的峰值落在哪一刻，决定了 bf16 能不能省出来。反向从最后一层往前走，到第 k 层（共 L 层）时活着的有四类：
 
-$M(k) = W + G \cdot k/L + A \cdot (L-k)/L + T$
+<p align="center">$M(k) = W + G \cdot k/L + A \cdot (L-k)/L + T$</p>
 
 | 项 | 是什么 | dtype（autocast 下） | 随 k 怎么变 |
 |:--|:--|:--|:--|
