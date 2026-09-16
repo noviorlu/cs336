@@ -195,16 +195,18 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 - **(e) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。看每个 op 的算术强度 I = FLOPs / 读写显存 bytes：5090 fp32 算力 1.05e14 FLOPS、带宽 1.79e12 B/s，I 低于两者之比 ≈ 60 的 op 受限于带宽，时间 = bytes / 带宽，与 FLOPs 无关。medium@1024 一层内各 op（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
 
-  | op | FLOPs | 读写 bytes | I | 带宽下限 | 实测 |
-  |:--|--:|--:|--:|--:|--:|
-  | 普通 Linear 作参照（FFN 的 w1，1024 → 4096，4096 个 token） | 3.4e10 | 读 x 16 MiB、W 16 MiB，写 y 64 MiB | 340 | 0.06 ms | 算力受限 |
-  | S = QKᵀ | 8.6e9 | 读 Q、K 32 MiB，写 S 256 MiB | 28 | 0.17 ms | 0.61 ms |
-  | S / √d | 6.7e7 | 读写 S 512 MiB | 0.13 | 0.30 ms | 0.34 ms |
-  | masked_fill | 0 | 读写 S 512 MiB | 0 | 0.30 ms | 0.35 ms |
-  | P = softmax(S)（5 个 kernel） | 3.4e8 | S 读写 8 遍 2 GiB，写 P | 0.16 | 1.2 ms | 1.35 ms |
-  | O = PV | 8.6e9 | 读 P 256 MiB、V 8 MiB，写 O 8 MiB | 30 | 0.16 ms | 0.24 ms |
+  | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 | 带宽下限 | 实测 |
+  |:--|--:|--:|--:|--:|--:|--:|
+  | 普通 Linear 作参照：y = x·Wᵀ（FFN 的 w1，x `[4096 token, 1024]`，W `[4096, 1024]`，y `[4096, 4096]`） | 3.4e10 | 读 x 16 MiB、W 16 MiB，写 y 64 MiB | 340 | **0.32 ms** | 0.06 ms | ≈ 0.5 ms |
+  | S = QKᵀ（Q、K 各 `[64 个 batch×head, 1024, 64]`，S `[64, 1024, 1024]`） | 8.6e9 | 读 Q、K 32 MiB，写 S 256 MiB | 28 | 0.08 ms | **0.17 ms** | 0.61 ms |
+  | S / √d（S 原地缩放） | 6.7e7 | 读 S 256 MiB，写 S 256 MiB | 0.13 | ~0 | **0.30 ms** | 0.34 ms |
+  | masked_fill（causal mask 填 −inf） | 0 | 读 S 256 MiB，写 S 256 MiB | 0 | 0 | **0.30 ms** | 0.35 ms |
+  | P = softmax(S)（hw1 版：max、减、exp、sum、除 5 个 kernel） | 3.4e8 | 每个 kernel 读写一遍 S 大小的张量，合计 8 遍 2 GiB，最后写出 P | 0.16 | ~0 | **1.2 ms** | 1.35 ms |
+  | O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 8.6e9 | 读 P 256 MiB、V 8 MiB，写 O 8 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms |
 
-  除了 Linear，每个 op 的 I 都在 60 以下，实测都贴着带宽下限——时间由「S 被搬了几遍」决定：
+  算力下限 = FLOPs / 1.05e14，带宽下限 = bytes / 1.79e12，粗体是两者中更大的那个，即该 op 的瓶颈；实测是 nsys 里对应 kernel 的 GPU 时间（Linear 取前向 169 次 `sgemm_128x256_tn` 中 FFN 宽度那类的均值）。
+
+  只有 Linear 的瓶颈是算力；attention 里每个 op 的 I 都在 60 以下，瓶颈是带宽，实测也都贴着带宽下限——时间由「S 被搬了几遍」决定：
   - softmax 是 hw1 自己写的（减 max、exp、sum、除），拆成 5 个 kernel 搬 8 遍，所以最贵；`/√d` 和 mask 各搬 2 遍，两个「零成本」操作加起来抵一次矩阵乘。
   - 两个矩阵乘也带宽受限：`[M,K]×[K,N]` 的 GEMM 在输出远大于输入时 I ≈ K/2。QKᵀ 的内维 K = d_head = 64，写出 1024² 个元素每个只做 64 次乘加，I ≈ 28；Linear 的 K = 1024，I 高 16 倍。这是 attention 的定义决定的：只要 S 要落显存就是带宽受限。QKᵀ 实测比带宽下限还慢 3.5×，因为它是 batched GEMM 且 K 经 einsum 转置后非连续，cuBLAS 选了效率较低的 `magma_sgemmEx`。
   - seq 翻 4 倍：Linear 的 bytes 和 FLOPs 都 ∝ seq，翻 4 倍；这些 op 的 bytes ∝ seq²，翻 16 倍。attention 三段合计从 12%（256）涨到 53%（1024）就是这么来的。
