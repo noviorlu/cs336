@@ -273,35 +273,28 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 
 ### 2.4 显存剖析（Memory Profiling）
 
-用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。
+用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。六问分三步：先看整步的时间线和峰值（a、b），再看混合精度改了什么（c），最后放大到一层里面谁最大、谁被留到反向（d、e、f）。
 
-#### (a) 显存时间线
+#### (a)(b) 整步：时间线与峰值
 
-**问题**：从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状。
-
-能认出阶段，靠的是**斜率**而不是峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB），反向坡度变缓但仍在爬（每层释放 ~140 MiB saved tensors、同时分配 ~315 MiB 梯度，净增），optimizer 一开始就垂直冲到 29.35 GiB OOM（AdamW 分配 m/v）。纯前向（forward，no_grad）几乎是平的——xl@128 只在 12.8 GiB 基线上多 0.08 GiB 临时量。
-
-![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
-![xl seq=2048 forward](assets/s2/mem_xl_seq2048_forward.png)
-
-> 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
-
-#### (b) 峰值显存
-
-**问题**：xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
-
-xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。
+**问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
 
 | seq | forward（no_grad） | fwd_bwd | full |
 |----:|------:|------:|:-----|
 | 128  | 12.90 | 25.56 | OOM @ optimizer（29.35） |
 | 2048 | 21.38 | OOM @ forward（25.96） | OOM @ forward |
 
+![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
+![xl seq=2048 forward](assets/s2/mem_xl_seq2048_forward.png)
+
+- (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向坡度变缓但仍在爬（每层释放 ~166 MiB saved tensors、同时新分配 ~410 MiB 梯度，净增，见 (f)）；optimizer 一开始就垂直冲到 29.35 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）几乎是平的——xl@128 只在 12.8 GiB 基线上多 0.08 GiB 临时量。
+- (b) xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：卡的不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。seq 2048 连 fwd_bwd 都过不了前向。
+
+> 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
+
 #### (c) 混合精度的影响
 
 **问题**：开 bf16 autocast 后峰值变化多少。
-
-**不省反多 4–6 GiB**：no_grad 前向 12.9 → 19.2 GiB（128）、21.4 → 25.3 GiB（2048），多出的是一份 bf16 权重副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合）减去 activation 省下的 1–2 GiB；fwd_bwd 持平（25.56 vs 25.55）。副本在推理时是 autocast 的 cast 缓存（可关，或干脆 `model.to(bf16)`），训练时是反向 `dx = dy·Wᵀ` 的输入（autograd 存的 saved tensor，关缓存也省不掉）。只有 activation 远大于权重时 autocast 才省显存（§2.3(d) 里 small 省 21%）。
 
 | seq | 模式 | fp32 | bf16 |
 |----:|:--|--:|--:|
@@ -309,48 +302,37 @@ xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：不是 activation
 | 128  | fwd_bwd | 25.56 | 25.55 |
 | 2048 | forward（no_grad） | 21.38 | 25.27 |
 
-#### (d) 残差流张量大小
+xl 上**不省反多 4–6 GiB**，和 §2.3(d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时的 +6.3 吻合），activation 侧减少——只是 xl 只喂 512 个 token，activation 才 1–2 GiB，省的盖不住副本；fwd_bwd 恰好持平（25.56 vs 25.55）。推理时这份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
 
-**问题**：残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大。
+#### (d)(e)(f) 一层里的显存：谁最大、谁被留到反向
 
-`[batch, seq, d_model] × 4 B = 4 × 2048 × 2560 × 4 = 83,886,080 B = 80 MiB`（seq=128 时 5 MiB）；每 token 10 KiB。
+**问题**：(d) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大；(e) 时间线上最大的分配是什么、多大、从哪行代码来；(f) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少。
 
-#### (e) 最大的几笔分配
+- (d) 先立一把尺子：残差流张量 `[4, 2048, 2560] × 4 B = 80 MiB`（seq 128 时 5 MiB），每 token 10 KiB。
+- (e) 最大的分配比这把尺子大 25 倍：xl@2048 前向最大的是 **2 GiB**，全部来自 attention 的 `[4, 32, 2048, 2048]` fp32 分数矩阵，每层临时造 6 份（`QKᵀ` einsum、`/√d`、`masked_fill`、softmax 里的 `x − max`、`exp`、除法），调用栈指向 `model.py:253-257` 和 `nn_utils.py:15-24`；次大的 320 MiB 是 SwiGLU 的 `[4, 2048, 10240]` 中间量。
 
-**问题**：时间线上最大的分配是什么、多大、从哪行代码来。
+  | 大小 | 每层次数 | 来源 |
+  |--:|--:|:--|
+  | 2048 MiB | 6 | attention 分数矩阵 `[b, h, s, s]`：einsum、缩放、mask、softmax 三步 |
+  |  320 MiB | 4 | SwiGLU 中间量 `[b, s, d_ff]`：w1、w3、SiLU、门积 |
+  |   80 MiB | — | 残差流 `[b, s, d]` |
 
-xl@2048 前向最大的分配是 **2 GiB**，全部来自 attention 的 `[4, 32, 2048, 2048]` fp32 分数矩阵——每层临时造 6 份（`QKᵀ` einsum、`/√d`、`masked_fill`、softmax 里的 `x − max`、`exp`、除法），调用栈指向 `model.py:253-257` 和 `nn_utils.py:15-24`；次大的 320 MiB 是 SwiGLU 的 `[4, 2048, 10240]` 中间量。残差流本身（80 MiB）排不进前列。
+  seq 128 时排序反过来：最大的是 SwiGLU 的 20 MiB，attention 分数只有 8 MiB。分数矩阵随 seq² 涨、其它随 seq 线性涨，seq 一长 attention 就成了显存主角——这是第二篇 FlashAttention 的动机。
+- (f) 临时分配不等于留到反向。xl@128（fwd_bwd）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还活着——这就是为反向保存的 saved tensors，占 58%。按 malloc 发生时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
 
-| 大小 | 每层次数 | 来源 |
-|--:|--:|:--|
-| 2048 MiB | 6 | attention 分数矩阵 `[b, h, s, s]`：einsum、缩放、mask、softmax 三步 |
-|  320 MiB | 4 | SwiGLU 中间量 `[b, s, d_ff]`：w1、w3、SiLU、门积 |
-|   80 MiB | — | 残差流 `[b, s, d]` |
+  | 来源算子 | saved tensors | 占比 | 是什么 |
+  |:--|--:|--:|:--|
+  | `aten::mul`     | 60 MiB | 36% | SwiGLU 的门积和 SiLU 的 `x·σ(x)`（`[4,128,10240]` 各 20 MiB） |
+  | `aten::bmm`     | 40 MiB | 24% | attention 的 q/k/v 与 `softmax·V` 输出 |
+  | `aten::empty`   | 20 MiB | 12% | FFN 线性层的输出本身（einsum 先 `empty` 再由 GEMM 写入） |
+  | `aten::sigmoid` | 20 MiB | 12% | SiLU 里的 `σ(x)` |
+  | `aten::add`     | 10 MiB |  6% | 残差加 |
 
-> seq=128 时排序反过来：最大的是 SwiGLU 的 20 MiB，attention 分数只有 8 MiB。分数矩阵随 seq² 涨、其它随 seq 线性涨，seq 一长 attention 就成了显存主角——这是 §4 FlashAttention 的动机。
+  seq 128 时大头是 FFN 的 `d_ff` 宽中间量而不是 attention（分数矩阵只有 8 MiB），和 (e) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB，净增 249 MiB；释放的里有 161 MiB 是上面的 saved tensors，所以反向新产生的张量 = 249 + 161 = **410 MiB**。预期：这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB = 405 MiB，误差 1%。这就是 (a) 里反向「不下坡」的原因：每层释放 166、新增 410，净值继续爬。
 
-#### (f) 单层 TransformerBlock 为反向保存的显存
+![block5 saved tensors](assets/s2/nsys_block5_memory.png)
 
-**问题**：一层 block 前向时分配的显存里，有多少要留到反向；反向时又新分配多少。
-
-xl@128（fwd_bwd，fp32）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还没释放——这就是为反向保存的 saved tensors，占该层前向分配的 58%。按包着每次分配的最内层 `aten::*` range 归因，前五个来源占 saved tensors 的 90%：`aten::mul` 60 MiB（36%，SwiGLU 的门积和 SiLU 的 `x·σ(x)`，`[4,128,10240]` fp32 各 20 MiB）、`aten::bmm` 40 MiB（24%，attention 的 q/k/v 与 `softmax·V`）、`aten::empty` 20 MiB（12%，`w1(x)`/`w3(x)` 的输出，einsum 先 `empty` 再写入）、`aten::sigmoid` 20 MiB（12%，SiLU 里的 `σ(x)`）、`aten::add` 10 MiB（6%，残差相加）。算子名要读成「malloc 发生时正在跑的算子」而非「张量属于谁」。可以看到大头是 FFN 的 `d_ff` 宽中间量而不是 attention——seq=128 时 `[b,h,s,s]` 分数矩阵只有 8 MiB，§2.4(e) 里 seq=2048 时它才变成 2 GiB 的主角。
-
-反向时用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来（反向在 autograd 工作线程上跑，自己插的 range 覆盖不到），这一段窗口内分配 1203 MiB、释放 954 MiB，**净增 249 MiB**；其中释放的 954 MiB 里有 161 MiB 是上面那些 saved tensors。所以反向新产生的张量 = 净增 + 释放的 saved tensors = **410 MiB**。预期值：这一层 104.9M 参数的权重梯度 × 4 B = 400 MiB，加上传给前一层的输入梯度 `[4,128,2560]` × 4 B = 5 MiB，合 405 MiB，误差 1%——符合预期。这也解释了 §2.4(a) 时间线里反向为什么"不下坡"：每层释放 166 MiB、新增 410 MiB，净值必然继续爬。
-
-| 来源算子 | saved tensors | 占比 | 是什么 |
-|:--|--:|--:|:--|
-| `aten::mul`     | 60 MiB | 36% | SwiGLU 的门积和 SiLU 的 `x·σ(x)`（`[4,128,10240]` 各 20 MiB） |
-| `aten::bmm`     | 40 MiB | 24% | attention 的 q/k/v 与 `softmax·V` 输出 |
-| `aten::empty`   | 20 MiB | 12% | FFN 线性层的输出本身（einsum 先 `empty` 再由 GEMM 写入，malloc 落在 `empty` 的 range 里） |
-| `aten::sigmoid` | 20 MiB | 12% | SiLU 里的 `σ(x)` |
-| `aten::add`     | 10 MiB |  6% | 残差相加 |
-
-> 采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`，`--nvtx-ops` 给每层打 `block{i}` range、`emit_nvtx` 给每个 aten 算子打带 `seq` 编号的 range；归因脚本 `python -m benchmark.memory`。不关 caching allocator 的话 nsys 只看到显存池的增长，看不到单个张量。
-> 关了 caching 后 `cudaFree` 过的地址会被复用，分配和释放要按「之后的第一次 free」配对，直接按地址集合会多算 60 MiB。
-
-![block5 saved tensorss](assets/s2/nsys_block5_memory.png)
-
-> 图从 nsys 的 sqlite 导出直接画（`CUDA_GPU_MEMORY_USAGE_EVENTS` + `NVTX_EVENTS`，与 GUI 同源）：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配（saved tensors）。
+> 采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`，`--nvtx-ops` 给每层打 `block{i}` range、`emit_nvtx` 给每个 aten 算子打带 `seq` 编号的 range；归因脚本 `python -m benchmark.memory`。不关 caching allocator 的话 nsys 只看到显存池的增长，看不到单个张量；关了之后 `cudaFree` 过的地址会被复用，分配和释放要按「之后的第一次 free」配对，直接按地址集合会多算 60 MiB。图从 nsys 的 sqlite 导出直接画：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配。
 
 ---
 
