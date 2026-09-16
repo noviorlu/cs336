@@ -335,7 +335,7 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 
 T 是常数偏移，M(k) 对 k 是直线、斜率 (G − A)/L，峰值必在两端之一，看 **A 和 G 谁大**：
 
-![M(k)：xl@128 上坡、small@512 下坡，两端的预测峰值与实测对上](assets/s2/peak_moment.png)
+![一步 fwd_bwd 的显存曲线：前向逐层 +A/L，反向逐层 +G/L − A/L；xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上](assets/s2/peak_moment.png)
 
 | | A > G（saved tensors 比一份权重大） | G > A |
 |:--|:--|:--|
