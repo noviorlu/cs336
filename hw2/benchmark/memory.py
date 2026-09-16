@@ -32,7 +32,15 @@ def record_snapshot(path: str | None, max_entries: int = 1_000_000):
         print(f"显存快照已写出：{path}（拖进 https://pytorch.org/memory_viz 查看）")
 
 
-def plot_snapshot(pickle_path, out=None, *, title=None, subtitle=None):
+def _phase(e):
+    """按分配时的 Python 栈判断阶段：optimizer.py 在栈里 → optimizer；没有任何 .py 帧（autograd 工作线程）→ backward；否则 forward。"""
+    fr = [f for f in e["frames"] if f["filename"].endswith(".py")]
+    if any("optimizer" in f["filename"] for f in fr):
+        return "optimizer"
+    return "forward" if fr else "backward"
+
+
+def plot_snapshot(pickle_path, out=None, *, title=None, subtitle=None, phases=False):
     """把 _dump_snapshot 的 pickle 画成 active memory 曲线（和 memory_viz 同一份 alloc/free 事件）。
 
     横轴是分配事件序号不是时间。记录从预热后开始，所以曲线起点 = 那时已分配的权重。
@@ -45,9 +53,11 @@ def plot_snapshot(pickle_path, out=None, *, title=None, subtitle=None):
     tr = d["device_traces"][0]
     live = {}                    # addr -> size；记录开始前就活着的块不在 trace 里，靠 segments 末态反推
     base = sum(b["size"] for seg in d["segments"] for b in seg["blocks"] if b["state"] == "active_allocated")
-    cur, ys = 0, []
-    for e in tr:
+    cur, ys, bounds, last = 0, [], [], None
+    for i, e in enumerate(tr):
         if e["action"] == "alloc":
+            if phases and (ph := _phase(e)) != last:
+                bounds.append((i, ph)); last = ph
             live[e["addr"]] = e["size"]; cur += e["size"]
         elif e["action"] == "free_completed" and e["addr"] in live:
             cur -= live.pop(e["addr"])
@@ -60,6 +70,8 @@ def plot_snapshot(pickle_path, out=None, *, title=None, subtitle=None):
     ax.fill_between(range(len(ys)), ys, alpha=.35); ax.plot(ys, lw=.8)
     ax.axhline(peak, ls="--", c="gray", lw=.8); ax.text(len(ys) * .01, peak, f"peak {peak:.2f} GiB", va="bottom", fontsize=8, c="gray")
     ax.axhline(start / 2**30, ls=":", c="gray", lw=.8); ax.text(len(ys) * .01, start / 2**30, f"allocated before recording: {start/2**30:.2f} GiB (weights)", va="top", fontsize=8, c="gray")
+    for i, ph in bounds:                      # 阶段分界（红线）
+        ax.axvline(i, c="red", lw=.8, ls="--"); ax.text(i + len(ys) * .005, peak * .5, ph, c="red", fontsize=8, rotation=90, va="center")
     ax.set_xlabel("allocator event #"); ax.set_ylabel("active memory (GiB)"); ax.set_ylim(0, peak * 1.08)
     ax.set_title(title or pickle_path.stem)
     if subtitle:
