@@ -208,7 +208,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 - **(h) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。看每个 op 的算术强度 I = FLOPs / 读写显存 bytes：5090 fp32 算力 1.05e14 FLOPS、带宽 1.79e12 B/s，I 低于两者之比 ≈ 60 的 op 受限于带宽，时间 = bytes / 带宽，与 FLOPs 无关。medium@1024 一层内各 op（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
 
-  | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 | 带宽下限 | 实测 |
+  | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 |
   |:--|--:|--:|--:|--:|--:|--:|
   | 普通 Linear 作参照：y = x·Wᵀ（FFN 的 w1，x `[4096 token, 1024]`，W `[4096, 1024]`，y `[4096, 4096]`） | 3.4e10 | 读 x 16 MiB、W 16 MiB，写 y 64 MiB | 340 | **0.32 ms** | 0.06 ms | ≈ 0.5 ms |
   | S = QKᵀ（Q、K 各 `[64 个 batch×head, 1024, 64]`，S `[64, 1024, 1024]`） | 8.6e9 | 读 Q、K 32 MiB，写 S 256 MiB | 28 | 0.08 ms | **0.17 ms** | 0.61 ms |
@@ -217,7 +217,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
   | P = softmax(S)（hw1 版：max、减、exp、sum、除 5 个 kernel） | 3.4e8 | 每个 kernel 读写一遍 S 大小的张量，合计 8 遍 2 GiB，最后写出 P | 0.16 | ~0 | **1.2 ms** | 1.35 ms |
   | O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 8.6e9 | 读 P 256 MiB、V 8 MiB，写 O 8 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms |
 
-  算力下限 = FLOPs / 1.05e14，带宽下限 = bytes / 1.79e12，粗体是两者中更大的那个，即该 op 的瓶颈；实测是 nsys 里对应 kernel 的 GPU 时间（Linear 取前向 169 次 `sgemm_128x256_tn` 中 FFN 宽度那类的均值）。
+  算力下限 = FLOPs / 1.05e14（带宽无限也至少要这么久），带宽下限 = bytes / 1.79e12（算力无限也至少要这么久），粗体是两者中更大的那个，即该 op 的瓶颈——算力下限大叫 **compute-bound**，带宽下限大叫 **memory-bound**；实测是 nsys 里对应 kernel 的 GPU 时间（Linear 取前向 169 次 `sgemm_128x256_tn` 中 FFN 宽度那类的均值）。
 
   只有 Linear 的瓶颈是算力；attention 里每个 op 的 I 都在 60 以下，瓶颈是带宽，实测也都贴着带宽下限——时间由「S 被搬了几遍」决定：
   - softmax 是 hw1 自己写的（减 max、exp、sum、除），拆成 5 个 kernel 搬 8 遍，所以最贵；`/√d` 和 mask 各搬 2 遍，两个「零成本」操作加起来抵一次矩阵乘。
