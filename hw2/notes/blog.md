@@ -166,7 +166,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 **问题**：(e) 最耗时的 kernel 是哪个，加上反向还是它吗；(f) 矩阵乘之外还有什么占时间；(g) 算上 optimizer 后矩阵乘占比怎么变；(h) attention 内部 softmax 和两次矩阵乘各花多少，和 FLOPs 相称吗。
 
-分三步看：先把 nsys 里的 kernel 归类，再看整步的时间怎么分，最后放大到 attention 内部。
+分四步看：先把 nsys 里的 kernel 归类，再看整步的时间怎么分，然后放大到 attention 内部，最后逐 op 算 roofline 解释为什么。
 
 **第一步：kernel 归类**。nsys 报表里的 kernel 名是 C++ 模板签名，按关键字归三类（占比取 medium@512 full step 的 GPU 时间）：
 
@@ -206,23 +206,25 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | PV | 0.5 (2%) | 1.7 (4%) | 5.8 (4%) |
 | 其余（QKVO 投影、RoPE、FFN、RMSNorm、残差加） | 19.8 (88%) | 33.9 (74%) | 65.4 (47%) |
 
-- **(h) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。要解释这个，给每个 op 算两个「至少要多久」：**算力下限** = FLOPs / 1.05e14（5090 fp32 峰值算力，数据瞬间到位也得算这么久）和**带宽下限** = bytes / 1.79e12（显存带宽，算得无限快也得搬这么久）。实际耗时不可能低于两者中大的那个：算力下限大叫 compute-bound，带宽下限大叫 memory-bound。两者之比就是算术强度 I = FLOPs / bytes 与 ridge point 1.05e14 / 1.79e12 ≈ 60 的比较——I < 60 即 memory-bound。下表 medium@1024 一层内各 op：前 4 列纸面算，「实测」是 nsys 里对应 kernel 的 GPU 时间，粗体是该 op 的瓶颈（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
+- **(h) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。attention 三段合计从 12%（256）涨到 53%（1024），全部增量来自这些几乎不算数的 kernel。为什么，第四步逐 op 算账。
 
-  | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 |
-  |:--|--:|--:|--:|--:|--:|--:|
-  | 普通 Linear 作参照：y = x·Wᵀ（FFN 的 w1，x `[4096 token, 1024]`，W `[4096, 1024]`，y `[4096, 4096]`） | 3.4e10 | 读 x 16 MiB、W 16 MiB，写 y 64 MiB | 340 | **0.32 ms** | 0.06 ms | ≈ 0.5 ms |
-  | S = QKᵀ（Q、K 各 `[64 个 batch×head, 1024, 64]`，S `[64, 1024, 1024]`） | 8.6e9 | 读 Q、K 32 MiB，写 S 256 MiB | 28 | 0.08 ms | **0.17 ms** | 0.61 ms |
-  | S / √d（S 原地缩放） | 6.7e7 | 读 S 256 MiB，写 S 256 MiB | 0.13 | ~0 | **0.30 ms** | 0.34 ms |
-  | masked_fill（causal mask 填 −inf） | 0 | 读 S 256 MiB，写 S 256 MiB | 0 | 0 | **0.30 ms** | 0.35 ms |
-  | P = softmax(S)（hw1 版：max、减、exp、sum、除 5 个 kernel） | 3.4e8 | 每个 kernel 读写一遍 S 大小的张量，合计 8 遍 2 GiB，最后写出 P | 0.16 | ~0 | **1.2 ms** | 1.35 ms |
-  | O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 8.6e9 | 读 P 256 MiB、V 8 MiB，写 O 8 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms |
+**第四步：逐 op 的 roofline——为什么**。给每个 op 算两个「至少要多久」：**算力下限** = FLOPs / 1.05e14（5090 fp32 峰值算力，数据瞬间到位也得算这么久）和**带宽下限** = bytes / 1.79e12（显存带宽，算得无限快也得搬这么久）。实际耗时不可能低于两者中大的那个：算力下限大叫 compute-bound，带宽下限大叫 memory-bound。两者之比就是算术强度 I = FLOPs / bytes 与 ridge point 1.05e14 / 1.79e12 ≈ 60 的比较——I < 60 即 memory-bound。下表 medium@1024 一层内各 op：前 4 列纸面算，「实测」是 nsys 里对应 kernel 的 GPU 时间，粗体是该 op 的瓶颈（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
 
-  实测怎么读：贴着粗体下限（`/√d` 0.34 vs 0.30，softmax 1.35 vs 1.2，PV 0.24 vs 0.16）说明 kernel 已到硬件极限，再快只能靠改下限本身——减 bytes（融合）或减 FLOPs；远高于下限（QKᵀ 0.61 vs 0.17）说明实现没到位，换 kernel 就能收回来。Linear 的实测取前向 169 次 `sgemm_128x256_tn` 中 FFN 宽度那类的均值。
+| op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 |
+|:--|--:|--:|--:|--:|--:|--:|
+| 普通 Linear 作参照：y = x·Wᵀ（FFN 的 w1，x `[4096 token, 1024]`，W `[4096, 1024]`，y `[4096, 4096]`） | 3.4e10 | 读 x 16 MiB、W 16 MiB，写 y 64 MiB | 340 | **0.32 ms** | 0.06 ms | ≈ 0.5 ms |
+| S = QKᵀ（Q、K 各 `[64 个 batch×head, 1024, 64]`，S `[64, 1024, 1024]`） | 8.6e9 | 读 Q、K 32 MiB，写 S 256 MiB | 28 | 0.08 ms | **0.17 ms** | 0.61 ms |
+| S / √d（S 原地缩放） | 6.7e7 | 读 S 256 MiB，写 S 256 MiB | 0.13 | ~0 | **0.30 ms** | 0.34 ms |
+| masked_fill（causal mask 填 −inf） | 0 | 读 S 256 MiB，写 S 256 MiB | 0 | 0 | **0.30 ms** | 0.35 ms |
+| P = softmax(S)（hw1 版：max、减、exp、sum、除 5 个 kernel） | 3.4e8 | 每个 kernel 读写一遍 S 大小的张量，合计 8 遍 2 GiB，最后写出 P | 0.16 | ~0 | **1.2 ms** | 1.35 ms |
+| O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 8.6e9 | 读 P 256 MiB、V 8 MiB，写 O 8 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms |
 
-  只有 Linear 的瓶颈是算力；attention 里每个 op 的 I 都在 60 以下，瓶颈是带宽，实测也都贴着带宽下限——时间由「S 被搬了几遍」决定：
-  - softmax 是 hw1 自己写的（减 max、exp、sum、除），拆成 5 个 kernel 搬 8 遍，所以最贵；`/√d` 和 mask 各搬 2 遍，两个「零成本」操作加起来抵一次矩阵乘。
-  - 两个矩阵乘也带宽受限：`[M,K]×[K,N]` 的 GEMM 在输出远大于输入时 I ≈ K/2。QKᵀ 的内维 K = d_head = 64，写出 1024² 个元素每个只做 64 次乘加，I ≈ 28；Linear 的 K = 1024，I 高 16 倍。这是 attention 的定义决定的：只要 S 要落显存就是带宽受限。QKᵀ 实测比带宽下限还慢 3.5×，因为它是 batched GEMM 且 K 经 einsum 转置后非连续，cuBLAS 选了效率较低的 `magma_sgemmEx`。
-  - seq 翻 4 倍：Linear 的 bytes 和 FLOPs 都 ∝ seq，翻 4 倍；这些 op 的 bytes ∝ seq²，翻 16 倍。attention 三段合计从 12%（256）涨到 53%（1024）就是这么来的。
+实测怎么读：贴着粗体下限（`/√d` 0.34 vs 0.30，softmax 1.35 vs 1.2，PV 0.24 vs 0.16）说明 kernel 已到硬件极限，再快只能靠改下限本身——减 bytes（融合）或减 FLOPs；远高于下限（QKᵀ 0.61 vs 0.17）说明实现没到位，换 kernel 就能收回来。Linear 的实测取前向 169 次 `sgemm_128x256_tn` 中 FFN 宽度那类的均值。
+
+只有 Linear 的瓶颈是算力；attention 里每个 op 的 I 都在 60 以下，瓶颈是带宽，实测也都贴着带宽下限——时间由「S 被搬了几遍」决定：
+- softmax 是 hw1 自己写的（减 max、exp、sum、除），拆成 5 个 kernel 搬 8 遍，所以最贵；`/√d` 和 mask 各搬 2 遍，两个「零成本」操作加起来抵一次矩阵乘。
+- 两个矩阵乘也带宽受限：`[M,K]×[K,N]` 的 GEMM 在输出远大于输入时 I ≈ K/2。QKᵀ 的内维 K = d_head = 64，写出 1024² 个元素每个只做 64 次乘加，I ≈ 28；Linear 的 K = 1024，I 高 16 倍。这是 attention 的定义决定的：只要 S 要落显存就是带宽受限。QKᵀ 实测比带宽下限还慢 3.5×，因为它是 batched GEMM 且 K 经 einsum 转置后非连续，cuBLAS 选了效率较低的 `magma_sgemmEx`。
+- seq 翻 4 倍：Linear 的 bytes 和 FLOPs 都 ∝ seq，翻 4 倍；这些 op 的 bytes ∝ seq²，翻 16 倍。attention 三段合计从 12%（256）涨到 53%（1024）就是这么来的。
 
 **结论**：GPU 时间看的是「张量被搬了几遍」，不是 FLOPs。解法只有一种——融合，让 S 少落几次显存：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
 
