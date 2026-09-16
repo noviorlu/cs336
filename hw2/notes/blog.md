@@ -4,6 +4,17 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 > 硬件 RTX 5090 32 GB（`torch` 可用 31.3 GiB；下文显存一律 GiB = 2³⁰ B，即 `max_memory_allocated()/1024³`），torch 2.11.0+cu130，fp32 基准 `allow_tf32=False`；除注明外 `batch=4, seq=512`，warmup 5 / measure 10。
 
+## 省流不看
+
+1. **先算纸面账再开机**（§1）：训练算力 ≈ 6 × 参数量 × token 数；训练静态显存 16 B/参数（fp32 权重 4 + 梯度 4 + AdamW 状态 8）。3.41B 参数的模型（作业的 xl）静态就 50.8 GiB，5090 的 31.3 GiB 装不下。按 Chinchilla 的 20 token/参数 训到收敛、实测算力利用率 31% 反推：0.42B 模型（作业的 medium）要 8 天，0.97B（large）要 41 天。单卡 5090 一周内能训完的最大模型约 0.4B。
+2. **不预热的计时数字没意义**（§2.1）：实测进程第一步比稳态慢 1.7–6.9×，绝对值 ~300 ms 且与模型大小无关；把它平均进去，10 步均值虚高 7–59%、标准差从 1 ms 涨到 100 ms，模型越小失真越大。原因是第一步要做一批**一次性**的事——GPU kernel 首次加载进显存、cuBLAS 建句柄、显存池第一次向驱动要内存——这些是进程级开销，和模型算得快慢无关，却全记在第一步上；不剔除，比较的就是「谁先启动」而不是「谁算得快」。先空跑 1 步再计时就稳了。计时用 `timeit` + `torch.cuda.synchronize()` 回答「多快」，用 Nsight Systems 看时间线回答「时间花在哪」。
+3. **时间线上看到的**（§2.2）：前向里矩阵乘的占比从 82%（seq 256）掉到 54%（seq 1024），让出的份额全被逐元素小 kernel 吃掉；seq 1024 时 attention 占前向一半，其中 softmax（拆成 5 个 kernel、把分数矩阵读写 5 遍）用了 PV 矩阵乘 5.6× 的时间，`/√d` 和 mask 两个逐元素操作也和一次矩阵乘一样贵。它们算得少、搬得多，卡在带宽上。
+4. **混合精度**（§2.3–2.5）：数值精度由累加器的 dtype 决定，bf16 累加器 `s += 0.01` 到 4.0 就加不动。bf16 自动混合精度让前向快 1.9–2.3×、反向 1.7–1.9×，模型越大越快——一半来自 bytes 减半，一半来自 fp32 只能用 CUDA core 而 bf16 能进吞吐高一个量级的 Tensor core；但**显存不省反多**——autocast 会多存一份 bf16 权重副本（3.41B 模型 +6.3 GiB），只有中间激活远大于权重时才省。
+5. **autograd 为反向存什么**（§3.1）：一个算子的局部导数里出现什么张量就存什么，存的是引用不是拷贝。RMSNorm 拆成 5 个算子，真正多占显存的只有归一化系数 r 和归一化后的 x̂；`torch.compile` 把 5 个算子融合成 1 个后，x̂ 不再存、反向时重算。
+6. **显存大头是 attention**（§2.5/§3.1）：3.41B 模型、序列 2048，一层 Transformer block 为反向存 3655 MiB，其中 56% 是 attention 分数矩阵 S = QKᵀ 和概率矩阵 P = softmax(S)——两个 `[batch, heads, seq, seq]` 张量，随序列长度平方增长，32 层合计 114 GiB。
+7. **激活检查点（activation checkpointing）是推迟不是压缩**（§3.2）：前向只留每段的输入，反向到该段时重算段内张量。峰值显存 = 所有段输入 + 一段的中间张量；不管怎么分段都恰好多算一次前向（实测慢 28–33%）。Transformer 每层中间张量远大于层输入，所以最省显存的分法就是每层一段，段长没有最优的中间值；教科书上的递归二分能把显存压到 O(log 层数) 但计算涨到 O(层数 · log 层数)，实践不用。
+8. **检查点动不了 S 和 P**：反向重算时它们仍要完整落在显存里。要消掉得改 attention 的 kernel 本身——[第二篇](blog2.md) FlashAttention。
+
 ---
 
 ## 1 背景与纸面账
@@ -23,6 +34,9 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | **forward / fwd_bwd / full** | benchmark 的三种模式：纯前向（`no_grad`）/ 前向 + 反向 / 前向 + 反向 + optimizer step |
 | **kernel / op** | kernel = GPU 上执行的一个函数（nsys 看到的单位）；op = PyTorch 的 aten 算子，一个 op 可能发多个 kernel |
 | **matmul / GEMM** | 矩阵乘；GEMM 是 cuBLAS/cutlass 里矩阵乘 kernel 的名字 |
+| **CUDA core / Tensor core** | 一个 SM 里的两种算术单元。CUDA core（SIMT）是标量 FMA，什么都能算，5090 fp32 峰值 1.05e14 FLOPS；Tensor core 只做小矩阵块乘加，只收 fp16 / bf16 / tf32 / fp8 输入，吞吐高一个量级（5090 bf16 2.1e14，H100 上比 CUDA core 高 15×）。纯 fp32 矩阵乘走不了 Tensor core；**tf32** 是把 fp32 尾数截到 10 位后送进 Tensor core 的后门，`allow_tf32=False` 就是关掉它。nsys 里 kernel 名带 `simt` 的走 CUDA core |
+| **FLOPs / FLOPS** | FLOPs = 浮点运算次数（计数，如 8.6e9）；FLOPS = 每秒浮点运算次数（速率，如 1.05e14）。全文用 10 的幂写，不用 G/T 前缀 |
+| **算术强度 I**（arithmetic intensity） | FLOPs / 读写显存的 bytes。低于硬件的 FLOPS / 带宽（5090 fp32 ≈ 60）的 op 受限于带宽，时间 = bytes / 带宽 |
 
 ### 1.2 模型规格
 
@@ -71,7 +85,7 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 ### 1.5 训练 20N token 要多久
 
-用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPs/s**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.4(c) 的 fwd_bwd 加速换算。
+用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.4(c) 的 fwd_bwd 加速换算。
 
 | Size | 20N token | step (fp32) | fp32 | step (bf16) | bf16 |
 |:-----|--:|--:|--:|--:|--:|
@@ -135,40 +149,67 @@ xl 卡在 Adam 状态（§2.5(b) 实测 OOM @ optimizer），10B 建模型即 OO
 | timeit |  9.44 | 16.66 | 51.30 | 23.37 | 47.67 | 146.52 |
 | 相对差 | +7.7% | +5.0% | +2.3% | +5.6% | +4.4% | +2.9% |
 
-#### (b) 最耗时的 kernel
+#### (b)–(e) kernel 分析：GPU 时间花在哪
 
-**问题**：前向里 GPU 时间最长的 kernel 是哪个、调用几次；加上反向后还是它吗。
+**问题**：(b) 最耗时的 kernel 是哪个，加上反向还是它吗；(c) 矩阵乘之外还有什么占时间；(d) 算上 optimizer 后矩阵乘占比怎么变；(e) attention 内部 softmax 和两次矩阵乘各花多少，和 FLOPs 相称吗。
 
-六档都是 `cutlass_80_simt_sgemm_128x256_8x4_tn`（占前向 41–70%，单次前向 37–169 次）；加上反向仍是它（medium@1024 占 14.6%），反向 GEMM 散在三个 tile 变体上。
+分三步看：先把 nsys 里的 kernel 归类，再看整步的时间怎么分，最后放大到 attention 内部。
 
-#### (c) 非矩阵乘 kernel
+**第一步：kernel 归类**。nsys 报表里的 kernel 名是 C++ 模板签名，按关键字归三类（占比取 medium@512 full step 的 GPU 时间）：
 
-**问题**：除矩阵乘之外，还有哪些 kernel 占了可观的时间。
+| 类别 | kernel 名 | 对应模型里的操作 | 占比 |
+|:--|:--|:--|--:|
+| **matmul** | `cutlass_80_simt_sgemm`<br>`magma_sgemmEx` | 所有 `Linear` 的前向与反向（`sgemm` = fp32 GEMM，`simt` = 走 CUDA core）<br>attention 的 QKᵀ / PV：batched GEMM，cuBLAS 选了源自 MAGMA 库的 kernel，同是矩阵乘 | 60% |
+| **elementwise** | `elementwise_kernel<MulFunctor>`<br>`elementwise_kernel<add>`<br>`elementwise_kernel<DivFunctor>`<br>`direct_copy_kernel`<br>`masked_fill_kernel`<br>`exp_kernel` / `neg_kernel`<br>`sigmoid_backward`<br>`addcdiv` / `addcmul` / `sqrt_kernel` | SwiGLU 门积、RMSNorm 的 w⊙x̂、`/√d`<br>残差加、梯度累加、softmax 减 max<br>softmax 归一化<br>`.contiguous()` / 转置<br>causal mask<br>softmax 的 exp 及其反向<br>SiLU 反向<br>AdamW 更新 | 39% |
+| **reduce** | `reduce_kernel<sum_functor>`<br>`reduce_kernel<MaxOps>` | RMSNorm 的 Σx²、softmax 的 Σexp、反向对 batch 维求和<br>softmax 的 max | 2% |
 
-elementwise（SwiGLU、RoPE、mask、残差）+ reduce（RMSNorm、softmax）占前向 18–49%，随 seq 急剧上升——它们访存受限，attention 中间张量随 seq² 涨。
+**第二步：整步按类别**。
 
-| | small 256 | small 512 | small 1024 | medium 256 | medium 512 | medium 1024 |
-|:--|--:|--:|--:|--:|--:|--:|
-| matmul  | 79% | 77% | 51% | 81% | 75% | 53% |
-| 非 matmul | 20% | 23% | 49% | 18% | 25% | 47% |
+| medium | forward 256 | forward 512 | forward 1024 | full step 256 | full step 512 |
+|:--|--:|--:|--:|--:|--:|
+| GPU 时间 / 步 | 22.5 ms | 45.5 ms | 138.7 ms | 81 ms | 166 ms |
+| **matmul** | **82%** | **75%** | **54%** | **65%** | **60%** |
+| elementwise | 16% | 23% | 40% | 34% | 39% |
+| reduce | 2% | 2% | 6% | 1% | 2% |
 
-#### (d) full step vs 纯前向
+- **(b) 最耗时的 kernel** 是 `cutlass_80_simt_sgemm_128x256_8x4_tn`：前向占 45–54%，加上反向和 optimizer 后仍是第一但只剩 17%。名字拆读：`128x256` 是每个 thread block 负责的输出分块，`tn` 是两个输入的布局（第一个转置）。cuBLAS 按矩阵形状和布局选 tile，同是 Linear 的矩阵乘会散在几个名字下；用每步实例数（24 层 × 7 个 Linear + lm_head = 169）能对出各是哪一步：
 
-**问题**：把 optimizer step 也算进来，matmul 的占比怎么变。
+  | kernel | 每步次数 | 对应 |
+  |:--|--:|:--|
+  | `sgemm_128x256_tn` + `sgemm_256x128_tn` | 73 + 96 = 169 | 前向 y = x·Wᵀ（W 存成 `[out, in]`，故转置） |
+  | `sgemm_256x128_nn` | 169 | 反向 dx = dy·W |
+  | `sgemm_128x128_nt` + `sgemm_128x64_nt` | 73 + 96 = 169 | 反向 dW = dyᵀ·x |
 
-full step 中 matmul 占比比前向低 6–18 pp（medium@256：81% → 64%），份额被 elementwise 吃掉（16% → 34%）：反向有大量梯度累加，AdamW 是纯逐元素。
+  73 / 96 是 d_model 宽的 QKVO 投影和 d_ff 宽的 FFN 矩阵分到了不同 tile。所以「最大 kernel」就是 Linear 的前向矩阵乘；full step 里它的份额被 dx、dW 两组各 169 次的反向 GEMM 分走。
+- **(c) 矩阵乘之外**是 elementwise + reduce，前向占比从 18%（seq 256）涨到 46%（seq 1024）。它们 FLOPs 极少，占时间是因为每个 kernel 都要把张量完整读一遍写一遍，而 attention 的中间张量随 seq² 涨——第三步量化。
+- **(d) 算上 optimizer**，matmul 占比比前向低 15–17 个百分点，让出的份额被 elementwise 吃掉：反向的梯度累加和 AdamW 的更新全是逐元素。small 同样趋势（forward 1024：matmul 51%）。
 
-#### (e) attention 内 softmax vs 矩阵乘
+**第三步：attention 内部**。把 attention 拆三段打 NVTX——scores（QKᵀ、/√d、mask）、softmax、PV——统计每段内 kernel 的 GPU 时间，24 层合计，占整个 forward 的比例：
 
-**问题**：attention 内部 softmax 和两次矩阵乘各花多少时间，和它们的 FLOPs 相称吗。
-
-softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段（含 `/√d` 和 `masked_fill`）占 attention 的 61%，三段都卡在带宽。
-
-| medium | seq 256 | seq 512 | seq 1024 |
+| medium forward | seq 256 | seq 512 | seq 1024 |
 |:--|--:|--:|--:|
-| scores  | 11.1 ms (40%) | 28.4 (55%) | 91.9 (61%) |
-| softmax |  1.8 (7%)     |  5.6 (11%) | 33.8 (22%) |
-| matmul  |  1.7 (6%)     |  3.2 (6%)  |  7.6 (5%)  |
+| scores | 1.3 ms (6%) | 5.2 (11%) | 35.1 (25%) |
+| softmax | 0.9 (4%) | 4.7 (10%) | 32.4 (23%) |
+| PV | 0.5 (2%) | 1.7 (4%) | 5.8 (4%) |
+| 其余（QKVO 投影、RoPE、FFN、RMSNorm、残差加） | 19.8 (88%) | 33.9 (74%) | 65.4 (47%) |
+
+- **(e) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。看每个 op 的算术强度 I = FLOPs / 读写显存 bytes：5090 fp32 算力 1.05e14 FLOPS、带宽 1.79e12 B/s，I 低于两者之比 ≈ 60 的 op 受限于带宽，时间 = bytes / 带宽，与 FLOPs 无关。medium@1024 一层内各 op（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
+
+  | op | FLOPs | 读写 bytes | I | 带宽下限 | 实测 |
+  |:--|--:|--:|--:|--:|--:|
+  | Linear（FFN w1，`[4096,1024]×[1024,4096]`） | 3.4e10 | 96 MiB | 340 | 0.06 ms | 算力受限 |
+  | S = QKᵀ | 8.6e9 | 读 Q、K 32 MiB，写 S 256 MiB | 28 | 0.17 ms | 0.61 ms |
+  | S / √d | 6.7e7 | 读写 S 512 MiB | 0.13 | 0.30 ms | 0.34 ms |
+  | masked_fill | 0 | 读写 S 512 MiB | 0 | 0.30 ms | 0.35 ms |
+  | softmax（5 个 kernel） | 3.4e8 | S 读写 8 遍 2 GiB | 0.16 | 1.2 ms | 1.35 ms |
+  | O = PV | 8.6e9 | 读 P 256 MiB、V 8 MiB，写 O 8 MiB | 30 | 0.16 ms | 0.24 ms |
+
+  除了 Linear，每个 op 的 I 都在 60 以下，实测都贴着带宽下限——时间由「S 被搬了几遍」决定：
+  - softmax 是 hw1 自己写的（减 max、exp、sum、除），拆成 5 个 kernel 搬 8 遍，所以最贵；`/√d` 和 mask 各搬 2 遍，两个「零成本」操作加起来抵一次矩阵乘。
+  - 两个矩阵乘也带宽受限：`[M,K]×[K,N]` 的 GEMM 在输出远大于输入时 I ≈ K/2。QKᵀ 的内维 K = d_head = 64，写出 1024² 个元素每个只做 64 次乘加，I ≈ 28；Linear 的 K = 1024，I 高 16 倍。这是 attention 的定义决定的：只要 S 要落显存就是带宽受限。QKᵀ 实测比带宽下限还慢 3.5×，因为它是 batched GEMM 且 K 经 einsum 转置后非连续，cuBLAS 选了效率较低的 `magma_sgemmEx`。
+  - seq 翻 4 倍：Linear 的 bytes 和 FLOPs 都 ∝ seq，翻 4 倍；这些 op 的 bytes ∝ seq²，翻 16 倍。attention 三段合计从 12%（256）涨到 53%（1024）就是这么来的。
+
+**结论**：GPU 时间看的是「张量被搬了几遍」，不是 FLOPs。解法只有一种——融合，让 S 少落几次显存：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
 
 ### 2.3 混合精度累加（Mixed Precision Accumulation）
 
@@ -206,7 +247,7 @@ softmax 比 FLOPs 相同的 `softQK·V` 矩阵乘慢 1.2–4.5×；`scores` 段�
 
 **问题**：bf16 autocast 相对 fp32，各规格前向和反向快多少，显存省多少。
 
-bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加速越高**（大 GEMM 更接近 Tensor Core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。xl 在 bf16 下仍 OOM。加速比含两个效应：位宽减半 + fp32 基准走 SIMT 而 bf16 走 Tensor Core。
+bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加速越高**（大 GEMM 更接近 Tensor Core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。xl 在 bf16 下仍 OOM。加速比是两个效应的乘积：位宽减半（搬的 bytes 少一半），以及**换了算术单元**——纯 fp32 矩阵乘只能走 CUDA core（nsys 里的 `simt_sgemm`，峰值 1.05e14 FLOPS），bf16 才有资格进 Tensor core（2.1e14）。基准关掉 `allow_tf32` 就是为了让 fp32 老老实实走 CUDA core，否则 fp32 也会被偷偷截成 tf32 送进 Tensor core，两组数就不是在比精度了。
 
 | Size | forward fp32 → bf16 | 加速 | backward fp32 → bf16 | 加速 | 峰值显存 |
 |:-----|:--|--:|:--|--:|:--|
