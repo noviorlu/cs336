@@ -228,7 +228,7 @@ xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OO
 
 ### 2.2 显存剖析（Memory Profiling）
 
-用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。六问分三步：先看整步的时间线和峰值（a、b），再看混合精度改了什么（c），最后放大到一层里面谁最大、谁被留到反向（d、e、f）。
+用 `torch.cuda.memory._record_memory_history` 记显存分配历史，拖进 pytorch.org/memory_viz 看时间线。xl，`batch=4`，峰值取 `max_memory_allocated`（预热后清零）。五问分两步：先看整步的时间线和峰值（a、b），再放大到一层里面谁最大、谁被留到反向（c、d、e）；bf16 列的解释放在 §2.3(e)。
 
 #### (a)(b) 整步：时间线与峰值
 
@@ -249,31 +249,17 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 ![xl 纯前向：seq 128（上，平）vs seq 2048（下，32 根尖峰）](assets/s2/mem_xl_forward_128_vs_2048.png)
 ![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
 
-- (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向坡度变缓但仍在爬（每层释放 ~166 MiB saved tensors、同时新分配 ~410 MiB 梯度，净增，见 (f)）；optimizer 一开始就垂直冲到 ~28.6 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）不留东西，seq 128 时几乎是平的（12.8 GiB 基线上多 0.08 GiB）；seq 2048 的图却有 32 根尖峰——每层 attention 算到一半时，`[4, 32, 2048, 2048]` 的 2 GiB 分数矩阵有 ~4 份同时活着（`QKᵀ`、`/√d`、`masked_fill`、softmax 的中间量，链式写法里前一份要等下一份算完才释放），12.8 + 4 × 2 ≈ 21.4 GiB 就是峰；`softmax·V` 一算完全部释放，掉回基线。横轴是分配事件序号不是时间，尖峰看着窄，实际 attention 占前向近一半时间（§2.2）。
+- (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向坡度变缓但仍在爬（每层释放 ~166 MiB saved tensors、同时新分配 ~410 MiB 梯度，净增，见 (e)）；optimizer 一开始就垂直冲到 ~28.6 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）不留东西，seq 128 时几乎是平的（12.8 GiB 基线上多 0.08 GiB）；seq 2048 的图却有 32 根尖峰——每层 attention 算到一半时，`[4, 32, 2048, 2048]` 的 2 GiB 分数矩阵有 ~4 份同时活着（`QKᵀ`、`/√d`、`masked_fill`、softmax 的中间量，链式写法里前一份要等下一份算完才释放），12.8 + 4 × 2 ≈ 21.4 GiB 就是峰；`softmax·V` 一算完全部释放，掉回基线。横轴是分配事件序号不是时间，尖峰看着窄，实际 attention 占前向近一半时间（§2.2）。
 - (b) xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：卡的不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。seq 2048 连 fwd_bwd 都过不了前向：基线 12.8 + 逐层累积的 saved tensors + 每层 8 GiB 的 attention 尖峰，25.96 GiB 时撞墙——第二篇 FlashAttention 消掉的正是这根尖峰。
 
 > 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
 
-#### (c) 混合精度的影响
+#### (c)(d)(e) 一层里的显存：谁最大、谁被留到反向
 
-**问题**：开 bf16 autocast 后峰值变化多少。
+**问题**：(c) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大；(d) 时间线上最大的分配是什么、多大、从哪行代码来；(e) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少。
 
-看上表的 bf16 列：xl 上**不省反多 4–6 GiB**（no_grad 前向）或**持平**（fwd_bwd），和 §2.3(d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时 no_grad 前向的 +6.3 吻合），activation 侧减少（xl@128 一层存 166 MiB，32 层 5.3 GiB，bf16 下约 3.5）——区别在**峰值落在哪一刻**：
-
-| 反向到第 k 层时活着的 | fp32 | bf16 autocast |
-|:--|:--|:--|
-| 权重 + 已算出的梯度 + 还没用掉的 saved tensors | 12.7 + k/32 × 12.7 + (32−k)/32 × 5.3 | 12.7 + k/32 × 12.7 + (32−k)/32 × (3.5 + 6.35 副本) |
-| 单调性 | 每层新增梯度 12.7/32 > 每层释放 5.3/32 → 一路涨 | 12.7 > 9.85 → 一路涨 |
-| 峰值 | 反向末尾：12.7 + 12.7 = **25.4** | 反向末尾：**25.4**（activation 和副本都已释放） |
-
-xl 每层新增的梯度比释放的 saved tensors 大，曲线一路上涨，峰值在反向末尾——那一刻 activation 无论什么精度都已归零，副本也释放完，bf16 省的 1.8 GiB 对峰值没有贡献。small@512 是反过来的比例（权重 0.48、activation 3.4）：反向每层释放的比新增的多，曲线下降，峰值在**前向末尾**，activation 全在，减半直接体现为 4.08 → 3.18。一句话：bf16 减 activation 是真的，但只有峰值落在「activation 全在」的时刻才看得见；这也是 §2.3(d) 里省的比例随模型变大而缩小的原因。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
-
-#### (d)(e)(f) 一层里的显存：谁最大、谁被留到反向
-
-**问题**：(d) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大；(e) 时间线上最大的分配是什么、多大、从哪行代码来；(f) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少。
-
-- (d) 残差流张量 `[batch, seq, d_model]` = `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是 Transformer 里"一层传给下一层"的那个张量，下面拿它当尺子。
-- (e) 最大的分配是它的 25 倍。照 §2.1 的办法，把一层 block 前向按子模块、逐 op 列出每个 op 分配的输出张量（xl，batch 4，32 头，d_head 80；大小按 shape × 4 B，与时间线上的 malloc 一致）：
+- (c) 残差流张量 `[batch, seq, d_model]` = `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是 Transformer 里"一层传给下一层"的那个张量，下面拿它当尺子。
+- (d) 最大的分配是它的 25 倍。照 §2.1 的办法，把一层 block 前向按子模块、逐 op 列出每个 op 分配的输出张量（xl，batch 4，32 头，d_head 80；大小按 shape × 4 B，与时间线上的 malloc 一致）：
 
   | 子模块 | op | 分配的张量 | seq 2048 | seq 128 |
   |:--|:--|:--|--:|--:|
@@ -289,7 +275,7 @@ xl 每层新增的梯度比释放的 saved tensors 大，曲线一路上涨，�
   | 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
 
   时间线上最大的分配就是 attention 核心那 6 份 **2 GiB**（调用栈 `model.py:253-257`、`nn_utils.py:15-24`），全是同一个 `[b, h, s, s]` 形状的链式中间量，也就是 (a) 里的尖峰；次大是 FFN 的 4 份 320 MiB。只有 attention 核心那一组随 seq² 涨（2048 → 128 缩 256 倍），其余都随 seq 线性涨（缩 16 倍）：seq 128 时 attention 只有 8 MiB、最大的反而是 FFN 的 20 MiB，seq 一长 attention 就成了显存主角——这是第二篇 FlashAttention 的动机。
-- (f) 临时分配不等于留到反向。xl@128（fwd_bwd）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还活着——这就是为反向保存的 saved tensors，占 58%。按 malloc 发生时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
+- (e) 临时分配不等于留到反向。xl@128（fwd_bwd）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还活着——这就是为反向保存的 saved tensors，占 58%。按 malloc 发生时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
 
   | 来源算子 | saved tensors | 占比 | 是什么 |
   |:--|--:|--:|:--|
@@ -299,7 +285,7 @@ xl 每层新增的梯度比释放的 saved tensors 大，曲线一路上涨，�
   | `aten::sigmoid` | 20 MiB | 12% | SiLU 里的 `σ(x)` |
   | `aten::add`     | 10 MiB |  6% | 残差加 |
 
-  seq 128 时大头是 FFN 的 `d_ff` 宽中间量而不是 attention（分数矩阵只有 8 MiB），和 (e) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB，净增 249 MiB；释放的里有 161 MiB 是上面的 saved tensors，所以反向新产生的张量 = 249 + 161 = **410 MiB**。预期：这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB = 405 MiB，误差 1%。这就是 (a) 里反向「不下坡」的原因：每层释放 166、新增 410，净值继续爬。
+  seq 128 时大头是 FFN 的 `d_ff` 宽中间量而不是 attention（分数矩阵只有 8 MiB），和 (d) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB，净增 249 MiB；释放的里有 161 MiB 是上面的 saved tensors，所以反向新产生的张量 = 249 + 161 = **410 MiB**。预期：这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB = 405 MiB，误差 1%。这就是 (a) 里反向「不下坡」的原因：每层释放 166、新增 410，净值继续爬。
 
 ![block5 saved tensors](assets/s2/nsys_block5_memory.png)
 
@@ -307,7 +293,7 @@ xl 每层新增的梯度比释放的 saved tensors 大，曲线一路上涨，�
 
 ### 2.3 混合精度（Mixed Precision）
 
-四问一条线：先看低精度数值本身的坑（a），再看 autocast 具体把哪些张量降了精度（b）、为什么偏偏留下 LayerNorm（c），最后看换来的速度和显存（d）。
+五问一条线：先看低精度数值本身的坑（a），再看 autocast 具体把哪些张量降了精度（b）、为什么偏偏留下 LayerNorm（c），最后看换来的速度和显存（d）以及 xl 上为什么显存不省（e）。
 
 #### (a) 精度由累加器决定
 
@@ -352,7 +338,21 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) | +1.78 | −5.50 |
 | xl     | OOM → OOM | — | — | — | — | +6.35 | — |
 
-峰值显存是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风；到 xl@128 这种 token 少、权重大的配置就反过来：`no_grad` 前向 +49%（副本全在、没有 activation 可省）；fwd_bwd 看似持平，其实是峰值落在反向末尾、副本那时已释放——见 §2.2(c)。
+峰值显存是两项相抵，后两列是用 `saved_tensors_hooks` 把为反向存的张量按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 反而不再被存，但它本来就在显存里，所以副本是净增。activation 侧**减少**：矩阵乘的输入输出都成了 bf16，但不是严格减半（small 3.41 → 2.28 = 67%），因为 RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。训练时 activation 远大于权重所以净减，模型越大副本越占上风；到 xl@128 这种 token 少、权重大的配置就反过来：`no_grad` 前向 +49%（副本全在、没有 activation 可省）；fwd_bwd 看似持平，其实是峰值落在反向末尾、副本那时已释放——见 §2.3(e)。
+
+#### (e) xl 上为什么不省：峰值落在哪一刻
+
+**问题**：xl@128 / 2048 开 bf16 autocast 后峰值变化多少，为什么和 (d) 的趋势不同。
+
+看 §2.2(a)(b) 峰值表的 bf16 列：xl 上**不省反多 4–6 GiB**（no_grad 前向）或**持平**（fwd_bwd），和 (d) 里 small/medium/large 省 20% 相反。机制相同——权重侧多一份 bf16 副本（3.41B × 2 B = 6.35 GiB，与 128 时 no_grad 前向的 +6.3 吻合），activation 侧减少（xl@128 一层存 166 MiB，32 层 5.3 GiB，bf16 下约 3.5）——区别在**峰值落在哪一刻**：
+
+| 反向到第 k 层时活着的 | fp32 | bf16 autocast |
+|:--|:--|:--|
+| 权重 + 已算出的梯度 + 还没用掉的 saved tensors | 12.7 + k/32 × 12.7 + (32−k)/32 × 5.3 | 12.7 + k/32 × 12.7 + (32−k)/32 × (3.5 + 6.35 副本) |
+| 单调性 | 每层新增梯度 12.7/32 > 每层释放 5.3/32 → 一路涨 | 12.7 > 9.85 → 一路涨 |
+| 峰值 | 反向末尾：12.7 + 12.7 = **25.4** | 反向末尾：**25.4**（activation 和副本都已释放） |
+
+xl 每层新增的梯度比释放的 saved tensors 大，曲线一路上涨，峰值在反向末尾——那一刻 activation 无论什么精度都已归零，副本也释放完，bf16 省的 1.8 GiB 对峰值没有贡献。small@512 是反过来的比例（权重 0.48、activation 3.4）：反向每层释放的比新增的多，曲线下降，峰值在**前向末尾**，activation 全在，减半直接体现为 4.08 → 3.18。一句话：bf16 减 activation 是真的，但只有峰值落在「activation 全在」的时刻才看得见；这也是 (d) 里省的比例随模型变大而缩小的原因。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
 
 ---
 
@@ -362,7 +362,7 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 
 **问题**：autograd 到底为反向存了哪些张量？先用最小的例子 RMSNorm 看清楚，再看 `torch.compile` 融合后有什么变化。
 
-§2.2(f) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
+§2.2(e) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
 
 $\mathrm{RMSNorm}(x)_i = w_i \cdot \frac{x_i}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}}$，拆成 5 个 op：
 $\underbrace{r = \big(\underbrace{\tfrac{1}{d}\textstyle\sum_j \underbrace{x_j^2}_{①}}_{②} + \epsilon\big)^{-1/2}}_{③}$，$\underbrace{\hat{x} = x \cdot r}_{④}$，$\underbrace{y = w \odot \hat{x}}_{⑤}$
