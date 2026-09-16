@@ -32,6 +32,44 @@ def record_snapshot(path: str | None, max_entries: int = 1_000_000):
         print(f"显存快照已写出：{path}（拖进 https://pytorch.org/memory_viz 查看）")
 
 
+def plot_snapshot(pickle_path, out=None, *, title=None, subtitle=None):
+    """把 _dump_snapshot 的 pickle 画成 active memory 曲线（和 memory_viz 同一份 alloc/free 事件）。
+
+    横轴是分配事件序号不是时间。记录从预热后开始，所以曲线起点 = 那时已分配的权重。
+    """
+    import pickle
+    import matplotlib.pyplot as plt
+
+    pickle_path = Path(pickle_path)
+    d = pickle.load(open(pickle_path, "rb"))
+    tr = d["device_traces"][0]
+    live = {}                    # addr -> size；记录开始前就活着的块不在 trace 里，靠 segments 末态反推
+    base = sum(b["size"] for seg in d["segments"] for b in seg["blocks"] if b["state"] == "active_allocated")
+    cur, ys = 0, []
+    for e in tr:
+        if e["action"] == "alloc":
+            live[e["addr"]] = e["size"]; cur += e["size"]
+        elif e["action"] == "free_completed" and e["addr"] in live:
+            cur -= live.pop(e["addr"])
+        ys.append(cur)
+    start = base - cur           # 末态 active − trace 净增 = 记录开始时已分配
+    ys = [(start + y) / 2**30 for y in ys]
+    peak = max(ys)
+
+    fig, ax = plt.subplots(figsize=(10, 3.6))
+    ax.fill_between(range(len(ys)), ys, alpha=.35); ax.plot(ys, lw=.8)
+    ax.axhline(peak, ls="--", c="gray", lw=.8); ax.text(len(ys) * .01, peak, f"peak {peak:.2f} GiB", va="bottom", fontsize=8, c="gray")
+    ax.axhline(start / 2**30, ls=":", c="gray", lw=.8); ax.text(len(ys) * .01, start / 2**30, f"allocated before recording: {start/2**30:.2f} GiB (weights)", va="top", fontsize=8, c="gray")
+    ax.set_xlabel("allocator event #"); ax.set_ylabel("active memory (GiB)"); ax.set_ylim(0, peak * 1.08)
+    ax.set_title(title or pickle_path.stem)
+    if subtitle:
+        ax.text(.5, .97, subtitle, transform=ax.transAxes, ha="center", va="top", fontsize=8, c="dimgray")
+    fig.tight_layout()
+    if out:
+        fig.savefig(out, dpi=140)
+    return fig
+
+
 # ---- §2.5 (f)：从 nsys 的 sqlite 里算「一层 TransformerBlock 为反向存了多少」 -------------
 #
 # 采集：PYTORCH_NO_CUDA_MEMORY_CACHING=1 nsys profile --cuda-memory-usage=true --trace=cuda,nvtx -- \
