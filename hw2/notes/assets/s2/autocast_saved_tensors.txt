@@ -1,4 +1,9 @@
-autocast=False: params 0.48 GiB | saved tensors 3.86 GiB ({'torch.int64': 0.0, 'torch.float32': 3.86, 'torch.bool': 0.0}) = 参数本身 0.45 + bf16 权重副本 0.00 + activation 3.41 | fwd 后 allocated 3.90 | peak 4.07
-autocast=True: params 0.48 GiB | saved tensors 2.50 GiB ({'torch.int64': 0.0, 'torch.float32': 0.93, 'torch.bfloat16': 1.57, 'torch.bool': 0.0}) = 参数本身 0.00 + bf16 权重副本 0.23 + activation 2.28 | fwd 后 allocated 3.04 | peak 3.18
-
-峰值变化 -0.89 GiB = 副本 +0.23 + saved tensors 变化 -1.13 → 和 -0.91
+small autocast=False: params 0.48 GiB | saved tensors 3.86 GiB = 参数本身 0.45 + bf16 权重副本 0.00 + activation 3.41 | fwd 后 allocated 3.90 | peak 4.07
+small autocast=True: params 0.48 GiB | saved tensors 2.50 GiB = 参数本身 0.00 + bf16 权重副本 0.23 + activation 2.28 | fwd 后 allocated 3.04 | peak 3.18
+small 峰值变化 -0.89 GiB = 副本 +0.23 + saved tensors 变化 -1.13 → 和 -0.91
+medium autocast=False: params 1.58 GiB | saved tensors 10.35 GiB = 参数本身 1.54 + bf16 权重副本 0.00 + activation 8.82 | fwd 后 allocated 10.40 | peak 10.57
+medium autocast=True: params 1.58 GiB | saved tensors 6.63 GiB = 参数本身 0.00 + bf16 权重副本 0.77 + activation 5.87 | fwd 后 allocated 8.23 | peak 8.36
+medium 峰值变化 -2.21 GiB = 副本 +0.77 + saved tensors 变化 -2.95 → 和 -2.18
+large autocast=False: params 3.61 GiB | saved tensors 19.94 GiB = 参数本身 3.56 + bf16 权重副本 0.00 + activation 16.38 | fwd 后 allocated 20.10 | peak 20.28
+large autocast=True: params 3.61 GiB | saved tensors 12.67 GiB = 参数本身 0.00 + bf16 权重副本 1.78 + activation 10.88 | fwd 后 allocated 16.41 | peak 16.57
+large 峰值变化 -3.71 GiB = 副本 +1.78 + saved tensors 变化 -5.50 → 和 -3.71
