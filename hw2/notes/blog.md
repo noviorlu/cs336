@@ -266,7 +266,13 @@ bf16 autocast 前向快 1.9–2.3×、反向快 1.7–1.9×，**模型越大加�
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) |
 | xl     | OOM → OOM | — | — | — | — |
 
-峰值显存是两项相抵：为反向存的 activation 位宽减半（small 省 ~1.5 GiB），但 autocast 会多存一份 bf16 权重副本（+参数量 × 2 B，small +0.26 GiB）。这里 activation 占大头所以净省；模型越大副本越贵、省得越少（−21% → −18%）；到 xl@128 这种权重远大于 activation 的配置就反过来变多了——见 §2.4(c)。
+峰值显存是两项相抵：权重侧**变多**——fp32 原件不动，autocast 再存一份 bf16 副本（+参数量 × 2 B）；activation 侧**减半**——autograd 为反向存的是 bf16 版本。训练时 activation 远大于权重，所以净减；模型越大、token 越少，副本越占上风：
+
+| 配置 | 权重侧 | activation 侧 | 峰值 |
+|:--|--:|--:|:--|
+| small fwd_bwd @ 512（本表） | +0.26 GiB | −1.5 GiB | **−21%** |
+| xl fwd_bwd @ 128（§2.4(c)） | +6.3 GiB | −6.3 GiB | 持平 |
+| xl `no_grad` 前向 @ 128（§2.4(c)，推理式） | +6.3 GiB | 没有 activation 可省 | **+49%** |
 
 ### 2.4 显存剖析（Memory Profiling）
 
