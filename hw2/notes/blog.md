@@ -276,13 +276,11 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | xl     | 12.70 | 13.47 | OOM @ forward（29.06） | OOM | OOM |
 | 10B    | 47.8  | OOM @ init | — | — | — |
 
-**峰值在哪一刻**。反向从最后一层往前走，走完 j 层时活着的显存：
+**峰值在哪一刻**。反向走完 j 层时活着的显存：
 
 <p align="center">$M(j) = W + G \cdot j/L + A \cdot (L-j)/L + T$</p>
 
-> **纸面账和实测差的那一个 W 就在这里。** 16 B/param 的纸面账把梯度当常驻缓冲区（4W）；实际 PyTorch 2.0 起 `zero_grad(set_to_none=True)` 是默认，`.grad` 在 optimizer step 后释放、下一步反向时逐层重建——它不是底座，是反向期间从 0 长到 W 的楔形。所以峰值不是 W + G + A，而是 W + max(A, G)：activation 和梯度**不会同时**全在。表 1-4 实测 3W + A 而非 4W + A、表 2.2-1 里 fwd_bwd 只比带图前向多零头，都是它。
-
-🟦 W 常驻，🟩 A 前向逐层堆上、反向逐层放掉，🟥 G 反向逐层堆上，🟨 T 是常数偏移。M(j) 对 j 是直线、斜率 (G − A)/L，峰值必在两端之一：**🟩A > 🟥G** 时反向下坡，峰值在前向末尾 = W + A；**🟥G > 🟩A** 时反向上坡，峰值在反向末尾 = W + G = 2W。G 恒等于权重大小，A ∝ token 数 × 层数，所以正常训练（batch × seq 喂够）都是 A > G；只有 token 少、模型大时翻过去——xl 只喂 512 个 token，A = 5.3 < G = 12.7。
+🟦 W 常驻；🟩 A 前向逐层堆上、反向逐层放掉；🟥 G 反向逐层堆上——`.grad` 在 step 后释放（PyTorch 2.0 默认 `set_to_none=True`），不是常驻底座；🟨 T 常数。M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A；**G > A** 在反向末尾 = 2W。A 和 G 不会同时全在，所以纸面 16 B/param 多算了一个 W（表 1-4 实测 3W + A）。A ∝ token 数，正常训练 A > G；xl 只喂 512 个 token 才翻过去（A 5.3 < G 12.7）。
 
 ![图 2.2-1](assets/s2/peak_moment.png)
 
