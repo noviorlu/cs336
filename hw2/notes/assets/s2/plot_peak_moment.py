@@ -11,7 +11,7 @@ cases = [  # name, L, W, G, A_fp32, A_bf16(含副本), T, 实测峰值 fp32/bf16
     ("xl @ seq 128, batch 4  (G > A)",    32, 12.7, 12.7, 5.3,  3.5 + 6.35, 0.2,  25.56, 25.55),
     ("small @ seq 512, batch 4  (A > G)", 12, 0.48, 0.48, 3.41, 2.28 + 0.23, 0.17, 4.08, 3.18),
 ]
-fig, axes = plt.subplots(1, 2, figsize=(14, 4.4))
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
 for ax, (name, L, W, G, A, A16, T, p32, p16) in zip(axes, cases):
     xs = list(range(2 * L + 1))
     # 四项随 x 的值：前向 i=0..L，反向 j=1..L
@@ -21,10 +21,10 @@ for ax, (name, L, W, G, A, A16, T, p32, p16) in zip(axes, cases):
     t = [0] * L + [T] * (L + 1)
     tot = [w[i] + a[i] + g[i] + t[i] for i in xs]
     ax.stackplot(xs, w, a, g, t, colors=[C["W"], C["A"], C["G"], C["T"]],
-                 labels=["W weights", "A saved tensors", "G gradients (.grad)", f"T backward temporaries   [fp32 peak {max(tot):.2f}, measured {p32}]"], alpha=.85)
+                 labels=["W weights", "A saved tensors", "G gradients (.grad)", f"T backward temporaries  (fp32 peak {max(tot):.2f}, meas. {p32})"], alpha=.85)
     # bf16 autocast：A 换成 A16（含副本），其余不变
     m16 = [W + A16 * i / L for i in range(L)] + [W + A16 + T] + [W + G * j / L + A16 * (L - j) / L + T for j in range(1, L + 1)]
-    ax.plot(xs, m16, c="k", ls="--", lw=1.2, label=f"bf16 autocast, A = {A16:.2f}   [peak {max(m16):.2f}, measured {p16}]")
+    ax.plot(xs, m16, c="k", ls="--", lw=1.2, label=f"bf16 autocast, A = {A16:.2f}  (peak {max(m16):.2f}, meas. {p16})")
     # 实测点：每层前向结束 / 反向结束时的 memory_allocated()（measure_peak_moment.py，hook 采样）
     size = name.split()[0]
     for ac, c, lab in [(False, "k", "measured fp32"), (True, "gray", "measured bf16")]:
@@ -35,7 +35,9 @@ for ax, (name, L, W, G, A, A16, T, p32, p16) in zip(axes, cases):
     ax.axvline(L, c="gray", lw=.8, ls=":")
     ax.set_title(f"{name}\nW = G = {W} GiB, A = {A} GiB, L = {L}", fontsize=10)
     ax.set_xticks([0, L, 2 * L]); ax.set_xticklabels(["start", "forward ends\nbackward starts (j=0)", "backward ends (j=L)"], fontsize=8)
-    ax.set_ylabel("active memory  GiB"); ax.legend(fontsize=7.5, loc="lower center", framealpha=.9) if G > A else ax.legend(fontsize=7.5, loc="upper left", bbox_to_anchor=(1.02, 1), frameon=False)
+    ax.set_ylabel("active memory  GiB")
+    ax.set_ylim(0, max(max(tot), max(m16)) * 1.6)      # 顶部留空放图例
+    ax.legend(fontsize=7, loc="upper left", framealpha=.9)
 fig.suptitle("one fwd_bwd step, stacked by term: forward W + A·i/L, backward M(j) = W + G·j/L + A·(L−j)/L + T", fontsize=9.5)
 fig.tight_layout()
 fig.savefig("notes/assets/s2/peak_moment.png", dpi=140)
