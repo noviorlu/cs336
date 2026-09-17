@@ -32,6 +32,8 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 全文统一用英文术语：
 
+**表 1-1** 全文术语
+
 | 术语 | 含义 |
 |:--|:--|
 | **activation** | 前向算出的任何中间张量，不管存不存 |
@@ -53,6 +55,8 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 作业给定的五个模型规格（下文 small / medium / large / xl / 10B），`vocab=10000, seq=512, batch=4`，`d_head = d_model / num_heads = 64`（10B 是 128）：
 
+**表 1-2** 作业给定的五个模型规格
+
 | Size | d_model | d_ff | num_layers | num_heads | N |
 |:-----|--:|--:|--:|--:|--:|
 | small  |  768 |  3072 | 12 | 12 |  0.13B |
@@ -70,6 +74,8 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 两种口径：**/ token** 是处理一个 token 的 FLOPs，只和模型大小有关（前向 ≈ 2N，训练 ≈ 6N）；**/ step** 是一个训练步的 FLOPs = / token × 一步的 token 数，这里 batch 4 × seq 512 = 2048。前者用来对 6N 公式、算 20N token 的总量，后者除以实测 step 时间得到吞吐（§1.5）。
 
+**表 1-3** 纸面 FLOPs：每 token 与每 step（batch 4 × seq 512）
+
 | Size | N | 前向 / token (FLOPs) | 训练 / token (FLOPs) | 前向 / step (FLOPs) | 训练 / step (FLOPs) |
 |:-----|--:|--:|--:|--:|--:|
 | small  |  0.13B | 2.6e8 | 7.8e8 | 5.3e11 | 1.6e12 |
@@ -84,6 +90,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 训练静态 = 16 B/参数（fp32 权重 4 + 梯度 4 + Adam m/v 8），autocast 再 +2；activation（为反向存的 saved tensors，§2.2 记作 A）由 §2.2 实测反推：带图前向峰值 − 权重。单位 GiB：
 
+**表 1-4** 纸面显存 vs 实测 full 峰值（GiB）
+
 | Size | 权重 W | 训练静态 4W | activation A（实测，batch 4 seq 512） | 纸面峰值 4W + A | 实测 full 峰值 | 31.3 GiB？ |
 |:-----|--:|--:|--:|--:|--:|:--|
 | small  |  0.5 |   1.9 |  3.5 |   5.4 |  5.0 | ✓ |
@@ -97,6 +105,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 ### 1.5 训练 20N token 要多久
 
 用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
+
+**表 1-5** 训 20N token 的时长估算（MFU 31%）
 
 | Size | 20N token | step (fp32) | 总时长 fp32 | step (bf16) | 总时长 bf16 |
 |:-----|--:|--:|--:|--:|--:|
@@ -129,6 +139,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 反向约为前向的 2 倍（2.02 / 2.02 / 1.93），optimizer 占 7%；测量很稳，标准差 ≤1.4%。xl 前向带图即 OOM，10B 建模型即 OOM。
 
+**表 2.1-1** 各规格 full step 各阶段耗时（ms，batch 4 seq 512，warmup 5 / measure 10）
+
 | Size | forward (ms) | backward (ms) | optimizer (ms) | full (ms) |
 |:-----|--------:|---------:|----------:|-----:|
 | small  |  17.2 ± 0.4 |  34.8 |  3.7 |  55.7 ± 0.7 |
@@ -141,6 +153,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 **问题**：去掉 warmup、或只预热 1–2 步，均值和方差变成什么样，为什么。
 
 不预热时首步比稳态慢 1.7–6.9×（绝对开销 ~300 ms，来自 kernel 懒加载、cuBLAS 初始化、显存池首次 cudaMalloc），10 步均值虚高 7–59%、标准差从 ~1 ms 涨到 ~100 ms；warmup=1 之后就稳了，模型越小坑越深。
+
+**表 2.1-2** 预热步数对 full step 均值 ± 标准差的影响（ms）
 
 | full step (ms) | w=0 | w=1 | w=5 |
 |:-----|----:|----:|----:|
@@ -158,6 +172,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 对得上，nsys 系统性偏高 2.3–7.7%，相对开销随负载增大而缩小。
 
+**表 2.1-3** nsys forward range 宽度 vs timeit（ms）
+
 | forward (ms) | small 256 | small 512 | small 1024 | medium 256 | medium 512 | medium 1024 |
 |:--|--:|--:|--:|--:|--:|--:|
 | nsys   | 10.17 | 17.50 | 52.50 | 24.68 | 49.76 | 150.78 |
@@ -172,6 +188,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 **第一步：kernel 归类**。nsys 报表里的 kernel 名是 C++ 模板签名，按关键字归三类（占比取 medium@512 full step 的 GPU 时间）：
 
+**表 2.1-4** nsys kernel 按名字归三类（medium@512 full step 占比）
+
 | 类别 | kernel 名 | 对应模型里的操作 | 占比 |
 |:--|:--|:--|--:|
 | **matmul** | `cutlass_80_simt_sgemm`<br>`magma_sgemmEx` | 所有 `Linear` 的前向与反向（`sgemm` = fp32 GEMM，`simt` = 走 CUDA core）<br>attention 的 QKᵀ / PV：batched GEMM，cuBLAS 选了源自 MAGMA 库的 kernel，同是矩阵乘 | 60% |
@@ -179,6 +197,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | **reduce** | `reduce_kernel<sum_functor>`<br>`reduce_kernel<MaxOps>` | RMSNorm 的 Σx²、softmax 的 Σexp、反向对 batch 维求和<br>softmax 的 max | 2% |
 
 **第二步：整步按类别**。
+
+**表 2.1-5** GPU 时间按类别占比（medium）
 
 | medium | forward 256 | forward 512 | forward 1024 | full step 256 | full step 512 |
 |:--|--:|--:|--:|--:|--:|
@@ -188,6 +208,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | reduce | 2% | 2% | 6% | 1% | 2% |
 
 - **(e) 最耗时的 kernel** 是 `cutlass_80_simt_sgemm_128x256_8x4_tn`：前向占 45–54%，加上反向和 optimizer 后仍是第一但只剩 17%。名字拆读：`128x256` 是每个 thread block 负责的输出分块，`tn` 是两个输入的布局（第一个转置）。cuBLAS 按矩阵形状和布局选 tile，同是 Linear 的矩阵乘会散在几个名字下；用每步实例数（24 层 × 7 个 Linear + lm_head = 169）能对出各是哪一步：
+
+  **表 2.1-5a** GEMM kernel 名 ↔ 前向 / 反向哪一步（medium@512 full step）
 
   | kernel | 每步次数 | 对应 |
   |:--|--:|:--|
@@ -200,6 +222,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 - **(g) 算上 optimizer**，matmul 占比比前向低 15–17 个百分点，让出的份额被 elementwise 吃掉：反向的梯度累加和 AdamW 的更新全是逐元素。small 同样趋势（forward 1024：matmul 51%）。
 
 **第三步：attention 内部**。把 attention 拆三段——scores（QKᵀ、/√d、mask）、softmax、PV——按 kernel 名把每段的 GPU 时间加起来（24 层合计），占整个 forward 的比例。不能直接用 NVTX 段过滤：range 是 CPU 侧打的，seq 长时 GPU 还在跑上一段的 kernel，CPU 已进入下一段，nsys 会把投影 GEMM、RoPE 算进 scores 段（seq 1024 时多算了 10 ms）。
+
+**表 2.1-6** attention 三段的 GPU 时间与占 forward 的比例（medium，按 kernel 名归因）
 
 | medium forward | seq 256 | seq 512 | seq 1024 |
 |:--|--:|--:|--:|
@@ -215,6 +239,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 - 带宽下限 = bytes / 1.79e12（显存带宽）
 
 实际耗时 ≥ 两者取大：算力下限大是 **compute-bound**，带宽下限大是 **memory-bound**（等价于算术强度 I = FLOPs / bytes 是否低于 ridge point ≈ 60）。下表 medium@1024 一层内各 op，前 4 列纸面算、「实测」是 nsys 里对应 kernel 的 GPU 时间（按 kernel 名归因，24 层平均）、粗体是瓶颈（S 是 `[4,16,1024,1024]`，4·16·1024² = 6.7e7 个元素 × 4 B = 256 MiB）：
+
+**表 2.1-7** 逐 op roofline：FLOPs、bytes、两个下限、实测与利用率（medium@1024 一层）
 
 | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 | 利用率 = 粗体 / 实测 |
 |:--|--:|--:|--:|--:|--:|--:|--:|
@@ -240,6 +266,8 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 先像 §2.1(b) 那样把各规格四种模式的峰值列出来（`batch=4, seq=512`，`max_memory_allocated`，预热后清零，`stages_b4_seq512.md`），单位 GiB：
 
+**表 2.2-1** 各规格 × 四种模式的峰值显存（GiB，batch 4 seq 512）
+
 | Size | 权重 W (GiB) | forward（no_grad） | forward（带图） | fwd_bwd | full |
 |:-----|--:|--:|--:|--:|--:|
 | small  |  0.48 |  0.72 |  3.98 |  4.08 |  5.04 |
@@ -254,7 +282,9 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 T 是常数偏移，M(j) 对 j 是直线、斜率 (G − A)/L，峰值必在两端之一：**A > G** 时反向下坡，峰值在前向末尾 = W + A；**G > A** 时反向上坡，峰值在反向末尾 = W + G = 2W。G 恒等于权重大小，A ∝ token 数 × 层数，所以正常训练（batch × seq 喂够）都是 A > G；只有 token 少、模型大时翻过去——xl 只喂 512 个 token，A = 5.3 < G = 12.7。
 
-![一步 fwd_bwd 的显存曲线：前向逐层 +A/L，反向逐层 +G/L − A/L；xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上（bf16 曲线见 §2.3）](assets/s2/peak_moment.png)
+![图 2.2-1](assets/s2/peak_moment.png)
+
+**图 2.2-1** 一步 fwd_bwd 的显存曲线 M(j)：xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上
 
 三条读法：(1) 带图前向 − W 就是 A，四个规格里 A 都是 W 的 2.5–7 倍，所以带图前向一开就是峰值，fwd_bwd 只多一点临时量；(2) full 比 fwd_bwd 多的恰好是 2W——AdamW 的 m、v 常驻（`.grad` 每步 `set_to_none` 后重建，不与 A 同时在峰值），xl 的 2W = 25.4 光这一项就把 5090 填满，和 §1.4 一致；(3) xl 连带图前向都 OOM，所以下面 xl 的实验只能降到 seq 128。
 
@@ -266,6 +296,8 @@ T 是常数偏移，M(j) 对 j 是直线、斜率 (G − A)/L，峰值必在两�
 
 峰值显存（GiB；bf16 列供 (c) 用）：
 
+**表 2.2-2** xl 各模式峰值显存，fp32 vs bf16 autocast（GiB，batch 4）
+
 | seq | 模式 | fp32 (GiB) | bf16 autocast (GiB) |
 |----:|:--|:--|:--|
 | 128  | forward（no_grad） | 12.90 | 19.18 |
@@ -276,8 +308,12 @@ T 是常数偏移，M(j) 对 j 是直线、斜率 (G − A)/L，峰值必在两�
 
 OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同机其它进程影响，两次跑差 1 GiB 以内。
 
-![xl 纯前向：seq 128（上，平）vs seq 2048（下，32 根尖峰）](assets/s2/mem_xl_forward_128_vs_2048.png)
-![xl seq=128 full step](assets/s2/mem_xl_seq128_full.png)
+![图 2.2-2](assets/s2/mem_xl_forward_128_vs_2048.png)
+
+**图 2.2-2** xl 纯前向的显存时间线：seq 128（上，平）vs seq 2048（下，32 根尖峰）
+![图 2.2-3](assets/s2/mem_xl_seq128_full.png)
+
+**图 2.2-3** xl@128 一步 full step 的显存时间线，红线为 forward / backward / optimizer 分界
 
 - (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向继续爬到 25.5（每层释放 166 MiB saved tensors、新分配 410 MiB 梯度，净增 244 MiB/层，比前向的 166 更陡；图上看着缓是因为横轴是事件数、反向每层的分配事件是前向的 4 倍，见 (e)）；optimizer 一开始就垂直冲到 ~28.6 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）不留东西，seq 128 时几乎是平的（12.8 GiB 基线上多 0.08 GiB）；seq 2048 的图却有 32 根尖峰——每层 attention 算到一半时，`[4, 32, 2048, 2048]` 的 2 GiB 分数矩阵有 ~4 份同时活着（`QKᵀ`、`/√d`、`masked_fill`、softmax 的中间量，链式写法里前一份要等下一份算完才释放），12.8 + 4 × 2 ≈ 21.4 GiB 就是峰；`softmax·V` 一算完全部释放，掉回基线。横轴是分配事件序号不是时间，尖峰看着窄，实际 attention 占前向近一半时间（§2.2）。
 - (b) xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：卡的不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。seq 2048 连 fwd_bwd 都过不了前向：基线 12.8 + 逐层累积的 saved tensors + 每层 8 GiB 的 attention 尖峰，25.96 GiB 时撞墙——第二篇 FlashAttention 消掉的正是这根尖峰。
@@ -290,6 +326,8 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 
 - (c) 残差流张量 `[batch, seq, d_model]` = `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是 Transformer 里"一层传给下一层"的那个张量，下面拿它当尺子。
 - (d) 最大的分配是它的 25 倍。照 §2.1 的办法，把一层 block 前向按子模块、逐 op 列出每个 op 分配的输出张量（xl，batch 4，32 头，d_head 80；大小按 shape × 4 B，与时间线上的 malloc 一致）：
+
+  **表 2.2-3** xl 一层 block 前向逐 op 分配的张量（seq 2048 vs 128）
 
   | 子模块 | op | 分配的张量 | seq 2048 | seq 128 |
   |:--|:--|:--|--:|--:|
@@ -307,6 +345,8 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
   时间线上最大的分配就是 attention 核心那 6 份 **2 GiB**（调用栈 `model.py:253-257`、`nn_utils.py:15-24`），全是同一个 `[b, h, s, s]` 形状的链式中间量，也就是 (a) 里的尖峰；次大是 FFN 的 4 份 320 MiB。只有 attention 核心那一组随 seq² 涨（2048 → 128 缩 256 倍），其余都随 seq 线性涨（缩 16 倍）：seq 128 时 attention 只有 8 MiB、最大的反而是 FFN 的 20 MiB，seq 一长 attention 就成了显存主角——这是第二篇 FlashAttention 的动机。
 - (e) 临时分配不等于留到反向。xl@128（fwd_bwd）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还活着——这就是为反向保存的 saved tensors，占 58%。按 malloc 发生时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
 
+  **表 2.2-4** xl@128 block5 留到反向的 166 MiB 按分配算子归因
+
   | 来源算子 | saved tensors | 占比 | 是什么 |
   |:--|--:|--:|:--|
   | `aten::mul`     | 60 MiB | 36% | SwiGLU 的门积和 SiLU 的 `x·σ(x)`（`[4,128,10240]` 各 20 MiB） |
@@ -317,7 +357,9 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 
   seq 128 时大头是 FFN 的 `d_ff` 宽中间量而不是 attention（分数矩阵只有 8 MiB），和 (d) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB，净增 249 MiB；释放的里有 161 MiB 是上面的 saved tensors，所以反向新产生的张量 = 249 + 161 = **410 MiB**。预期：这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB = 405 MiB，误差 1%。这就是 (a) 里反向「不下坡」的原因：每层释放 166、新增 410，净值继续爬。
 
-![block5 saved tensors](assets/s2/nsys_block5_memory.png)
+![图 2.2-4](assets/s2/nsys_block5_memory.png)
+
+**图 2.2-4** xl@128 block5 前向的 cudaMalloc/cudaFree 与活到 range 结束的分配（红点）
 
 > 采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`，`--nvtx-ops` 给每层打 `block{i}` range、`emit_nvtx` 给每个 aten 算子打带 `seq` 编号的 range；归因脚本 `python -m benchmark.memory`。不关 caching allocator 的话 nsys 只看到显存池的增长，看不到单个张量；关了之后 `cudaFree` 过的地址会被复用，分配和释放要按「之后的第一次 free」配对，直接按地址集合会多算 60 MiB。图从 nsys 的 sqlite 导出直接画：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配。
 
@@ -329,6 +371,8 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 
 **问题**：(a) `s = 0; 重复 1000 次 s += 0.01`，累加器和加数分别用 fp32 / fp16 / bf16，结果各是多少，为什么；(b) 一个 `Linear → ReLU → LayerNorm → Linear` 的玩具模型，参数 fp32，包在 `torch.autocast(fp16)` 里训练，参数、各层输出、logits、loss、梯度分别是什么 dtype；(c) autocast 为什么把 LayerNorm 留在 fp32，换成 bf16 后还有必要吗。
 
+**表 2.3-1** 1000 次 s += 0.01 在各 dtype 组合下的结果
+
 | (a) 累加 | 结果 |
 |:--|--:|
 | `s(fp32) += x(fp32)` | 10.0001 |
@@ -336,6 +380,8 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 | `s(fp32) += x(fp16)`（自动/手动升精度） | 10.0021 |
 | `s(bf16) += x(bf16)` | **4.0000** |
 | `s(fp32) += x(bf16)` | 10.0098 |
+
+**表 2.3-2** autocast(fp16) 下玩具模型各张量的 dtype
 
 | (b) autocast(fp16) 下 | 参数 | fc1 输出 | ln 输出 | logits | loss | 梯度 |
 |:--|:--|:--|:--|:--|:--|:--|
@@ -353,6 +399,8 @@ bf16 改的是 A（矩阵乘相关的 saved tensors 变 16 位，减）和一份
 
 **(d) small / medium / large @512**（A = 3.4 / 8.8 / 16.4 GiB ≫ G = 0.5 / 1.6 / 3.6，峰值在前向末尾）：
 
+**表 2.3-3** bf16 autocast 的加速与峰值显存变化（batch 4 seq 512）
+
 | Size | forward fp32 → bf16 (ms) | 加速 | backward fp32 → bf16 (ms) | 加速 | 峰值显存 fp32 → bf16 (GiB) | 其中权重侧 (GiB) | 其中 activation 侧 (GiB) |
 |:-----|:--|--:|:--|--:|:--|--:|--:|
 | small  |  17.2 →  9.2 | 1.87× |  33.9 →  20.1 | 1.69× | 4.08 → 3.18 (−21%) | +0.23 | −1.13 |
@@ -364,6 +412,8 @@ bf16 改的是 A（矩阵乘相关的 saved tensors 变 16 位，减）和一份
 - 显存：后两列是用 `saved_tensors_hooks` 把 saved tensors 按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），权重侧和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 不再被存，但它本来就在显存里，副本是净增。activation 侧**减少**但不是减半（small 3.41 → 2.28 = 67%）：RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。activation 远大于副本所以净省；模型越大副本越占上风，省的比例从 −21% 缩到 −18%。
 
 **(e) xl @128 / 2048**（§2.2(a)(b) 峰值表的 bf16 列）：
+
+**表 2.3-4** xl 上 bf16 的峰值变化与峰值时刻
 
 | seq | 模式 | fp32 (GiB) | bf16 (GiB) | 峰值时刻 | 为什么 |
 |----:|:--|--:|--:|:--|:--|
@@ -405,6 +455,8 @@ Loading    5 → 6 → 2 → 4 → 3 → 1
 ```
 
 规则只有一条：每个算子的局部偏导里出现了哪个变量，前向就得把它存下来；偏导是常数的什么都不存。「存」是让反向节点持有引用，不是拷贝，所以本来就活着的输入 `x` 和参数 `w` 不占额外显存。
+
+**表 3.1-1** RMSNorm 五个 op 各自为反向存的张量（eager）
 
 | op | 前向 | 反向要算的偏导 | 偏导里出现的变量 → 存它 | shape | `grad_fn` | 额外显存 | print 里第几条 |
 |:--|:--|:--|:--|:--|:--|--:|:--|
@@ -483,6 +535,8 @@ Loading    1 → 2 → 3（与 Saving 同序）
 
 整个 RMSNorm 成了一个算子，反向公式由 AOTAutograd 写死：
 
+**表 3.1-2** torch.compile 融合后 RMSNorm 为反向存的张量
+
 | op | 前向 | 反向要算的偏导 | 偏导里出现的变量 → 存它 | shape | `grad_fn` | 额外显存 | print 里第几条 |
 |:--|:--|:--|:--|:--|:--|--:|:--|
 | fused | $y = w\odot\big(x\cdot r\big)$，$r=(\tfrac1d\sum x^2+\epsilon)^{-1/2}$ | $\partial y/\partial w = \hat{x}$ | $\hat{x}$ → **不存**，反向用 $x\cdot r$ 重算 | — | — | 0 | — |
@@ -536,6 +590,8 @@ x̂ = x·r 现场重算
 
 xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，为反向存的仍有 **3655 MiB**（作业文档给的参考值 3651，多 4 MiB 是我们的实现显式传入的 mask）。剩下的全是矩阵乘的输入，融合动不了：
 
+**表 3.2-1** xl 一层 block（compile 后）为反向存的 3655 MiB 构成
+
 | 大小 (MiB) | 张量 | 占比 |
 |--:|:--|--:|
 | 1024 ×2 | attention 的 S=QKᵀ、P=softmax(S)，`[b,h,s,s]` | 56% |
@@ -549,7 +605,9 @@ xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，�
 
 checkpointing 是用计算换显存。x 轴：反向峰值时活着的 saved tensors；y 轴：一步要算几遍前向（xl@2048 batch 4，L = 32）：
 
-![checkpoint tradeoff](assets/s3/checkpoint_tradeoff.png)
+![图 3.2-1](assets/s3/checkpoint_tradeoff.png)
+
+**图 3.2-1** checkpoint 策略的显存–计算权衡（xl@2048 batch 4，L = 32）
 
 - **y = 2× 那一排**：平切成 k 段。每层恰好被重算一次，所以总前向恒为 2×；k 只决定同时物化几层，从 k = 1（114 GiB）到 k = L（6.1 GiB）单调下降——entry 太便宜，没有 U 形。(b) 问的就是这一排。
 - **往左上**：嵌套 checkpoint。一层的 saved tensors（3.6 GiB，红虚线）是底线，减的只是 entry，计算从 2× 涨到 6×。(a) 的答案在左上角。
@@ -558,6 +616,8 @@ checkpointing 是用计算换显存。x 轴：反向峰值时活着的 saved ten
 #### 重算（Recomputation）
 
 `checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入（entry），反向到这段时重跑一遍前向造出 saved tensors，用完释放。4 层 xl block 实测：
+
+**表 3.2-2** 4 层 block 有无 checkpoint 的峰值构成（MiB）
 
 | | ① 前向留下、活到反向（实测） | ② 反向重算一段临时物化（估） | 峰值 ① + ② |
 |:--|--:|--:|--:|
@@ -727,6 +787,8 @@ flowchart LR
 
 完整顺序（F = 重算前向，B = 反向）。autograd 走到 checkpoint 节点先重跑它的前向再往里走，碰到普通层才 backward。后两列是此刻活着的 saved tensors：entry（80 MiB 一个）和某一层内部的（3655 MiB）：
 
+**表 3.2-3** 8 层递归 checkpoint 的 F/B 执行轨迹
+
 | 步 | F / B | 做什么（括号 = 前向了几层） | entry x_i：用 → 得 ⇒ 显存里留着的 | one layer's saved tensors（MiB） |
 |--:|:--|:--|:--|--:|
 | 0 | F | 原始前向 L1–L8（8） | x0 → y ⇒ {x0} | 0 |
@@ -758,7 +820,11 @@ def ckpt(layers, x):
 
 (b) 指定的 xl@2048 batch 4 在 5090 上量不了：参数+梯度 25.4 GiB，任何段长都 OOM。用 large（36 层，参数+梯度 7.2 GiB）测：batch 4 / seq 2048 只有每段 ≤ 4 层能跑（15.4 / 18.9 / 22.5 / 26.1 GiB，每多 1 层 +3.6 GiB），要让全部段长含「不 checkpoint」都出数，降到 batch 1 / seq 1024，fwd_bwd：
 
-![checkpoint sweep](assets/s3/checkpoint_large_sweep.png)
+![图 3.2-2](assets/s3/checkpoint_large_sweep.png)
+
+**图 3.2-2** checkpoint 段长扫描（large，batch 1 seq 1024）
+
+**表 3.2-4** checkpoint 段长扫描：峰值显存与 step 时间（large，batch 1 seq 1024，fwd_bwd）
 
 | 每段几层 | 1 | 2 | 3 | 4 | 6 | 9 | 12 | 18 | 36（整网一段） | 不 checkpoint |
 |:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
