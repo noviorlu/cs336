@@ -270,8 +270,6 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 **问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
 
-先把各规格四种模式的峰值列出来，作为整节的底账：
-
 **表 2.2-1** 各规格 × 四种模式的峰值显存（GiB，batch 4 seq 512，`max_memory_allocated`，预热后清零；`stages_b4_seq512.md`）
 
 | Size | 权重 W (GiB) | forward（no_grad） | forward（带图） | fwd_bwd | full |
