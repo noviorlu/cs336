@@ -380,9 +380,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 |:--|:--|:--|:--|:--|:--|:--|
 | dtype | fp32 | fp16 | fp32 | fp16 | fp32 | fp32 |
 
-**(b) 一个 `Linear → ReLU → LayerNorm → Linear` 的玩具模型，参数 fp32，包在 `torch.autocast(fp16)` 里训练，参数、各层输出、logits、loss、梯度分别是什么 dtype？** autocast 不改存储的权重，只在算子调用时把输入转成 16 位：矩阵乘的输出（fc1、logits）是 fp16，LayerNorm、loss、梯度留在 fp32。bf16 下模式相同。
-
-**(c) autocast 为什么把 LayerNorm 留在 fp32，换成 bf16 后还有必要吗？** LayerNorm 敏感的是特征维上的**归约**（均值 / 方差累加，正是 (a) 的场景）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但归约精度比 fp16 更差（表 2.3-1 里卡在 4.0 就是它），所以仍要留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，留 fp32 基本免费。
+**(b)(c) 参数 fp32 的玩具模型 `Linear → ReLU → LayerNorm → Linear` 包在 `torch.autocast(fp16)` 里训练，各张量是什么 dtype？为什么 LayerNorm 留在 fp32，换成 bf16 后还有必要吗？** autocast 不改存储的权重，只在算子调用时把输入转成 16 位：矩阵乘的输出（fc1、logits）是 fp16，LayerNorm、loss、梯度留在 fp32；bf16 下模式相同。LayerNorm 留 fp32 是因为它敏感的是特征维上的**归约**（均值 / 方差累加，正是 (a) 的场景）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但归约精度比 fp16 更差（表 2.3-1 里卡在 4.0 就是它），所以仍要留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，留 fp32 基本免费。
 
 #### (d)(e) 代价换来了什么：速度与显存
 
