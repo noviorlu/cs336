@@ -103,7 +103,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | medium | 5.4e12 | 167.4 | 3.2e13 | 31% |
 | large  | 1.2e13 | 372.8 | 3.2e13 | 31% |
 
-三档一致（fp32 走 CUDA core，时间含反向、optimizer 和逐元素 kernel），下面统一按 3.3e13 FLOPS 估；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
+三档一致，下面统一按 3.3e13 FLOPS 估；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。31% 对 eager fp32 是正常水平，能拆成三项：一步里只有矩阵乘在算、其余是逐元素 / 归约 kernel（表 2.1-5，matmul 占 full step 的 62%）× 矩阵乘本身只到 fp32 SIMT GEMM 的 64%（表 2.1-7）× GPU 在 kernel 之间的空转（表 2.1-3，3–8%）≈ 37%，再扣掉纯带宽的 optimizer 段。提高的路就是 §2 的结论反过来用：bf16 进 Tensor core、`torch.compile` 融合逐元素、FlashAttention。
 
 **表 1-5b** 训 20N token 的时长估算（按 3.3e13 FLOPS）
 
