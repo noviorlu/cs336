@@ -46,8 +46,8 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | **matmul / GEMM** | 矩阵乘；GEMM 是 cuBLAS/cutlass 里矩阵乘 kernel 的名字 |
 | **CUDA core / Tensor core** | 一个 SM 里的两种算术单元。CUDA core（SIMT）是标量 FMA，什么都能算，5090 fp32 峰值 1.05e14 FLOPS；Tensor core 只做小矩阵块乘加，只收 fp16 / bf16 / tf32 / fp8 输入，吞吐高一个量级（5090 bf16 2.1e14，H100 上比 CUDA core 高 15×）。纯 fp32 矩阵乘走不了 Tensor core；**tf32** 是把 fp32 尾数截到 10 位后送进 Tensor core 的后门，`allow_tf32=False` 就是关掉它。nsys 里 kernel 名带 `simt` 的走 CUDA core |
 | **FLOPs / FLOPS** | FLOPs = 浮点运算次数（计数，如 8.6e9）；FLOPS = 每秒浮点运算次数（速率，如 1.05e14）。全文用 10 的幂写，不用 G/T 前缀 |
-| **W / G / A / T** | 显存四项（§2.2）：W = 全部权重的大小；G = 全部参数梯度 `.grad` 的大小，= W；A = 前向结束时为反向存的全部 saved tensors；T = 正在算的这一层反向的临时量，算完即释放 |
-| **L / j / M(j)** | L = 层数；j = 反向已走完的层数（0 → L）；M(j) = 此刻活着的显存 = W + G·j/L + A·(L−j)/L + T |
+| **🟦 W / 🟥 G / 🟩 A / 🟨 T** | 显存四项（§2.2，颜色与图 2.2-1 一致）：🟦 W = 全部权重的大小；🟥 G = 全部参数梯度 `.grad` 的大小，= W；🟩 A = 前向结束时为反向存的全部 saved tensors；🟨 T = 正在算的这一层反向的临时量，算完即释放 |
+| **L / j / M(j)** | L = 层数；j = 反向已走完的层数（0 → L）；M(j) = 此刻活着的显存 = 🟦W + 🟥G·j/L + 🟩A·(L−j)/L + 🟨T |
 | **k** | checkpoint 段数，每段 L/k 层（§3.2） |
 | **算术强度 I**（arithmetic intensity） | FLOPs / 读写显存的 bytes。低于硬件的 FLOPS / 带宽（5090 fp32 ≈ 60）的 op 受限于带宽，时间 = bytes / 带宽 |
 
@@ -280,11 +280,11 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 <p align="center">$M(j) = W + G \cdot j/L + A \cdot (L-j)/L + T$</p>
 
-T 是常数偏移，M(j) 对 j 是直线、斜率 (G − A)/L，峰值必在两端之一：**A > G** 时反向下坡，峰值在前向末尾 = W + A；**G > A** 时反向上坡，峰值在反向末尾 = W + G = 2W。G 恒等于权重大小，A ∝ token 数 × 层数，所以正常训练（batch × seq 喂够）都是 A > G；只有 token 少、模型大时翻过去——xl 只喂 512 个 token，A = 5.3 < G = 12.7。
+🟦 W 常驻，🟩 A 前向逐层堆上、反向逐层放掉，🟥 G 反向逐层堆上，🟨 T 是常数偏移。M(j) 对 j 是直线、斜率 (G − A)/L，峰值必在两端之一：**🟩A > 🟥G** 时反向下坡，峰值在前向末尾 = W + A；**🟥G > 🟩A** 时反向上坡，峰值在反向末尾 = W + G = 2W。G 恒等于权重大小，A ∝ token 数 × 层数，所以正常训练（batch × seq 喂够）都是 A > G；只有 token 少、模型大时翻过去——xl 只喂 512 个 token，A = 5.3 < G = 12.7。
 
 ![图 2.2-1](assets/s2/peak_moment.png)
 
-**图 2.2-1** 一步 fwd_bwd 的显存曲线 M(j)：xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上
+**图 2.2-1** 一步 fwd_bwd 的显存曲线，按 🟦W / 🟩A / 🟥G / 🟨T 堆叠（fp32），虚线为 bf16 autocast：xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上
 
 三条读法：(1) 带图前向 − W 就是 A，四个规格里 A 都是 W 的 2.5–7 倍，所以带图前向一开就是峰值，fwd_bwd 只多一点临时量；(2) full 比 fwd_bwd 多的恰好是 2W——AdamW 的 m、v 常驻（`.grad` 每步 `set_to_none` 后重建，不与 A 同时在峰值），xl 的 2W = 25.4 光这一项就把 5090 填满，和 §1.4 一致；(3) xl 连带图前向都 OOM，所以下面 xl 的实验只能降到 seq 128。
 
