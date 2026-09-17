@@ -212,7 +212,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 - 算力下限 = FLOPs / 1.05e14（5090 fp32 峰值）
 - 带宽下限 = bytes / 1.79e12（显存带宽）
 
-实际耗时 ≥ 两者取大：算力下限大是 **compute-bound**，带宽下限大是 **memory-bound**（等价于算术强度 I = FLOPs / bytes 是否低于 ridge point ≈ 60）。下表 medium@1024 一层内各 op，前 4 列纸面算、「实测」是 nsys 的 kernel GPU 时间、粗体是瓶颈（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
+实际耗时 ≥ 两者取大：算力下限大是 **compute-bound**，带宽下限大是 **memory-bound**（等价于算术强度 I = FLOPs / bytes 是否低于 ridge point ≈ 60）。下表 medium@1024 一层内各 op，前 4 列纸面算、「实测」是 nsys 的 kernel GPU 时间、粗体是瓶颈（S 是 `[4,16,1024,1024]`，4·16·1024² = 6.7e7 个元素 × 4 B = 256 MiB）：
 
 | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 |
 |:--|--:|--:|--:|--:|--:|--:|
