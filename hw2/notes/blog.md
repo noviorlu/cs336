@@ -38,7 +38,6 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | **saved tensors** | 其中 autograd 为反向留下的那部分（PyTorch `saved_tensors_hooks` 看到的就是它们）。作业文档和 JAX 叫 **residuals**，本文不用这个词，以免和 residual connection 混 |
 | **entry** | 一段 checkpoint 的输入 x_i（`[b, s, d]`，80 MiB），checkpoint 唯一保留的东西，反向 recompute 的起点 |
 | **recompute**（重算） | 反向时用 entry 把一段前向重跑一遍 |
-| **k（§3.2）** | checkpoint 段数，每段 L/k 层——与上面反向计数的 k 不同 |
 | **residual stream**（残差流） | Transformer 里逐层相加的那条 `[batch, seq, d_model]` 主干，与上面的 residuals 无关 |
 | **forward / fwd_bwd / full** | benchmark 的三种模式：纯前向（`no_grad`）/ 前向 + 反向 / 前向 + 反向 + optimizer step |
 | **kernel / op** | kernel = GPU 上执行的一个函数（nsys 看到的单位）；op = PyTorch 的 aten 算子，一个 op 可能发多个 kernel |
@@ -47,6 +46,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | **FLOPs / FLOPS** | FLOPs = 浮点运算次数（计数，如 8.6e9）；FLOPS = 每秒浮点运算次数（速率，如 1.05e14）。全文用 10 的幂写，不用 G/T 前缀 |
 | **W / G / A / T** | 显存四项（§2.2）：W = 全部权重的大小；G = 全部参数梯度 `.grad` 的大小，= W；A = 前向结束时为反向存的全部 saved tensors；T = 正在算的这一层反向的临时量，算完即释放 |
 | **L / k / M(k)** | L = 层数；k = 反向已走完的层数（0 → L）；M(k) = 此刻活着的显存 = W + G·k/L + A·(L−k)/L + T |
+| **k（§3.2 里）** | checkpoint 段数，每段 L/k 层——与上一行反向计数的 k 是两回事 |
 | **算术强度 I**（arithmetic intensity） | FLOPs / 读写显存的 bytes。低于硬件的 FLOPS / 带宽（5090 fp32 ≈ 60）的 op 受限于带宽，时间 = bytes / 带宽 |
 
 ### 1.2 模型规格
