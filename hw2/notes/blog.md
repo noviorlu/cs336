@@ -264,9 +264,11 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ### 2.2 显存剖析（Memory Profiling）
 
-先像 §2.1(b) 那样把各规格四种模式的峰值列出来（`batch=4, seq=512`，`max_memory_allocated`，预热后清零，`stages_b4_seq512.md`），单位 GiB：
+三个尺度往里看：先各规格一张峰值表并给出「峰值落在哪一刻」的判据；再看 xl 一步的时间线（a、b）；最后钻进一层 block，看谁最大、谁留到反向（c、d、e）。
 
-**表 2.2-1** 各规格 × 四种模式的峰值显存（GiB，batch 4 seq 512）
+#### 各规格峰值与判据
+
+**表 2.2-1** 各规格 × 四种模式的峰值显存（GiB，batch 4 seq 512，`max_memory_allocated`，预热后清零；`stages_b4_seq512.md`）
 
 | Size | 权重 W (GiB) | forward（no_grad） | forward（带图） | fwd_bwd | full |
 |:-----|--:|--:|--:|--:|--:|
@@ -276,7 +278,9 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | xl     | 12.70 | 13.47 | OOM @ forward（29.06） | OOM | OOM |
 | 10B    | 47.8  | OOM @ init | — | — | — |
 
-**峰值在哪一刻**。反向走完 j 层时活着的显存：
+三列怎么读：带图前向 − W = A，四档都是 W 的 2.5–7 倍；fwd_bwd 只比带图前向多零头；full 再多 2W 是 AdamW 的 m、v，xl 光这项 25.4 GiB 就填满 5090。xl 连带图前向都 OOM，后面 xl 的实验降到 seq 128。
+
+**峰值落在哪一刻**。反向走完 j 层时活着的显存：
 
 <p align="center">$M(j) = W + G \cdot j/L + A \cdot (L-j)/L + T$</p>
 
@@ -290,15 +294,13 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 **图 2.2-1** 一步 fwd_bwd 的显存曲线，按 🟦W / 🟩A / 🟥G / 🟨T 堆叠（fp32），虚线为 bf16 autocast
 
-对表 2.2-1：带图前向 − W = A，四档都是 W 的 2.5–7 倍，峰值在前向末尾；full 再多 2W 是 AdamW 的 m、v，xl 光这项 25.4 GiB 就填满 5090；xl 连带图前向都 OOM，下面 xl 的实验降到 seq 128。
-
-以下用 `torch.cuda.memory._record_memory_history` 记分配历史（可拖进 pytorch.org/memory_viz），xl，batch 4。
-
-#### (a)(b) 整步：时间线与峰值
+#### (a)(b) xl 一步的时间线与峰值
 
 **问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
 
-**表 2.2-2** xl 各模式峰值显存，fp32 vs bf16 autocast（GiB，batch 4；OOM 行为炸掉前水位，受碎片影响 ±1 GiB；bf16 列见 §2.3(e)）
+用 `torch.cuda.memory._record_memory_history` 记一步的分配历史（可拖进 pytorch.org/memory_viz），xl，batch 4。
+
+**表 2.2-2** xl 各模式峰值显存，fp32 vs bf16 autocast（GiB；OOM 行为炸掉前水位，受碎片影响 ±1 GiB；bf16 列见 §2.3(e)）
 
 | seq | 模式 | fp32 (GiB) | bf16 autocast (GiB) |
 |----:|:--|:--|:--|
@@ -319,58 +321,57 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 - (a) 三个阶段靠**斜率**认（图 2.2-3）：前向 32 级均匀上坡，每层留 166 MiB，12.8 → 18.1；反向继续爬到 25.5，每层释放 166、新分配 410 MiB 梯度（看着缓是因为横轴是事件数）；optimizer 垂直冲到 ~28.6 OOM。纯前向（图 2.2-2）不留东西：seq 128 平；seq 2048 每层一根尖峰，是 attention 的 2 GiB 分数矩阵链上 ~4 份同时活着（12.8 + 4 × 2 ≈ 21.4），`softmax·V` 一算完全释放。
 - (b) xl 的 full 任何 seq 都装不下（optimizer 的 2W）；seq 2048 连 fwd_bwd 都过不了前向：12.8 + 已留下的 saved tensors + 当前层 8 GiB 的尖峰，25.96 撞墙——第二篇 FlashAttention 消的就是这根尖峰。
 
-#### (c)(d)(e) 一层里的显存：谁最大、谁被留到反向
+#### (c)(d)(e) 一层里：谁最大、谁留到反向
 
 **问题**：(c) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大；(d) 时间线上最大的分配是什么、多大、从哪行代码来；(e) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少。
 
-- (c) 残差流张量 `[batch, seq, d_model]` = `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是 Transformer 里"一层传给下一层"的那个张量，下面拿它当尺子。
-- (d) 最大的分配是它的 25 倍。照 §2.1 的办法，把一层 block 前向按子模块、逐 op 列出每个 op 分配的输出张量（xl，batch 4，32 头，d_head 80；大小按 shape × 4 B，与时间线上的 malloc 一致）：
+**(c) 一把尺子**：残差流张量 `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是一层传给下一层的那个张量。
 
-  **表 2.2-3** xl 一层 block 前向逐 op 分配的张量（seq 2048 vs 128）
+**(d) 最大的分配是尺子的 25 倍**。照 §2.1 的办法，把一层 block 前向按子模块逐 op 列出每个 op 分配的输出（xl，batch 4，32 头，d_head 80；大小 = shape × 4 B，与时间线上的 malloc 一致）：
 
-  | 子模块 | op | 分配的张量 | seq 2048 | seq 128 |
-  |:--|:--|:--|--:|--:|
-  | RMSNorm ×2 | `x²` 均值、rsqrt、`x·r`、`w⊙x̂` | `[b, s, d]` = `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
-  | attention 投影 | `Q = x·Wqᵀ`、K、V、RoPE(Q)、RoPE(K) | `[4, s, 2560]` | 80 MiB × 5 | 5 MiB × 5 |
-  | **attention 核心** | `S = QKᵀ`（einsum） | `[b, h, s, s]` = `[4, 32, s, s]` | **2 GiB** | 8 MiB |
-  | | `S / √d` | 同上 | **2 GiB** | 8 MiB |
-  | | `masked_fill(−inf)` | 同上 | **2 GiB** | 8 MiB |
-  | | softmax：`x − max`、`exp`、`/ sum` | 同上 × 3 | **2 GiB × 3** | 8 MiB × 3 |
-  | | `O = PV`、`O·Woᵀ` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
-  | FFN | `w1(x)`、`w3(x)`、`SiLU`、门积 | `[b, s, d_ff]` = `[4, s, 10240]` | 320 MiB × 4 | 20 MiB × 4 |
-  | | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB |
-  | 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
+**表 2.2-3** xl 一层 block 前向逐 op 分配的张量（seq 2048 vs 128）
 
-  时间线上最大的分配就是 attention 核心那 6 份 **2 GiB**（调用栈 `model.py:253-257`、`nn_utils.py:15-24`），全是同一个 `[b, h, s, s]` 形状的链式中间量，也就是 (a) 里的尖峰；次大是 FFN 的 4 份 320 MiB。只有 attention 核心那一组随 seq² 涨（2048 → 128 缩 256 倍），其余都随 seq 线性涨（缩 16 倍）：seq 128 时 attention 只有 8 MiB、最大的反而是 FFN 的 20 MiB，seq 一长 attention 就成了显存主角——这是第二篇 FlashAttention 的动机。
-- (e) 临时分配不等于留到反向。xl@128（fwd_bwd）的 block5 在前向 range 内一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在 range 结束时还活着——这就是为反向保存的 saved tensors，占 58%。按 malloc 发生时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
+| 子模块 | op | 分配的张量 | seq 2048 | seq 128 |
+|:--|:--|:--|--:|--:|
+| RMSNorm ×2 | `x²` 均值、rsqrt、`x·r`、`w⊙x̂` | `[b, s, d]` = `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
+| attention 投影 | `Q = x·Wqᵀ`、K、V、RoPE(Q)、RoPE(K) | `[4, s, 2560]` | 80 MiB × 5 | 5 MiB × 5 |
+| **attention 核心** | `S = QKᵀ`（einsum） | `[b, h, s, s]` = `[4, 32, s, s]` | **2 GiB** | 8 MiB |
+| | `S / √d` | 同上 | **2 GiB** | 8 MiB |
+| | `masked_fill(−inf)` | 同上 | **2 GiB** | 8 MiB |
+| | softmax：`x − max`、`exp`、`/ sum` | 同上 × 3 | **2 GiB × 3** | 8 MiB × 3 |
+| | `O = PV`、`O·Woᵀ` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
+| FFN | `w1(x)`、`w3(x)`、`SiLU`、门积 | `[b, s, d_ff]` = `[4, s, 10240]` | 320 MiB × 4 | 20 MiB × 4 |
+| | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB |
+| 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
 
-  **表 2.2-4** xl@128 block5 留到反向的 166 MiB 按分配算子归因
+最大的就是 attention 核心那 6 份 **2 GiB**（调用栈 `model.py:253-257`、`nn_utils.py:15-24`），同一个 `[b, h, s, s]` 形状的链式中间量，即 (a) 的尖峰；次大是 FFN 的 4 份 320 MiB。只有 attention 核心随 seq² 涨（2048 → 128 缩 256 倍），其余随 seq 线性（缩 16 倍）：seq 128 时最大的反而是 FFN 的 20 MiB，seq 一长 attention 才成主角——第二篇 FlashAttention 的动机。
 
-  | 来源算子 | saved tensors | 占比 | 是什么 |
-  |:--|--:|--:|:--|
-  | `aten::mul`     | 60 MiB | 36% | SwiGLU 的门积和 SiLU 的 `x·σ(x)`（`[4,128,10240]` 各 20 MiB） |
-  | `aten::bmm`     | 40 MiB | 24% | attention 的 q/k/v 与 `softmax·V` 输出 |
-  | `aten::empty`   | 20 MiB | 12% | FFN 线性层的输出本身（einsum 先 `empty` 再由 GEMM 写入） |
-  | `aten::sigmoid` | 20 MiB | 12% | SiLU 里的 `σ(x)` |
-  | `aten::add`     | 10 MiB |  6% | 残差加 |
+**(e) 分配过 ≠ 留到反向**。xl@128 的 block5 前向一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在前向结束时还活着——这就是为反向保存的 saved tensors（58%）。按 malloc 时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
 
-  seq 128 时大头是 FFN 的 `d_ff` 宽中间量而不是 attention（分数矩阵只有 8 MiB），和 (d) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB，净增 249 MiB；释放的里有 161 MiB 是上面的 saved tensors，所以反向新产生的张量 = 249 + 161 = **410 MiB**。预期：这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB = 405 MiB，误差 1%。这就是 (a) 里反向「不下坡」的原因：每层释放 166、新增 410，净值继续爬。
+**表 2.2-4** xl@128 block5 留到反向的 166 MiB 按分配算子归因
 
-  三张表怎么对：表 2.2-3 是一层前向**先后**分配过的量（大部分即造即扔，不能加总），表 2.2-4 是其中**留到反向**的，表 2.2-2 是某一刻**同时活着**的峰值。用前两张凑后一张：
+| 来源算子 | saved tensors | 占比 | 是什么 |
+|:--|--:|--:|:--|
+| `aten::mul`     | 60 MiB | 36% | SwiGLU 的门积和 SiLU 的 `x·σ(x)`（`[4,128,10240]` 各 20 MiB） |
+| `aten::bmm`     | 40 MiB | 24% | attention 的 q/k/v 与 `softmax·V` 输出 |
+| `aten::empty`   | 20 MiB | 12% | FFN 线性层的输出本身（einsum 先 `empty` 再由 GEMM 写入） |
+| `aten::sigmoid` | 20 MiB | 12% | SiLU 里的 `σ(x)` |
+| `aten::add`     | 10 MiB |  6% | 残差加 |
 
-  | 表 2.2-2 | 怎么凑 |
-  |:--|:--|
-  | 2048 forward（no_grad）21.38 | W 12.8 + attention 核心链上同时活着的 ~4 份 2 GiB（表 2.2-3）≈ 21.4 |
-  | 128 forward（no_grad）12.90 | W 12.8 + 4 × 8 MiB + 零头 |
-  | 128 fwd_bwd 25.56 | 前向末尾 W + 32 × 166 MiB（表 2.2-4）= 18.1；反向末尾 W + G = 25.4 才是峰值（G > A，见开头） |
-  | 2048 fwd_bwd OOM @ 25.96 | W 12.8 + 已留下几层的 saved tensors（每层 ~5.6 GiB）+ 当前层 8 GiB 尖峰，第 2 层即撞墙 |
-
+seq 128 时留下的大头是 FFN 的 d_ff 宽中间量而不是 attention，和 (d) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB（含上面 161 MiB 的 saved tensors），净增 249 MiB；反向新产生 = 249 + 161 = **410 MiB**，对上这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB（误差 1%）。这就是 (a) 里反向「不下坡」的原因。
 
 ![图 2.2-4](assets/s2/nsys_block5_memory.png)
 
-**图 2.2-4** xl@128 block5 前向的 cudaMalloc/cudaFree 与活到 range 结束的分配（红点）
+**图 2.2-4** xl@128 block5 前向的 cudaMalloc/cudaFree 与活到 range 结束的分配（红点）。采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`（不关 caching allocator 只能看到显存池的增长），`--nvtx-ops` 打层 range、`emit_nvtx` 打算子 range；地址被复用，分配和释放按「之后的第一次 free」配对。脚本 `python -m benchmark.memory`。
 
-> 采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`，`--nvtx-ops` 给每层打 `block{i}` range、`emit_nvtx` 给每个 aten 算子打带 `seq` 编号的 range；归因脚本 `python -m benchmark.memory`。不关 caching allocator 的话 nsys 只看到显存池的增长，看不到单个张量；关了之后 `cudaFree` 过的地址会被复用，分配和释放要按「之后的第一次 free」配对，直接按地址集合会多算 60 MiB。图从 nsys 的 sqlite 导出直接画：上图整步的 cudaMalloc/cudaFree 曲线和每层 range，下图放大 block5 前向，红点是活到 range 结束的分配。
+**三张表怎么对**：表 2.2-3 是一层前向**先后**分配过的量（大部分即造即扔，不能加总），表 2.2-4 是其中**留到反向**的，表 2.2-2 是某一刻**同时活着**的峰值。用前两张凑后一张：
+
+| 表 2.2-2 | 怎么凑 |
+|:--|:--|
+| 2048 forward（no_grad）21.38 | W 12.8 + attention 核心链上同时活着的 ~4 份 2 GiB（表 2.2-3）≈ 21.4 |
+| 128 forward（no_grad）12.90 | W 12.8 + 4 × 8 MiB + 零头 |
+| 128 fwd_bwd 25.56 | 前向末尾 W + 32 × 166 MiB（表 2.2-4）= 18.1；G > A，反向末尾 W + G = 25.4 才是峰值 |
+| 2048 fwd_bwd OOM @ 25.96 | W 12.8 + 已留下几层的 saved tensors（每层 ~5.6 GiB：2 份 2 GiB 的 S/P + FFN 3 × 320 + 8 × 80）+ 当前层 8 GiB 尖峰，第 2 层即撞墙 |
 
 ### 2.3 混合精度（Mixed Precision）
 
