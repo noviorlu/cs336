@@ -93,9 +93,19 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ### 1.5 训练时长
 
-实际算力用表 1-3 的每步 FLOPs 除以表 2.1-1 实测的 full step 时间：large 1.2e13 / 0.3728 s = **3.2e13 FLOPS**，medium 5.4e12 / 0.1674 s = 3.2e13，small 1.6e12 / 0.0557 s = 2.9e13——三档一致，取 3.3e13；对比 5090 fp32 规格 1.05e14，**MFU = 31%**（fp32 走 CUDA core，且含反向、optimizer 和逐元素 kernel 的时间）。bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
+实际算力 = 表 1-3 的每步 FLOPs ÷ 表 2.1-1 实测的 full step 时间，再除以 5090 fp32 规格 1.05e14 就是 MFU：
 
-**表 1-5** 训 20N token 的时长估算（MFU 31%）
+**表 1-5a** 实测算力与 MFU（fp32，batch 4 seq 512，full step）
+
+| Size | 训练 / step (FLOPs) | step (ms) | 实际 FLOPS | MFU |
+|:-----|--:|--:|--:|--:|
+| small  | 1.6e12 |  55.7 | 2.9e13 | 27% |
+| medium | 5.4e12 | 167.4 | 3.2e13 | 31% |
+| large  | 1.2e13 | 372.8 | 3.2e13 | 31% |
+
+三档一致（fp32 走 CUDA core，时间含反向、optimizer 和逐元素 kernel），下面统一按 3.3e13 FLOPS 估；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
+
+**表 1-5b** 训 20N token 的时长估算（按 3.3e13 FLOPS）
 
 | Size | 20N token | step (fp32) | 总时长 fp32 | step (bf16) | 总时长 bf16 |
 |:-----|--:|--:|--:|--:|--:|
