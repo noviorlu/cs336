@@ -316,9 +316,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 #### (c)(d)(e) 逐 op：一层里谁最大、谁留到反向
 
-**(c) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大？** 残差流张量 `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是一层传给下一层的那个张量，下面拿它当尺子。
-
-**(d) 时间线上最大的分配是什么、多大、从哪行代码来？** 是尺子的 25 倍。照 §2.1 的办法，把一层 block 前向按子模块逐 op 列出每个 op 分配的输出（xl，batch 4，32 头，d_head 80；大小 = shape × 4 B，与时间线上的 malloc 一致）：
+照 §2.1 的办法，把 xl 一层 block 前向按子模块逐 op 列出每个 op 分配的输出（batch 4，32 头，d_head 80；大小 = shape × 4 B，与时间线上的 malloc 一致）：
 
 **表 2.2-3** xl 一层 block 前向逐 op 分配的张量（seq 2048 vs 128）
 
@@ -335,9 +333,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 | | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB |
 | 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
 
-最大的就是 attention 核心那 6 份 **2 GiB**（调用栈 `model.py:253-257`、`nn_utils.py:15-24`），同一个 `[b, h, s, s]` 形状的链式中间量，即 (a) 的尖峰；次大是 FFN 的 4 份 320 MiB。只有 attention 核心随 seq² 涨（2048 → 128 缩 256 倍），其余随 seq 线性（缩 16 倍）：seq 128 时最大的反而是 FFN 的 20 MiB，seq 一长 attention 才成主角——第二篇 FlashAttention 的动机。
-
-**(e) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少？** 分配过 ≠ 留到反向。xl@128 的 block5 前向一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在前向结束时还活着——这就是为反向保存的 saved tensors（58%）。按 malloc 时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
+分配过的不都留下。xl@128 的 block5 前向一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在前向结束时还活着——为反向保存的 saved tensors（58%）。按 malloc 时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
 
 **表 2.2-4** xl@128 block5 留到反向的 166 MiB 按分配算子归因
 
@@ -349,11 +345,13 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 | `aten::sigmoid` | 20 MiB | 12% | SiLU 里的 `σ(x)` |
 | `aten::add`     | 10 MiB |  6% | 残差加 |
 
-seq 128 时留下的大头是 FFN 的 d_ff 宽中间量而不是 attention，和 (d) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB（含上面 161 MiB 的 saved tensors），净增 249 MiB；反向新产生 = 249 + 161 = **410 MiB**，对上这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB（误差 1%）。这就是 (a) 里反向「不下坡」的原因。
-
 ![图 2.2-3](assets/s2/nsys_block5_memory.png)
 
 **图 2.2-3** xl@128 block5 前向的 cudaMalloc/cudaFree 与活到 range 结束的分配（红点）。采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`（不关 caching allocator 只能看到显存池的增长），`--nvtx-ops` 打层 range、`emit_nvtx` 打算子 range；地址被复用，分配和释放按「之后的第一次 free」配对。脚本 `python -m benchmark.memory`。
+
+- **(c) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大？** `[4, 2048, 2560] × 4 B` = **80 MiB**（seq 128 时 5 MiB），每 token 10 KiB。它是一层传给下一层的那个张量，拿它当尺子。
+- **(d) 时间线上最大的分配是什么、多大、从哪行代码来？** 表 2.2-3 里 attention 核心那 6 份 **2 GiB**（尺子的 25 倍；调用栈 `model.py:253-257`、`nn_utils.py:15-24`），同一个 `[b, h, s, s]` 形状的链式中间量，即图 2.2-2 右上的尖峰；次大是 FFN 的 4 份 320 MiB。只有 attention 核心随 seq² 涨（2048 → 128 缩 256 倍），其余随 seq 线性（缩 16 倍）：seq 128 时最大的反而是 FFN 的 20 MiB，seq 一长 attention 才成主角——第二篇 FlashAttention 的动机。
+- **(e) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少？** 留到反向的是表 2.2-4 的 166 MiB，大头是 FFN 的 d_ff 宽中间量而不是 attention，和 (d) seq 128 的结论一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB（含上面 161 MiB 的 saved tensors），净增 249 MiB；反向新产生 = 249 + 161 = **410 MiB**，对上这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB（误差 1%）。这就是 (a) 里反向「不下坡」的原因。
 
 **三张表怎么对**：表 2.2-3 是一层前向**先后**分配过的量（大部分即造即扔，不能加总），表 2.2-4 是其中**留到反向**的，表 2.2-2 是某一刻**同时活着**的峰值。用前两张凑后一张：
 
