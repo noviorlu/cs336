@@ -219,16 +219,16 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | P = softmax(S)（hw1 版：max、减、exp、sum、除 5 个 kernel） | 5 × 6.7e7 = 3.4e8 | 5 个 kernel 各读 1–2 遍、写 1 遍 S 大小的张量，合计 8 × 256 MiB = 2 GiB（末次写出的即 P） | 0.16 | ~0 | **1.2 ms** | 1.35 ms |
 | O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 64·(2·1024·1024·64) = 8.6e9 | 读 P 256 MiB + V 64·1024·64·4 B = 8 MiB，写 O 8 MiB，共 272 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms |
 
-FLOPs 怎么算：矩阵乘 `[M,K]×[K,N]` 是 2·M·N·K（每个输出元素 K 次乘加，乘、加各算 1 FLOP），batched 再乘个数；逐元素 op 是「每元素几次运算 × 元素数」，S 有 4·16·1024² = 6.7e7 个元素，softmax 每元素约 5 次（max、减、exp、sum、除），mask 是选择不算运算记 0。bytes 怎么算：每个输入张量读一遍、每个输出张量写一遍，元素数 × 4 B（fp32）；原地 op 也要读一遍写一遍；链式的 softmax 每个 kernel 各算各的再相加。
+**怎么算**：矩阵乘 `[M,K]×[K,N]` 的 FLOPs = 2·M·N·K，逐元素 op = 每元素运算次数 × 元素数（S 有 6.7e7 个）；bytes = 输入各读一遍 + 输出各写一遍，元素数 × 4 B，原地 op 也算读写各一遍。
 
-  实测怎么读：贴着粗体下限（`/√d` 0.34 vs 0.30，softmax 1.35 vs 1.2，PV 0.24 vs 0.16）说明 kernel 已到硬件极限，再快只能靠改下限本身——减 bytes（融合）或减 FLOPs；远高于下限（QKᵀ 0.61 vs 0.17）说明实现没到位，换 kernel 就能收回来。Linear 的实测取前向 169 次 `sgemm_128x256_tn` 中 FFN 宽度那类的均值。
+**怎么读**：
+- 只有 Linear 是 compute-bound；attention 里每个 op 的 I 都在 60 以下，全是 memory-bound——包括两个矩阵乘：输出远大于输入时 GEMM 的 I ≈ K/2，QKᵀ 的 K = d_head = 64，只有 Linear（K = 1024）的 1/16。这是 attention 的定义决定的：S 要落显存就是带宽受限。
+- 实测贴着粗体下限（`/√d`、mask、softmax、PV）= kernel 已到硬件极限，再快只能改下限：减 bytes（融合）或减 FLOPs。QKᵀ 是例外，比下限慢 3.5×——K 经 einsum 转置后非连续，cuBLAS 选了慢的 `magma_sgemmEx`，换 kernel 就能收回。
+- 所以时间由「S 被搬了几遍」决定：softmax 5 个 kernel 搬 8 遍最贵；`/√d` 和 mask 各搬 2 遍，两个零 FLOPs 的 op 抵一次矩阵乘。seq 翻 4 倍，这些 op 的 bytes ∝ seq² 翻 16 倍，Linear 只翻 4 倍——attention 占比 12% → 53% 就是这么来的。
 
-只有 Linear 的瓶颈是算力；attention 里每个 op 的 I 都在 60 以下，瓶颈是带宽，实测也都贴着带宽下限——时间由「S 被搬了几遍」决定：
-- softmax 是 hw1 自己写的（减 max、exp、sum、除），拆成 5 个 kernel 搬 8 遍，所以最贵；`/√d` 和 mask 各搬 2 遍，两个「零成本」操作加起来抵一次矩阵乘。
-- 两个矩阵乘也带宽受限：`[M,K]×[K,N]` 的 GEMM 在输出远大于输入时 I ≈ K/2。QKᵀ 的内维 K = d_head = 64，写出 1024² 个元素每个只做 64 次乘加，I ≈ 28；Linear 的 K = 1024，I 高 16 倍。这是 attention 的定义决定的：只要 S 要落显存就是带宽受限。QKᵀ 实测比带宽下限还慢 3.5×，因为它是 batched GEMM 且 K 经 einsum 转置后非连续，cuBLAS 选了效率较低的 `magma_sgemmEx`。
-- seq 翻 4 倍：Linear 的 bytes 和 FLOPs 都 ∝ seq，翻 4 倍；这些 op 的 bytes ∝ seq²，翻 16 倍。attention 三段合计从 12%（256）涨到 53%（1024）就是这么来的。
+**结论**：GPU 时间看的是「张量被搬了几遍」，不是 FLOPs。解法只有融合，让 S 少落几次显存：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
 
-**结论**：GPU 时间看的是「张量被搬了几遍」，不是 FLOPs。解法只有一种——融合，让 S 少落几次显存：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
+---
 
 ### 2.2 显存剖析（Memory Profiling）
 
