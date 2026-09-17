@@ -261,16 +261,9 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 <p align="center">$M(j) = W + G \cdot j/L + A \cdot (L-j)/L + T$</p>
 
-T 是常数偏移，M(j) 对 j 是直线、斜率 (G − A)/L，峰值必在两端之一，看 **A 和 G 谁大**：
+T 是常数偏移，M(j) 对 j 是直线、斜率 (G − A)/L，峰值必在两端之一：**A > G** 时反向下坡，峰值在前向末尾 = W + A；**G > A** 时反向上坡，峰值在反向末尾 = W + G = 2W。G 恒等于权重大小，A ∝ token 数 × 层数，所以正常训练（batch × seq 喂够）都是 A > G；只有 token 少、模型大时翻过去——xl 只喂 512 个 token，A = 5.3 < G = 12.7。
 
 ![一步 fwd_bwd 的显存曲线：前向逐层 +A/L，反向逐层 +G/L − A/L；xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上（bf16 曲线见 §2.3）](assets/s2/peak_moment.png)
-
-| | A > G（saved tensors 比一份权重大） | G > A |
-|:--|:--|:--|
-| 反向曲线 | 下坡 | 上坡 |
-| 峰值时刻 | **前向末尾** | **反向末尾** |
-| 峰值 = | W + A | W + G = 2W |
-| 什么时候 | 正常训练：A ∝ token 数 × 层数，喂够 token 就满足 | token 少、模型大：xl 只喂 512 个 token |
 
 三条读法：(1) 四个规格里 A 都远大于 W——batch 4 × seq 512 的 activation 是权重的 2.5–7 倍，所以带图前向一开就是峰值，反向和 optimizer 只加零头；(2) full 比 fwd_bwd 多的恰好是 2W（Adam 状态），xl 的 2W = 25.4 光这一项就把 5090 填满，和 §1.4 的纸面账一致；(3) xl 连带图前向都 OOM，所以下面 xl 的实验只能降到 seq 128。
 
