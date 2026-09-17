@@ -121,7 +121,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ## 2 性能剖析与基准（Profiling & Benchmarking）
 
-### 2.1 时间花在哪（Benchmarking & Profiling）
+### 2.1 时间剖析（Time Profiling）
 
 **▍(a)–(c) 整步：timeit 计时**
 
