@@ -320,18 +320,20 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 **表 2.2-3** xl 一层 block 前向逐 op 分配的张量（seq 2048 vs 128）
 
-| 子模块 | op | 分配的张量 | seq 2048 | seq 128 |
-|:--|:--|:--|--:|--:|
-| RMSNorm ×2 | `x²` 均值、rsqrt、`x·r`、`w⊙x̂` | `[b, s, d]` = `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
-| attention 投影 | `Q = x·Wqᵀ`、K、V、RoPE(Q)、RoPE(K) | `[4, s, 2560]` | 80 MiB × 5 | 5 MiB × 5 |
-| **attention 核心** | `S = QKᵀ`（einsum） | `[b, h, s, s]` = `[4, 32, s, s]` | **2 GiB** | 8 MiB |
-| | `S / √d` | 同上 | **2 GiB** | 8 MiB |
-| | `masked_fill(−inf)` | 同上 | **2 GiB** | 8 MiB |
-| | softmax：`x − max`、`exp`、`/ sum` | 同上 × 3 | **2 GiB × 3** | 8 MiB × 3 |
-| | `O = PV`、`O·Woᵀ` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
-| FFN | `w1(x)`、`w3(x)`、`SiLU`、门积 | `[b, s, d_ff]` = `[4, s, 10240]` | 320 MiB × 4 | 20 MiB × 4 |
-| | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB |
-| 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 |
+| 子模块 | op | 分配的张量 | seq 2048 | seq 128 | 归到 |
+|:--|:--|:--|--:|--:|:--|
+| RMSNorm ×2 | `x²` 均值、rsqrt、`x·r`、`w⊙x̂` | `[b, s, d]` = `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 | 🟩 A（x̂ 反向要用） |
+| attention 投影 | `Q = x·Wqᵀ`、K、V、RoPE(Q)、RoPE(K) | `[4, s, 2560]` | 80 MiB × 5 | 5 MiB × 5 | 🟩 A（RoPE 后的 Q、K 和 V） |
+| **attention 核心** | `S = QKᵀ`（einsum） | `[b, h, s, s]` = `[4, 32, s, s]` | **2 GiB** | 8 MiB | 🟩 A（S） |
+| | `S / √d` | 同上 | **2 GiB** | 8 MiB | 前向临时，即释放 |
+| | `masked_fill(−inf)` | 同上 | **2 GiB** | 8 MiB | 前向临时 |
+| | softmax：`x − max`、`exp`、`/ sum` | 同上 × 3 | **2 GiB × 3** | 8 MiB × 3 | 前两份临时；`/ sum` 的输出 P → 🟩 A |
+| | `O = PV`、`O·Woᵀ` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 | 🟩 A（PV 输出是 Wo 的输入） |
+| FFN | `w1(x)`、`w3(x)`、`SiLU`、门积 | `[b, s, d_ff]` = `[4, s, 10240]` | 320 MiB × 4 | 20 MiB × 4 | 🟩 A（w1(x)、w3(x)、silu·gate） |
+| | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB | 前向临时 |
+| 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 | 加法不存；新的 x 由下一层 RMSNorm 存 → 🟩 A |
+
+最后一列按 §3.1 的规则（局部导数里出现什么就存什么）判断，与 §3.2 实测的一层 saved tensors 清单一致。**前向临时量不在 M(j) 里**——M(j) 是逐层记账，层内即造即释的量就是图 2.2-2 右上那 32 根尖峰。
 
 分配过的不都留下。xl@128 的 block5 前向一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在前向结束时还活着——为反向保存的 saved tensors（58%）。按 malloc 时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
 
