@@ -9,7 +9,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 1. **先算纸面账**（§1）：训练静态显存 16 B/参数、算力 6 × 参数 × token。3.41B（xl）静态 50.8 GiB，5090 装不下；0.97B（large）训到收敛 41 天。单卡一周上限 ≈ 0.4B。
 2. **GPU 时间 = 张量搬了几遍，不是 FLOPs**（§2.1）：softmax FLOPs 是 PV 矩阵乘的 1/5，时间是它的 6×——每个算子独立 kernel、把 seq² 的分数矩阵过一遍显存。解法只有融合。（计时前先 warmup：首步含 ~300 ms 一次性开销，不剔除均值虚高 7–59%。）
 3. **峰值 = 权重 + max(activation, 梯度)**（§2.2）：`.grad` 不常驻（`set_to_none=True`），反向每层放一层 activation、加一层梯度，两者不会同时全在；纸面 16 B/参数 里梯度那 4 B 在峰值时刻并不在场，实测 full 峰值是 12 B/参数 + activation。
-4. **bf16 快 2×、省 20%，归约留 fp32**（§2.3）：加速来自 bytes 减半 × Tensor core；显存只减矩阵乘的 activation，还多一份 bf16 权重副本，纯前向反而多 6 GiB；bf16 累加 `+0.01` 到 4.0 就停，所以 LayerNorm / softmax / loss 留 fp32。
+4. **bf16 快 2×、省 20%，归约留 fp32**（§2.3）：加速来自 bytes 减半 × Tensor core；显存只减矩阵乘的 activation，权重、梯度不变，还多一份 bf16 权重副本；bf16 累加 `+0.01` 到 4.0 就停，所以 LayerNorm / softmax / loss 留 fp32。
 5. **显存大头是 attention 的 S、P，checkpoint 动不了**（§3）：一层 3.6 GiB 里 56% 是 `[b, h, s, s]` 的分数矩阵，∝ seq²。autograd「局部导数里有什么就存什么」，融合省不掉；checkpoint 只是推迟（多一次前向 +30%），重算时仍要物化。要消掉得改 kernel——[第二篇](blog2.md) FlashAttention。
 
 ---
