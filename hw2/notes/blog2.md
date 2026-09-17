@@ -7,6 +7,12 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 ---
 
+## 省流不看
+
+TODO：§4 做完后按 现象 → 原因 → 做法 填，每条指向对应小节。
+
+---
+
 ## 4.0 预备：Roofline
 
 Roofline 回答「这段代码在这块卡上最快能跑多快」，用来判断后面每个数字合不合理。
