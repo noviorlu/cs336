@@ -46,7 +46,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | **matmul / GEMM** | 矩阵乘；GEMM 是 cuBLAS/cutlass 里矩阵乘 kernel 的名字 |
 | **CUDA core / Tensor core** | 一个 SM 里的两种算术单元。CUDA core（SIMT）是标量 FMA，什么都能算，5090 fp32 峰值 1.05e14 FLOPS；Tensor core 只做小矩阵块乘加，只收 fp16 / bf16 / tf32 / fp8 输入，吞吐高一个量级（5090 bf16 2.1e14，H100 上比 CUDA core 高 15×）。纯 fp32 矩阵乘走不了 Tensor core；**tf32** 是把 fp32 尾数截到 10 位后送进 Tensor core 的后门，`allow_tf32=False` 就是关掉它。nsys 里 kernel 名带 `simt` 的走 CUDA core |
 | **FLOPs / FLOPS** | FLOPs = 浮点运算次数（计数，如 8.6e9）；FLOPS = 每秒浮点运算次数（速率，如 1.05e14）。全文用 10 的幂写，不用 G/T 前缀 |
-| **🟦 W / 🟥 G / 🟩 A / 🟨 T** | 显存四项（§2.2，颜色与图 2.2-1 一致）：🟦 W = 全部权重的大小；🟥 G = 全部参数梯度 `.grad` 的大小，= W——但不常驻：`zero_grad(set_to_none=True)` 下 step 后释放，下一步反向时逐层重建，所以在图里是楔形不是底座；🟩 A = 前向结束时为反向存的全部 saved tensors；🟨 T = 正在算的这一层反向的临时量，算完即释放 |
+| **🟦 W / 🟥 G / 🟩 A / 🟨 T** | 显存四项（§2.2，颜色与图 2.2-1 一致）：🟦 W = 全部权重的大小；🟥 G = 全部参数梯度 `.grad` 的大小，= W——但不常驻：`zero_grad(set_to_none=True)` 下 step 后释放，下一步反向时逐层重建，所以在图里是楔形不是底座；🟩 A = 前向结束时为反向存的全部 saved tensors；🟨 T = 正在算的这一层的临时量，算完即释放：前向是 attention 分数矩阵链那种尖峰，反向是 `dy`、`dx`、累加前的 `dW` |
 | **L / j / M(j)** | L = 层数；j = 反向已走完的层数（0 → L）；M(j) = 此刻活着的显存 = 🟦W + 🟥G·j/L + 🟩A·(L−j)/L + 🟨T |
 | **k** | checkpoint 段数，每段 L/k 层（§3.2） |
 | **算术强度 I**（arithmetic intensity） | FLOPs / 读写显存的 bytes。低于硬件的 FLOPS / 带宽（5090 fp32 ≈ 60）的 op 受限于带宽，时间 = bytes / 带宽 |
@@ -284,7 +284,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 <p align="center">$M(j) = W + G \cdot j/L + A \cdot (L-j)/L + T$</p>
 
-🟦 W 常驻；🟩 A 前向逐层堆上、反向逐层放掉；🟥 G 反向逐层堆上；🟨 T 常数。
+🟦 W 常驻；🟩 A 前向逐层堆上、反向逐层放掉；🟥 G 反向逐层堆上；🟨 T 是正在算的这一层的临时量（前向的尖峰、反向的中间量），层内即造即释。
 
 > **为什么梯度不是常驻底座**：`.grad` 是反向算到那个参数时才创建的，optimizer step 用完就被 `zero_grad(set_to_none=True)`（PyTorch 2.0 默认）释放，下一步反向再逐层重建——前向期间不存在，反向期间从 0 长到 W。
 
@@ -325,15 +325,15 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 | RMSNorm ×2 | `x²` 均值、rsqrt、`x·r`、`w⊙x̂` | `[b, s, d]` = `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 | 🟩 A（x̂ 反向要用） |
 | attention 投影 | `Q = x·Wqᵀ`、K、V、RoPE(Q)、RoPE(K) | `[4, s, 2560]` | 80 MiB × 5 | 5 MiB × 5 | 🟩 A（RoPE 后的 Q、K 和 V） |
 | **attention 核心** | `S = QKᵀ`（einsum） | `[b, h, s, s]` = `[4, 32, s, s]` | **2 GiB** | 8 MiB | 🟩 A（S） |
-| | `S / √d` | 同上 | **2 GiB** | 8 MiB | 前向临时，即释放 |
-| | `masked_fill(−inf)` | 同上 | **2 GiB** | 8 MiB | 前向临时 |
-| | softmax：`x − max`、`exp`、`/ sum` | 同上 × 3 | **2 GiB × 3** | 8 MiB × 3 | 前两份临时；`/ sum` 的输出 P → 🟩 A |
+| | `S / √d` | 同上 | **2 GiB** | 8 MiB | 🟨 T（前向临时，即释放） |
+| | `masked_fill(−inf)` | 同上 | **2 GiB** | 8 MiB | 🟨 T |
+| | softmax：`x − max`、`exp`、`/ sum` | 同上 × 3 | **2 GiB × 3** | 8 MiB × 3 | 前两份 🟨 T；`/ sum` 的输出 P → 🟩 A |
 | | `O = PV`、`O·Woᵀ` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 | 🟩 A（PV 输出是 Wo 的输入） |
 | FFN | `w1(x)`、`w3(x)`、`SiLU`、门积 | `[b, s, d_ff]` = `[4, s, 10240]` | 320 MiB × 4 | 20 MiB × 4 | 🟩 A（w1(x)、w3(x)、silu·gate） |
-| | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB | 前向临时 |
+| | `w2(·)` | `[4, s, 2560]` | 80 MiB | 5 MiB | 🟨 T |
 | 残差加 ×2 | `x + …` | `[4, s, 2560]` | 80 MiB × 2 | 5 MiB × 2 | 加法不存；新的 x 由下一层 RMSNorm 存 → 🟩 A |
 
-最后一列按 §3.1 的规则（局部导数里出现什么就存什么）判断，与 §3.2 实测的一层 saved tensors 清单一致。**前向临时量不在 M(j) 里**——M(j) 是逐层记账，层内即造即释的量就是图 2.2-2 右上那 32 根尖峰。
+最后一列按 §3.1 的规则（局部导数里出现什么就存什么）判断，与 §3.2 实测的一层 saved tensors 清单一致。🟨 T 在 M(j) 里只算一层的量——图 2.2-2 右上那 32 根尖峰就是它在每层前向里的样子，seq 2048 时一层有 ~8 GiB，seq 128 时只有 32 MiB。
 
 分配过的不都留下。xl@128 的 block5 前向一共 `cudaMalloc` 了 288 MiB，其中 **166 MiB、25 个张量**在前向结束时还活着——为反向保存的 saved tensors（58%）。按 malloc 时正在跑的 `aten::*` 算子归因（算子名读成「谁分配的」而非「张量属于谁」），前五个占 90%：
 
@@ -359,10 +359,10 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 | 表 2.2-2 | 怎么凑 |
 |:--|:--|
-| 2048 forward（no_grad）21.38 | 🟦 W 12.8 + 前向临时量：attention 核心链上同时活着的 ~4 份 2 GiB（表 2.2-3）≈ 21.4 |
-| 128 forward（no_grad）12.90 | 🟦 W 12.8 + 前向临时量 4 × 8 MiB + 零头 |
+| 2048 forward（no_grad）21.38 | 🟦 W 12.8 + 🟨 T：attention 核心链上同时活着的 ~4 份 2 GiB（表 2.2-3）≈ 21.4 |
+| 128 forward（no_grad）12.90 | 🟦 W 12.8 + 🟨 T 4 × 8 MiB + 零头 |
 | 128 fwd_bwd 25.56 | 前向末尾 🟦 W + 🟩 A（32 × 166 MiB，表 2.2-4）= 18.1；G > A，反向末尾 🟦 W + 🟥 G = 25.4 才是峰值 |
-| 2048 fwd_bwd OOM @ 25.96 | 🟦 W 12.8 + 🟩 A 已留下的层（每层 ~5.6 GiB：2 份 2 GiB 的 S/P + FFN 3 × 320 + 8 × 80）+ 当前层 8 GiB 前向临时尖峰，第 2 层即撞墙 |
+| 2048 fwd_bwd OOM @ 25.96 | 🟦 W 12.8 + 🟩 A 已留下的层（每层 ~5.6 GiB：2 份 2 GiB 的 S/P + FFN 3 × 320 + 8 × 80）+ 🟨 T 当前层 8 GiB 的尖峰，第 2 层即撞墙 |
 
 ### 2.3 混合精度（Mixed Precision）
 
