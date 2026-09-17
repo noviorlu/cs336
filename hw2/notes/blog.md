@@ -298,9 +298,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 **问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
 
-峰值显存（GiB；bf16 列供 (c) 用）：
-
-**表 2.2-2** xl 各模式峰值显存，fp32 vs bf16 autocast（GiB，batch 4）
+**表 2.2-2** xl 各模式峰值显存，fp32 vs bf16 autocast（GiB，batch 4；OOM 行为炸掉前水位，受碎片影响 ±1 GiB；bf16 列见 §2.3(e)）
 
 | seq | 模式 | fp32 (GiB) | bf16 autocast (GiB) |
 |----:|:--|:--|:--|
@@ -310,24 +308,16 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 | 2048 | forward（no_grad） | 21.38 | 25.27 |
 | 2048 | fwd_bwd / full | OOM @ forward（25.96） | OOM @ forward（26.78） |
 
-OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同机其它进程影响，两次跑差 1 GiB 以内。
-
 ![图 2.2-2](assets/s2/mem_xl_forward_128_vs_2048.png)
 
 **图 2.2-2** xl 纯前向的显存时间线：seq 128（上，平）vs seq 2048（下，32 根尖峰）
+
 ![图 2.2-3](assets/s2/mem_xl_seq128_full.png)
 
-**图 2.2-3** xl@128 一步 full step 的显存时间线，红线为 forward / backward / optimizer 分界
+**图 2.2-3** xl@128 一步 full step 的显存时间线，红线为阶段分界（按分配时的 Python 栈判断：有 `optimizer.py` 是 optimizer，没有 Python 帧是 backward）
 
-- (a) 三个阶段靠**斜率**认（图 2.2-3）：
-  - 前向：32 级均匀上坡，每层留 166 MiB saved tensors，12.8 → 18.1 GiB
-  - 反向：继续爬到 25.5——每层释放 166 MiB、新分配 410 MiB 梯度，净增 244 MiB/层（横轴是事件数、反向每层事件多 4 倍，所以看着缓）
-  - optimizer：垂直冲到 ~28.6 GiB OOM，AdamW 分配 m、v
-
-  纯前向（图 2.2-2）不留东西：seq 128 平，多 0.08 GiB；seq 2048 有 32 根尖峰——每层 attention 的 `[4, 32, 2048, 2048]` 2 GiB 分数矩阵链上 ~4 份同时活着，12.8 + 4 × 2 ≈ 21.4，`softmax·V` 一算完全释放。尖峰看着窄是横轴是事件数，实际 attention 占前向近一半时间（§2.1）。
-- (b) xl 的 full step 任何 seq 都装不下：卡的是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（§1.4 的训练静态 50.8 GiB）。seq 2048 连 fwd_bwd 都过不了前向：12.8 + 逐层累积的 saved tensors + 每层 8 GiB 的 attention 尖峰，25.96 GiB 撞墙——第二篇 FlashAttention 消的就是这根尖峰。
-
-> 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
+- (a) 三个阶段靠**斜率**认（图 2.2-3）：前向 32 级均匀上坡，每层留 166 MiB，12.8 → 18.1；反向继续爬到 25.5，每层释放 166、新分配 410 MiB 梯度（看着缓是因为横轴是事件数）；optimizer 垂直冲到 ~28.6 OOM。纯前向（图 2.2-2）不留东西：seq 128 平；seq 2048 每层一根尖峰，是 attention 的 2 GiB 分数矩阵链上 ~4 份同时活着（12.8 + 4 × 2 ≈ 21.4），`softmax·V` 一算完全释放。
+- (b) xl 的 full 任何 seq 都装不下（optimizer 的 2W）；seq 2048 连 fwd_bwd 都过不了前向：12.8 + 已留下的 saved tensors + 当前层 8 GiB 的尖峰，25.96 撞墙——第二篇 FlashAttention 消的就是这根尖峰。
 
 #### (c)(d)(e) 一层里的显存：谁最大、谁被留到反向
 
