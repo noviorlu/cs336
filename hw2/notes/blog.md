@@ -294,7 +294,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 ![图 2.2-1](assets/s2/peak_moment.png)
 
-**图 2.2-1** 一步 fwd_bwd 的显存曲线，按 🟦W / 🟩A / 🟥G / 🟨T 堆叠（fp32），虚线为 bf16 autocast
+**图 2.2-1** 按 M(j) 公式画的一步 fwd_bwd 显存曲线（W/G/A/T 取实测值，标注的 measured 是实测峰值），按 🟦W / 🟩A / 🟥G / 🟨T 堆叠（fp32），虚线为 bf16 autocast
 
 回到作业问的 xl。用 `torch.cuda.memory._record_memory_history` 记一步的分配历史（可拖进 pytorch.org/memory_viz），xl，batch 4。
 
@@ -310,7 +310,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 ![图 2.2-2](assets/s2/mem_xl_timelines.png)
 
-**图 2.2-2** xl 实测显存时间线（图 2.2-1 是模型，这是快照）：上 seq 128 纯前向（平）、中 seq 2048 纯前向（32 根尖峰）、下 seq 128 full step（红线为阶段分界，按分配时的 Python 栈判断：有 `optimizer.py` 是 optimizer，没有 Python 帧是 backward）
+**图 2.2-2** xl 的显存快照时间线，每个点是一次真实分配 / 释放（图 2.2-1 是用实测的 W/G/A/T 按公式画的直线）：上 seq 128 纯前向（平）、中 seq 2048 纯前向（32 根尖峰）、下 seq 128 full step（红线为阶段分界，按分配时的 Python 栈判断：有 `optimizer.py` 是 optimizer，没有 Python 帧是 backward）
 
 - (a) 三个阶段靠**斜率**认（图 2.2-2 下，和图 2.2-1 左的模型预测形状一致）：前向 32 级均匀上坡，每层留 166 MiB，12.8 → 18.1；反向继续爬到 25.5，每层释放 166、新分配 410 MiB 梯度（看着缓是因为横轴是事件数）；optimizer 垂直冲到 ~28.6 OOM——模型图里没有的第三段。纯前向（图 2.2-2 上、中）不留东西：seq 128 平；seq 2048 每层一根尖峰，是 attention 的 2 GiB 分数矩阵链上 ~4 份同时活着（12.8 + 4 × 2 ≈ 21.4），`softmax·V` 一算完全释放。
 - (b) xl 的 full 任何 seq 都装不下（optimizer 的 2W）；seq 2048 连 fwd_bwd 都过不了前向：12.8 + 已留下的 saved tensors + 当前层 8 GiB 的尖峰，25.96 撞墙——第二篇 FlashAttention 消的就是这根尖峰。
