@@ -236,17 +236,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ### 2.2 显存剖析（Memory Profiling）
 
-先像 §2.1(b) 那样把各规格四种模式的峰值列出来（`batch=4, seq=512`，`max_memory_allocated`，预热后清零，`stages_b4_seq512.md`），单位 GiB：
-
-| Size | 权重 W (GiB) | forward（no_grad） | forward（带图） | fwd_bwd | full |
-|:-----|--:|--:|--:|--:|--:|
-| small  |  0.48 |  0.72 |  3.98 |  4.08 |  5.04 |
-| medium |  1.58 |  1.90 | 10.49 | 10.58 | 13.74 |
-| large  |  3.61 |  4.11 | 20.19 | 20.28 | 27.51 |
-| xl     | 12.70 | 13.47 | OOM @ forward（29.06） | OOM | OOM |
-| 10B    | 47.8  | OOM @ init | — | — | — |
-
-后面反复用到的记号：
+本节反复用到的记号：
 
 | 符号 | 含义 |
 |:--|:--|
@@ -257,6 +247,16 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | G | 全部参数梯度 `.grad` 的大小，= W（`.grad` 与参数同 dtype）；走完 k 层累加了 k/L 份 |
 | A | 前向结束时为反向存的全部 saved tensors；每走完一层释放一层，剩 (L−k)/L |
 | T | 正在算的这一层反向的临时量：`dy`、`dx`、累加前的 `dW`、softmax / SiLU 反向的中间张量，算完即释放；一层的量（§2.2(e) 里 xl ≈ 0.95 GiB 分配即释放，对峰值贡献 ~0.2） |
+
+先像 §2.1(b) 那样把各规格四种模式的峰值列出来（`batch=4, seq=512`，`max_memory_allocated`，预热后清零，`stages_b4_seq512.md`），单位 GiB：
+
+| Size | 权重 W (GiB) | forward（no_grad） | forward（带图） | fwd_bwd | full |
+|:-----|--:|--:|--:|--:|--:|
+| small  |  0.48 |  0.72 |  3.98 |  4.08 |  5.04 |
+| medium |  1.58 |  1.90 | 10.49 | 10.58 | 13.74 |
+| large  |  3.61 |  4.11 | 20.19 | 20.28 | 27.51 |
+| xl     | 12.70 | 13.47 | OOM @ forward（29.06） | OOM | OOM |
+| 10B    | 47.8  | OOM @ init | — | — | — |
 
 四列各是什么：
 
