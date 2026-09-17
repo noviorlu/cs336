@@ -389,18 +389,16 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 | dtype | fp32 | fp16 | fp32 | fp16 | fp32 | fp32 |
 
 - (a) 精度由**累加器**的 dtype 决定，加数是什么无所谓：fp16 累加器漂到 9.95；bf16 累加器只有 7 位尾数，到 4.0 就再也加不动——4.0 + 0.01 舍回 4.0；fp32 累加器无论加数是 fp16 / bf16 还是手动转过，都落在 10.00x（偏差来自 0.01 在 16 位里本身存不准，bf16 的表示误差是 fp16 的 8 倍，所以 10.0098 比 10.0021 偏得多）。
-- (b) autocast 不改存储的权重，只在算子调用时转换输入：矩阵乘的输出（fc1、logits）是 fp16，LayerNorm、loss、梯度留在 fp32。bf16 下模式相同。翻译成显存和时间：**省的是矩阵乘**——它的输入输出、以及 autograd 为反向存下的这些张量（(d) 里的 A）变成 16 位，矩阵乘本身走 Tensor core；**不省的是权重和 `.grad`**（W 和 G），它们始终 fp32，还多一份 16 位权重副本。所以 autocast 减的只有 activation，权重侧反而多。
+- (b) autocast 不改存储的权重，只在算子调用时把输入转成 16 位：矩阵乘的输出（fc1、logits）是 fp16，LayerNorm、loss、梯度留在 fp32。bf16 下模式相同。
 - (c) LayerNorm 敏感的是特征维上的**归约**（均值 / 方差累加，正是 (a) 的场景）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但归约精度比 fp16 更差（(a) 里卡在 4.0 就是它），所以仍要留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，留 fp32 基本免费。
 
 #### (d)(e) 代价换来了什么：速度与显存
 
 **问题**：(d) bf16 autocast 相对 fp32，各规格前向和反向快多少，显存省多少；(e) xl@128 / 2048 开 bf16 后峰值变化多少，为什么趋势不同。
 
-bf16 改的是 A（矩阵乘相关的 saved tensors 变 16 位，减）和一份 bf16 权重副本（+参数量 × 2 B，也是 saved tensor，加）；W 和 G 不动。按 §2.2 的判据，这两项只有在峰值落在前向末尾（A > G）时才进峰值，G > A 时峰值 = 2W，bf16 不改变峰值。
+按 (b)，autocast 改的只有矩阵乘：时间上它走 Tensor core；显存上 🟩 A 里矩阵乘相关的 saved tensors 变 16 位（减），另存一份 bf16 权重副本（+参数量 × 2 B，也在 🟩 A 里，加）；🟦 W、🟥 G 始终 fp32 不动。按 §2.2 的判据，这两项只在峰值落于前向末尾（A > G）时进峰值；G > A 时峰值 = 2W，bf16 不改变峰值。
 
-**(d) small / medium / large @512**（A = 3.4 / 8.8 / 16.4 GiB ≫ G = 0.5 / 1.6 / 3.6，峰值在前向末尾）：
-
-**表 2.3-3** bf16 autocast 的加速与峰值显存变化（batch 4 seq 512）
+**表 2.3-3** bf16 autocast 的加速与峰值显存变化（batch 4 seq 512；A = 3.4 / 8.8 / 16.4 GiB ≫ G，峰值在前向末尾）
 
 | Size | forward fp32 → bf16 (ms) | 加速 | backward fp32 → bf16 (ms) | 加速 | 峰值显存 fp32 → bf16 (GiB) | 其中权重侧 (GiB) | 其中 activation 侧 (GiB) |
 |:-----|:--|--:|:--|--:|:--|--:|--:|
@@ -409,20 +407,9 @@ bf16 改的是 A（矩阵乘相关的 saved tensors 变 16 位，减）和一份
 | large  | 114.8 → 49.9 | **2.30×** | 220.0 → 117.6 | 1.87× | 20.28 → 16.61 (−18%) | +1.78 | −5.50 |
 | xl     | OOM → OOM | — | — | — | — | +6.35 | — |
 
-- 速度：前向快 1.9–2.3×、反向 1.7–1.9×，**模型越大加速越高**（大 GEMM 更接近 Tensor core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。加速比是两个效应的乘积：位宽减半（搬的 bytes 少一半），以及**换了算术单元**——纯 fp32 矩阵乘只能走 CUDA core（nsys 里的 `simt_sgemm`，1.05e14 FLOPS），bf16 才能进 Tensor core（2.1e14）。基准关掉 `allow_tf32` 就是为了让 fp32 老老实实走 CUDA core，否则 fp32 会被截成 tf32 送进 Tensor core，两组数就不是在比精度了。
-- 显存：后两列是用 `saved_tensors_hooks` 把 saved tensors 按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell，`autocast_saved_tensors.txt`），权重侧和「参数量 × 2 B」的纸面值误差 < 0.05 GiB。权重侧**变多**：autocast 把 fp32 W 转成 bf16 再做矩阵乘，反向用的是这份 bf16 版，autograd 存的就是它——fp32 W 不再被存，但它本来就在显存里，副本是净增。activation 侧**减少**但不是减半（small 3.41 → 2.28 = 67%）：RMSNorm、残差流、loss 这些 autocast 不碰的张量还留在 fp32。activation 远大于副本所以净省；模型越大副本越占上风，省的比例从 −21% 缩到 −18%。
-
-**(e) xl @128 / 2048**（§2.2(a)(b) 峰值表的 bf16 列）：
-
-**表 2.3-4** xl 上 bf16 的峰值变化与峰值时刻
-
-| seq | 模式 | fp32 (GiB) | bf16 (GiB) | 峰值时刻 | 为什么 |
-|----:|:--|--:|--:|:--|:--|
-| 128 | forward（no_grad） | 12.90 | 19.18 | 前向 | 副本全在（+6.35），没有 saved tensors 可省 |
-| 128 | fwd_bwd | 25.56 | 25.55 | 反向末尾 | A = 32 × 166 MiB = 5.3 < G = 12.7，峰值 = 2W；此刻 saved tensors 和副本都已释放 |
-| 2048 | forward（no_grad） | 21.38 | 25.27 | 前向 | 副本 +6.35，attention 尖峰从 fp32 的 8 GiB 缩到 bf16 的 4 GiB，净 +3.9 |
-
-xl 上 bf16 **不省反多**（no_grad 前向）或**持平**（fwd_bwd）不是机制不同，是落在了判据表的右列。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
+- **(d) 速度**：前向快 1.9–2.3×、反向 1.7–1.9×，模型越大加速越高（大 GEMM 更接近 Tensor core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。加速比 = 位宽减半 × 换算术单元——纯 fp32 矩阵乘只能走 CUDA core（`simt_sgemm`，1.05e14 FLOPS），bf16 才能进 Tensor core（2.1e14）；基准关 `allow_tf32` 就是不让 fp32 偷偷走 Tensor core。
+- **(d) 显存**：后两列是 `saved_tensors_hooks` 按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell），权重侧和「参数量 × 2 B」误差 < 0.05 GiB。activation 侧不是减半（small 3.41 → 2.28 = 67%）：RMSNorm、残差流、loss 这些 autocast 不碰的张量留在 fp32。activation 远大于副本所以净省；模型越大副本越占上风，−21% → −18%。
+- **(e) xl**（表 2.2-2 的 bf16 列）：seq 128 no_grad 前向 +6.3——副本全在、没有 A 可省；seq 128 fwd_bwd 持平——A 5.3 < G 12.7，峰值在反向末尾 = 2W，那时 A 和副本都已释放；seq 2048 no_grad 前向 +3.9——副本 +6.35，attention 尖峰（🟨 T）从 8 GiB 缩到 4 GiB。不是机制不同，是落在了 G > A 那一侧。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
 
 ---
 
