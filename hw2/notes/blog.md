@@ -592,7 +592,7 @@ checkpoint 只动 🟩 A，🟦 W、🟥 G 不变。先看融合之后一层还�
 - **往左上**：嵌套 checkpoint。一层的 saved tensors（3.6 GiB，红虚线）是底线，减的只是 entry，计算从 2× 涨到 6×。(a) 的答案在左上角。
 - 实践停在 k = L，或者用选择性重算（只丢 S、P 这类大而便宜的张量，前向 +5%）。要压底线本身靠第二篇 FlashAttention。
 
-**重算怎么发生（Recomputation）**。**`torch.utils.checkpoint` 怎么用时间换显存？** `checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入（entry），反向到这段时重跑一遍前向造出 saved tensors，用完释放。4 层 xl block 实测：
+**`torch.utils.checkpoint` 怎么用时间换显存（Recomputation）？** `checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入（entry），反向到这段时重跑一遍前向造出 saved tensors，用完释放。4 层 xl block 实测：
 
 **表 3.2-2** 4 层 block 有无 checkpoint 的峰值构成（MiB）
 
