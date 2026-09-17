@@ -102,7 +102,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 实测比纸面少一个 W：峰值出现在前向末尾（A 全在），那一刻上一步的 `.grad` 已被 `zero_grad(set_to_none=True)` 释放、本步的还没算出来，所以真正同时在显存里的是 3W + A（§2.2 开头的表）。纸面账按 4W 算是保守的上界。xl 卡在 Adam 状态（§2.2(b) 实测 OOM @ optimizer），10B 建模型即 OOM。
 
-### 1.5 训练 20N token 要多久
+### 1.5 训练时长
 
 用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
 
@@ -123,7 +123,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ### 2.1 时间剖析（Time Profiling）
 
-#### (a)–(c) 整步：timeit 计时
+#### (a)–(c) 整步：timeit
 
 **(a) 脚本**
 
@@ -160,7 +160,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | medium | 196.8 ± 96.7  | 166.5 ± 0.9 | 167.2 ± 1.8 |
 | large  | 400.9 ± 86.8  | 374.4 ± 2.8 | 375.1 ± 3.2 |
 
-#### (d)–(h) 逐 kernel：Nsight Systems 剖析
+#### (d)–(h) 逐 kernel：nsys
 
 用 NVIDIA Nsight Systems（`nsys`）采 GPU kernel 级 timeline，代码里用 NVTX range 标出 forward / backward / optimizer 各段。覆盖 small + medium × seq 256 / 512 / 1024（large 只跑得到 512）。
 
@@ -260,7 +260,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ### 2.2 显存剖析（Memory Profiling）
 
-#### (a)(b) 整步：峰值与时间线
+#### (a)(b) 整步：峰值
 
 **表 2.2-1** 各规格 × 四种模式的峰值显存（GiB，batch 4 seq 512，`max_memory_allocated`，预热后清零；`stages_b4_seq512.md`）
 
@@ -308,7 +308,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 - **(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状？** 能，看左下，靠**斜率**认：前向 32 级上坡（每层留 🟩 166 MiB，12.8 → 18.1）；反向继续爬到 25.5（每层 −🟩 166 + 🟥 410）；optimizer 垂直冲到 ~28.6 OOM（Adam 的 m、v，= 2🟦W，M(j) 之外）。前两段的形状和图 2.2-1 左的模型一致。
 - **(b) xl 在 seq 128 / 2048 下，forward / fwd_bwd / full 的峰值各多少？** 数字在表 2.2-2。两个 OOM 的原因：full 任何 seq 都装不下，左下 optimizer 那一段就是 2W 的 Adam 状态；seq 2048 连 fwd_bwd 都过不了前向，看右下——第 1 层 attention 链冲到 21.6，算完回落到 17.5（这一层留下了 ~4.7 GiB saved tensors），第 2 层的链再往上爬，25.96 撞墙。对比右上：纯前向每层用完就回到 12.8 基线，所以 32 层都过得去；带图前向每层往基线上加 4.7 GiB，第 2 层就没有 8 GiB 给尖峰了。第二篇 FlashAttention 消的就是这根尖峰。
 
-#### (c)(d)(e) 逐 op：一层里谁最大、谁留到反向
+#### (c)(d)(e) 逐 op：一层
 
 照 §2.1 的办法，把 xl 一层 block 前向按子模块逐 op 列出每个 op 分配的输出（batch 4，32 头，d_head 80；大小 = shape × 4 B，与时间线上的 malloc 一致）：
 
@@ -360,7 +360,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 ### 2.3 混合精度（Mixed Precision）
 
-#### (a)(b)(c) 精度：谁该留在 fp32
+#### (a)(b)(c) 精度
 
 **表 2.3-1** 1000 次 s += 0.01 在各 dtype 组合下的结果
 
@@ -382,7 +382,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 **(b)(c) 参数 fp32 的玩具模型 `Linear → ReLU → LayerNorm → Linear` 包在 `torch.autocast(fp16)` 里训练，各张量是什么 dtype？为什么 LayerNorm 留在 fp32，换成 bf16 后还有必要吗？** autocast 不改存储的权重，只在算子调用时把输入转成 16 位：矩阵乘的输出（fc1、logits）是 fp16，LayerNorm、loss、梯度留在 fp32；bf16 下模式相同。LayerNorm 留 fp32 是因为它敏感的是特征维上的**归约**（均值 / 方差累加，正是 (a) 的场景）和方差里的**平方**（fp16 上限 65504 易溢出）。换 bf16 后溢出消失，但归约精度比 fp16 更差（表 2.3-1 里卡在 4.0 就是它），所以仍要留 fp32，理由从「怕溢出」变成「怕精度」；LayerNorm 只占前向 2–7%，留 fp32 基本免费。
 
-#### (d)(e) 代价换来了什么：速度与显存
+#### (d)(e) 速度与显存
 
 按 (b)，autocast 改的只有矩阵乘：时间上它走 Tensor core；显存上 🟩 A 里矩阵乘相关的 saved tensors 变 16 位（减），另存一份 bf16 权重副本（+参数量 × 2 B，也在 🟩 A 里，加）；🟦 W、🟥 G 始终 fp32 不动。按 §2.2 的判据，这两项只在峰值落于前向末尾（A > G）时进峰值；G > A 时峰值 = 2W，bf16 不改变峰值。
 
@@ -412,9 +412,9 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 ## 3 单卡显存（Single-GPU Memory）
 
-### 3.1 autograd 为反向存了什么（Autograd Residuals）
+### 3.1 autograd 存什么（Autograd Residuals）
 
-#### (a) 逐 op：RMSNorm 的 5 个算子各存什么
+#### (a) 逐 op：RMSNorm
 
 **🟩 A 到底由哪些张量组成？** §2.2(e) 按 malloc 归因是粗账；要精确到每个 op，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。先用最小的例子 RMSNorm（纯 fp32，`x: [4,512,2560]`）看清规则，再看 `torch.compile` 融合后有什么变化。
 
@@ -507,7 +507,7 @@ flowchart LR
 
 反向沿虚线 ⑤ → ④ → ③ → ② → ①：⑤ 取 $\hat{x}$、$w$，④ 取 $r$、$x$，③ 取 $r$，① 取 $x$，与 print 的 Loading 顺序一致。`x` 有两条虚线入边，两路梯度在叶子上累加。
 
-#### (b) 融合后：`torch.compile` 只存 x、w、r（Operator Fusion）
+#### (b) 融合后（Operator Fusion）
 
 **`torch.compile` 融合后存的东西有什么变化？** 回看表 3.1-1：$\partial\hat{x}/\partial x$ 只用到 $r$ 和 $\hat{x}$，而 $\hat{x}=x\cdot r$ 是一次逐元素乘——反向手里有 $x$ 和 $r$ 就能当场算回 $\hat{x}$，不必存那 20 MiB。逐算子写法做不到，因为 ⑤ 的 MulBackward 只知道「我要 $\hat{x}$」，不知道它是 $x\cdot r$ 来的。`torch.compile(RMSNorm(...))` 把 ①–⑤ 追踪成一张图，AOTAutograd 生成一个前向 kernel、一个反向 kernel，并在「存」和「重算」之间选便宜的：
 
@@ -569,7 +569,7 @@ x̂ = x·r 现场重算
 
 ### 3.2 激活检查点（Activation Checkpointing）
 
-#### (a) 一层与整网：3655 MiB，用计算换显存
+#### (a) 一层与整网
 
 checkpoint 只动 🟩 A，🟦 W、🟥 G 不变。先看融合之后一层还剩多少 A 动不了：
 
@@ -678,7 +678,7 @@ flowchart LR
 
 两段不能并行：L2 反向要 `dx2`，它是 L3 反向的输出。前半段的重算只依赖 x0、理论上能提前，但那样两段的红色同时活着，峰值回到 14.6 GiB。
 
-#### (b) 忽略算力：递归 checkpoint，显存 O(log L)（Recursive Checkpointing）
+#### (b) 递归 checkpoint（Recursive Checkpointing）
 
 **(b) 忽略算力，峰值显存最小的 checkpoint 策略是什么，渐近显存和计算各多少？** 峰值 = 一层的 saved tensors + 活着的 entry。前者最少 1 层，每层一个 checkpoint 已做到；后者要存 x0…x_{L-1}，O(L)。**entry 也是 activation，也能被 checkpoint 掉**：一段层外面再包一层 `checkpoint`，段内的 entry 就不存，反向到这段时重算。一路对半包到底就是一棵二叉树——节点 = 一次 `checkpoint` 调用、留自己的 entry；叶子 = 层：
 
@@ -791,7 +791,7 @@ def ckpt(layers, x):
     return checkpoint(right, checkpoint(left, x))    # 两个子树各包一个 checkpoint
 ```
 
-#### (c) 只重算一次：段长 1 最优
+#### (c) 最优段长
 
 **(c) 只允许重算一次（不嵌套），xl@2048 batch 4 最优的段长是多少？实测验证并比较相邻段长。** 不嵌套只能平切 k 段，峰值 = k × entry + (L/k) × 一层 saved tensors。xl@2048 是 k × 80 + (32/k) × 3655 MiB，两项相等要 k ≈ 38 > 32——entry 比一层 saved tensors 小 45 倍，所以切到最细（每层一个）最优，没有中间的平衡点。
 
