@@ -1,4 +1,4 @@
-"""§2.3(d)(e)：一步 fwd_bwd 的显存曲线。前向第 j 层结束：W + A·j/L（末尾加 T）；反向走完 k 层：W + G·k/L + A·(L−k)/L + T。
+"""§2.3(d)(e)：一步 fwd_bwd 的显存曲线。前向第 j 层结束：W + A·j/L（末尾加 T）；反向走完 j 层：W + G·j/L + A·(L−j)/L + T。
 xl@128 与 small@512，fp32 vs bf16 autocast。数字来自 memory_xl_peak.md / autocast_saved_tensors.txt。"""
 import matplotlib.pyplot as plt
 
@@ -22,8 +22,8 @@ for ax, (name, L, W, G, A32, A16, T, p32, p16) in zip(axes, cases):
     ax.text(L / 2, y0, "forward: +A/L per layer", fontsize=8, c="gray", ha="center", va="bottom")
     ax.text(1.5 * L, y0, "backward: +G/L − A/L per layer", fontsize=8, c="gray", ha="center", va="bottom")
     ax.set_title(f"{name}\nW = G = {W} GiB, L = {L}", fontsize=10)
-    ax.set_xticks([0, L, 2 * L]); ax.set_xticklabels(["start", "forward ends\nbackward starts", "backward ends"], fontsize=8)
+    ax.set_xticks([0, L, 2 * L]); ax.set_xticklabels(["start", "forward ends\nbackward starts (j=0)", "backward ends (j=L)"], fontsize=8)
     ax.set_ylabel("active memory  GiB"); ax.legend(fontsize=8, loc="upper left" if G > A32 else "lower center")
-fig.suptitle("one fwd_bwd step: forward W + A·j/L, backward W + G·k/L + A·(L−k)/L + T   — backward slope (G−A)/L decides where the peak is", fontsize=9.5)
+fig.suptitle("one fwd_bwd step: forward W + A·i/L (i layers done), backward M(j) = W + G·j/L + A·(L−j)/L + T (j layers done)   — slope (G−A)/L decides the peak", fontsize=9.5)
 fig.tight_layout()
 fig.savefig("notes/assets/s2/peak_moment.png", dpi=140)
