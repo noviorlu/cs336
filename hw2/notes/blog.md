@@ -264,9 +264,13 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ### 2.2 显存剖析（Memory Profiling）
 
-三个尺度往里看：先各规格一张峰值表并给出「峰值落在哪一刻」的判据；再看 xl 一步的时间线（a、b）；最后钻进一层 block，看谁最大、谁留到反向（c、d、e）。
+两个尺度，和 §2.1 一样：先看整步——各规格的峰值、峰值落在哪一刻、xl 一步的时间线（a、b）；再钻进一层 block 逐 op 看谁最大、谁留到反向（c、d、e）。
 
-#### 各规格峰值与判据
+#### (a)(b) 整步：峰值与时间线
+
+**问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
+
+先把各规格四种模式的峰值列出来，作为整节的底账：
 
 **表 2.2-1** 各规格 × 四种模式的峰值显存（GiB，batch 4 seq 512，`max_memory_allocated`，预热后清零；`stages_b4_seq512.md`）
 
@@ -294,11 +298,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 **图 2.2-1** 一步 fwd_bwd 的显存曲线，按 🟦W / 🟩A / 🟥G / 🟨T 堆叠（fp32），虚线为 bf16 autocast
 
-#### (a)(b) xl 一步的时间线与峰值
-
-**问题**：(a) 从时间线上能认出 forward / backward / optimizer 三个阶段吗，各是什么形状；(b) xl 在 seq 128 和 2048 下，forward / fwd_bwd / full 的峰值各多少。
-
-用 `torch.cuda.memory._record_memory_history` 记一步的分配历史（可拖进 pytorch.org/memory_viz），xl，batch 4。
+回到作业问的 xl。用 `torch.cuda.memory._record_memory_history` 记一步的分配历史（可拖进 pytorch.org/memory_viz），xl，batch 4。
 
 **表 2.2-2** xl 各模式峰值显存，fp32 vs bf16 autocast（GiB；OOM 行为炸掉前水位，受碎片影响 ±1 GiB；bf16 列见 §2.3(e)）
 
@@ -321,7 +321,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 - (a) 三个阶段靠**斜率**认（图 2.2-3）：前向 32 级均匀上坡，每层留 166 MiB，12.8 → 18.1；反向继续爬到 25.5，每层释放 166、新分配 410 MiB 梯度（看着缓是因为横轴是事件数）；optimizer 垂直冲到 ~28.6 OOM。纯前向（图 2.2-2）不留东西：seq 128 平；seq 2048 每层一根尖峰，是 attention 的 2 GiB 分数矩阵链上 ~4 份同时活着（12.8 + 4 × 2 ≈ 21.4），`softmax·V` 一算完全释放。
 - (b) xl 的 full 任何 seq 都装不下（optimizer 的 2W）；seq 2048 连 fwd_bwd 都过不了前向：12.8 + 已留下的 saved tensors + 当前层 8 GiB 的尖峰，25.96 撞墙——第二篇 FlashAttention 消的就是这根尖峰。
 
-#### (c)(d)(e) 一层里：谁最大、谁留到反向
+#### (c)(d)(e) 逐 op：一层里谁最大、谁留到反向
 
 **问题**：(c) 残差流上一个 `[batch, seq, d_model]` 的 fp32 张量多大；(d) 时间线上最大的分配是什么、多大、从哪行代码来；(e) 一层 block 前向分配的显存里有多少要留到反向，反向又新分配多少。
 
