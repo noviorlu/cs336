@@ -409,7 +409,16 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 - **(d) 速度**：前向快 1.9–2.3×、反向 1.7–1.9×，模型越大加速越高（大 GEMM 更接近 Tensor core 峰值）；反向低于前向是因为梯度累加进 fp32 `.grad` 不缩水。加速比 = 位宽减半 × 换算术单元——纯 fp32 矩阵乘只能走 CUDA core（`simt_sgemm`，1.05e14 FLOPS），bf16 才能进 Tensor core（2.1e14）；基准关 `allow_tf32` 就是不让 fp32 偷偷走 Tensor core。
 - **(d) 显存**：后两列是 `saved_tensors_hooks` 按来源数出来的实测（notebook「2.4 Benchmarking mixed precision」的 (d) cell），权重侧和「参数量 × 2 B」误差 < 0.05 GiB。activation 侧不是减半（small 3.41 → 2.28 = 67%）：RMSNorm、残差流、loss 这些 autocast 不碰的张量留在 fp32。activation 远大于副本所以净省；模型越大副本越占上风，−21% → −18%。
-- **(e) xl**（表 2.2-2 的 bf16 列）：seq 128 no_grad 前向 +6.3——副本全在、没有 A 可省；seq 128 fwd_bwd 持平——A 5.3 < G 12.7，峰值在反向末尾 = 2W，那时 A 和副本都已释放；seq 2048 no_grad 前向 +3.9——副本 +6.35，attention 尖峰（🟨 T）从 8 GiB 缩到 4 GiB。不是机制不同，是落在了 G > A 那一侧。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。Megatron / DeepSpeed 的混合精度是反过来的布局：模型参数常驻 bf16，fp32 master weights 放在 optimizer 里，step 时更新 master 再 cast 回来——总量同样 ~18 B/param，但没有每步 cast，且 master + m + v 可以随 optimizer 分片到多卡，这是它比 autocast 省显存的地方。
+- **(e) xl**（表 2.2-2 的 bf16 列）：seq 128 no_grad 前向 +6.3——副本全在、没有 A 可省；seq 128 fwd_bwd 持平——A 5.3 < G 12.7，峰值在反向末尾 = 2W，那时 A 和副本都已释放；seq 2048 no_grad 前向 +3.9——副本 +6.35，attention 尖峰（🟨 T）从 8 GiB 缩到 4 GiB。不是机制不同，是落在了 G > A 那一侧。推理时那份副本是 autocast 的 cast 缓存，可以关掉或干脆 `model.to(bf16)`；训练时它是反向 `dx = dy·W` 的输入，autograd 存着，关缓存也省不掉。
+
+> **两份权重放哪里，决定了混合精度的用法**。同样是「一份 bf16 算、一份 fp32 更新」，两种布局：
+>
+> | | 模型里 | optimizer 里 | 每步 | 适用 |
+> |:--|:--|:--|:--|:--|
+> | **autocast**（本文） | fp32 参数 | m、v | 前向临时 cast 出 bf16 副本，用完丢 | 单卡、一行代码开；副本进 🟩 A |
+> | **Megatron / DeepSpeed** | **bf16 参数常驻** | **fp32 master** + m、v | 用 fp32 master 更新，cast 回 bf16 参数 | 多卡：master + m + v 随 optimizer 分片（ZeRO-1），每卡只常驻 2 B/param 的权重 |
+>
+> 总量都 ~18 B/param，Megatron 布局省的是每步 cast 和分片后每卡的份额——单卡上没差别，多卡上是主流做法。
 
 ---
 
