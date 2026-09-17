@@ -123,8 +123,6 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ### 2.1 时间花在哪（Benchmarking & Profiling）
 
-两个尺度：先用 `timeit` 看整步（(a)–(c)，作业 2.1），再用 Nsight Systems 拆到每个 kernel（(d)–(h)，作业 2.2）。
-
 #### (a)–(c) 整步：timeit 计时
 
 **(a) 脚本**
@@ -183,8 +181,6 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 **(e)–(h) kernel 分析：GPU 时间花在哪**
 
 **问题**：(e) 最耗时的 kernel 是哪个，加上反向还是它吗；(f) 矩阵乘之外还有什么占时间；(g) 算上 optimizer 后矩阵乘占比怎么变；(h) attention 内部 softmax 和两次矩阵乘各花多少，和 FLOPs 相称吗。
-
-分四步看：先把 nsys 里的 kernel 归类，再看整步的时间怎么分，然后放大到 attention 内部，最后逐 op 算 roofline 解释为什么。
 
 **第一步：kernel 归类**。nsys 报表里的 kernel 名是 C++ 模板签名，按关键字归三类（占比取 medium@512 full step 的 GPU 时间）：
 
@@ -263,8 +259,6 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 ---
 
 ### 2.2 显存剖析（Memory Profiling）
-
-两个尺度，和 §2.1 一样：先看整步——各规格的峰值、峰值落在哪一刻、xl 一步的时间线（a、b）；再钻进一层 block 逐 op 看谁最大、谁留到反向（c、d、e）。
 
 #### (a)(b) 整步：峰值与时间线
 
@@ -365,8 +359,6 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 | 2048 fwd_bwd OOM @ 25.96 | 🟦 W 12.8 + 🟩 A 已留下的层（每层 ~5.6 GiB：2 份 2 GiB 的 S/P + FFN 3 × 320 + 8 × 80）+ 🟨 T 当前层 8 GiB 的尖峰，第 2 层即撞墙 |
 
 ### 2.3 混合精度（Mixed Precision）
-
-五问两步：先看精度——低精度数值的坑、autocast 把谁降了精度、为什么留下 LayerNorm（a、b、c）；再看代价换来了什么——速度和显存（d、e）。
 
 #### (a)(b)(c) 精度：谁该留在 fp32
 
