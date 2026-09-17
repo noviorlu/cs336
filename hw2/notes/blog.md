@@ -258,7 +258,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 - 利用率：compute-bound 看 MFU，memory-bound 看 MBU。六个 op 都在 57–86%，已到硬件极限，再快只能改下限——减 bytes（融合）或减 FLOPs。
 - 时间 = S 被搬了几遍：softmax 8 遍最贵，`/√d` 和 mask 各 2 遍。这些 bytes ∝ seq²，Linear ∝ seq，所以 attention 占比 10% → 46%。
 
-**结论**：GPU 时间看「张量被搬了几遍」，不是 FLOPs。解法只有融合：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
+**结论**：GPU 时间看「张量被搬了几遍」，不是 FLOPs。解法只有融合：fused softmax 8 遍 → 2 遍，FlashAttention 分块在片上算完就丢、S/P 根本不落显存（第二篇）。
 
 ---
 
