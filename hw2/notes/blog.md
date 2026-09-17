@@ -37,6 +37,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | **🟦 W / 🟥 G / 🟩 A / 🟨 T** | 显存四项（§2.2，颜色与图 2.2-1 一致）：🟦 W = 全部权重的大小；🟥 G = 全部参数梯度 `.grad` 的大小，= W——但不常驻：`zero_grad(set_to_none=True)` 下 step 后释放，下一步反向时逐层重建，所以在图里是楔形不是底座；🟩 A = 前向结束时为反向存的全部 saved tensors；🟨 T = 正在算的这一层的临时量，算完即释放：前向是 attention 分数矩阵链那种尖峰，反向是 `dy`、`dx`、累加前的 `dW` |
 | **L / j / M(j)** | L = 层数；j = 反向已走完的层数（0 → L）；M(j) = 此刻活着的显存 = 🟦W + 🟥G·j/L + 🟩A·(L−j)/L + 🟨T |
 | **k** | checkpoint 段数，每段 L/k 层（§3.2） |
+| **MFU / MBU** | model FLOPs utilization = 实际 FLOPS / 峰值 FLOPS，衡量 compute-bound 的代码；memory bandwidth utilization = 实际带宽 / 峰值带宽，衡量 memory-bound 的代码。整步训练的 MFU 用「每步 FLOPs / 每步时间 / 峰值」算（§1.5） |
 | **算术强度 I**（arithmetic intensity） | FLOPs / 读写显存的 bytes。低于硬件的 FLOPS / 带宽（5090 fp32 ≈ 60）的 op 受限于带宽，时间 = bytes / 带宽 |
 
 ### 1.2 模型规格
@@ -92,7 +93,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 ### 1.5 训练时长
 
-用 §2.1 实测 full step 步长反推：5090 fp32 实际 **3.3e13 FLOPS**（规格 1.05e14，MFU 31%，SIMT 路径）；bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
+实际算力用表 1-3 的每步 FLOPs 除以表 2.1-1 实测的 full step 时间：large 1.2e13 / 0.3728 s = **3.2e13 FLOPS**，medium 5.4e12 / 0.1674 s = 3.2e13，small 1.6e12 / 0.0557 s = 2.9e13——三档一致，取 3.3e13；对比 5090 fp32 规格 1.05e14，**MFU = 31%**（fp32 走 CUDA core，且含反向、optimizer 和逐元素 kernel 的时间）。bf16 autocast 按 §2.3(d) 的 fwd_bwd 加速换算。
 
 **表 1-5** 训 20N token 的时长估算（MFU 31%）
 
