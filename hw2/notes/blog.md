@@ -413,12 +413,13 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 > **两份权重放哪里，决定了混合精度的用法**。同样是「一份 bf16 算、一份 fp32 更新」，两种布局：
 >
-> | | 模型里 | optimizer 里 | 每步 | 适用 |
-> |:--|:--|:--|:--|:--|
-> | **autocast**（本文） | fp32 参数 | m、v | 前向临时 cast 出 bf16 副本，用完丢 | 单卡、一行代码开；副本进 🟩 A |
-> | **Megatron / DeepSpeed** | **bf16 参数常驻** | **fp32 master** + m、v | 用 fp32 master 更新，cast 回 bf16 参数 | 多卡：master + m + v 随 optimizer 分片（ZeRO-1），每卡只常驻 2 B/param 的权重 |
+> | | 模型里的参数 | 梯度 | optimizer 里 | B/param | 每步 | 适用 |
+> |:--|:--|:--|:--|--:|:--|:--|
+> | fp32 训练（参照） | fp32 4 | fp32 4 | m、v 8 | 16 | — | — |
+> | **autocast**（本文） | fp32 4 + 临时 bf16 副本 2 | fp32 4 | m、v 8 | 18 | 前向 cast 出 bf16 副本，用完丢 | 单卡、一行代码开；副本进 🟩 A |
+> | **Megatron / DeepSpeed** | **bf16 2（常驻）** | bf16 2（或累加进 fp32 main_grad 4） | **fp32 master 4** + m、v 8 | 16–18 | 用 fp32 master 更新，cast 回 bf16 参数 | 多卡：master + m + v 随 optimizer 分片（ZeRO-1），每卡只常驻 2 B/param 的权重 |
 >
-> 总量都 ~18 B/param，Megatron 布局省的是每步 cast 和分片后每卡的份额——单卡上没差别，多卡上是主流做法。
+> 总量差不多，Megatron 布局省的是每步 cast 和分片后每卡的份额——单卡上没差别，多卡上是主流做法。
 
 ---
 
