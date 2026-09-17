@@ -294,7 +294,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 ![图 2.2-1](assets/s2/peak_moment.png)
 
-**图 2.2-1** 按 M(j) 公式画的一步 fwd_bwd 显存曲线（W/G/A/T 取实测值，标注的 measured 是实测峰值），按 🟦W / 🟩A / 🟥G / 🟨T 堆叠（fp32），虚线为 bf16 autocast
+**图 2.2-1** 一步 fwd_bwd 的显存：色带是按 M(j) 公式画的（W/G/A/T 取实测值，🟦W / 🟩A / 🟥G / 🟨T 堆叠，fp32），虚线是 bf16 autocast 的公式曲线；× 是 hook 在每层前向 / 反向结束时读到的 `memory_allocated()` 实测点，压在公式曲线上
 
 回到作业问的 xl。用 `torch.cuda.memory._record_memory_history` 记一步的分配历史（可拖进 pytorch.org/memory_viz），xl，batch 4。
 
