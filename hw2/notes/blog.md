@@ -12,7 +12,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
    - 原因：第一步要做一批一次性的事——GPU kernel 首次加载进显存、cuBLAS 建句柄、显存池第一次向驱动要内存。这是进程级开销，和模型算得快慢无关，却全记在第一步上；不剔除，比较的就是「谁先启动」而不是「谁算得快」。
    - 做法：先空跑 1 步再计时。计时用 `timeit` + `torch.cuda.synchronize()` 回答「多快」，用 Nsight Systems 看时间线回答「时间花在哪」。
 3. **GPU 时间看的是「张量被搬了几遍」，不是 FLOPs**（§2.1）
-   - 现象：seq 从 256 到 1024，前向里矩阵乘的占比从 82% 掉到 54%，让出的份额全被 attention 里几个几乎不算数的操作吃掉——softmax（hw1 版拆成 5 个 kernel，把 256 MiB 的分数矩阵 S 读写 8 遍）用了 PV 矩阵乘 5.6× 的时间；`/√d` 和 causal mask 各把 S 读写一遍，两个「零 FLOPs」操作加起来抵一次矩阵乘。
+   - 现象：seq 从 256 到 1024，前向里矩阵乘的占比从 82% 掉到 54%，让出的份额全被 attention 里几个几乎不算数的操作吃掉——softmax（hw1 版拆成 5 个 kernel，把 256 MiB 的分数矩阵 S 读写 8 遍）用了 PV 矩阵乘 6× 的时间；`/√d` 和 causal mask 各把 S 读写一遍，两个「零 FLOPs」操作加起来抵一次矩阵乘。
    - 原因：eager 模式每个算子是独立 kernel，都要把整个张量过一遍显存；这些 op 的算术强度（FLOPs / bytes）远低于 5090 的 60，时间 = bytes / 带宽，与 FLOPs 无关；S 是 seq² 大，seq 翻 4 倍它们翻 16 倍，矩阵乘只翻 4 倍。
    - 做法：融合，让 S 少落几次显存（fused softmax、FlashAttention）。
 4. **bf16 混合精度：快 2×、省 20% 显存，代价是归约精度**（§2.3）
