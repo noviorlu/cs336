@@ -206,7 +206,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | PV | 0.5 (2%) | 1.7 (4%) | 5.8 (4%) |
 | 其余（QKVO 投影、RoPE、FFN、RMSNorm、残差加） | 19.8 (88%) | 33.9 (74%) | 65.4 (47%) |
 
-- **(h) 不相称**。QKᵀ 和 PV 的 FLOPs 完全一样，softmax 的 FLOPs 只有它们的零头，但 seq 1024 时 softmax 用了 PV 的 **5.6×** 时间，scores 段 6×。attention 三段合计从 12%（256）涨到 53%（1024），全部增量来自这些几乎不算数的 kernel。为什么，第四步逐 op 算账。
+- **(h) 不相称**。纸面上 QKᵀ 和 PV 的 FLOPs 完全一样（都是 2·b·h·s²·d = 8.6e9），softmax 只有它们的 4%（每元素 ~5 次运算，3.4e8）；实测 seq 1024 时 softmax 32.4 ms 是 PV 5.8 ms 的 **5.6×**，scores 段 35.1 ms 是 6×。三段合计从 6+4+2 = 12%（256）涨到 25+23+4 = 52%（1024），PV 那一行几乎没动，增量全在 scores 和 softmax 这些几乎不算数的 kernel 上。为什么，第四步逐 op 算账。
 
 **第四步：逐 op 的 roofline——为什么**。给每个 op 算两个「至少要多久」：**算力下限** = FLOPs / 1.05e14（5090 fp32 峰值算力，数据瞬间到位也得算这么久）和**带宽下限** = bytes / 1.79e12（显存带宽，算得无限快也得搬这么久）。实际耗时不可能低于两者中大的那个：算力下限大叫 compute-bound，带宽下限大叫 memory-bound。两者之比就是算术强度 I = FLOPs / bytes 与 ridge point 1.05e14 / 1.79e12 ≈ 60 的比较——I < 60 即 memory-bound。下表 medium@1024 一层内各 op：前 4 列纸面算，「实测」是 nsys 里对应 kernel 的 GPU 时间，粗体是该 op 的瓶颈（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
 
