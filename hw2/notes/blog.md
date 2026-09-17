@@ -38,13 +38,15 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | **saved tensors** | 其中 autograd 为反向留下的那部分（PyTorch `saved_tensors_hooks` 看到的就是它们）。作业文档和 JAX 叫 **residuals**，本文不用这个词，以免和 residual connection 混 |
 | **entry** | 一段 checkpoint 的输入 x_i（`[b, s, d]`，80 MiB），checkpoint 唯一保留的东西，反向 recompute 的起点 |
 | **recompute**（重算） | 反向时用 entry 把一段前向重跑一遍 |
-| **L / k** | L = Transformer 层数；k = checkpoint 段数，每段 L/k 层 |
+| **k（§3.2）** | checkpoint 段数，每段 L/k 层——与上面反向计数的 k 不同 |
 | **residual stream**（残差流） | Transformer 里逐层相加的那条 `[batch, seq, d_model]` 主干，与上面的 residuals 无关 |
 | **forward / fwd_bwd / full** | benchmark 的三种模式：纯前向（`no_grad`）/ 前向 + 反向 / 前向 + 反向 + optimizer step |
 | **kernel / op** | kernel = GPU 上执行的一个函数（nsys 看到的单位）；op = PyTorch 的 aten 算子，一个 op 可能发多个 kernel |
 | **matmul / GEMM** | 矩阵乘；GEMM 是 cuBLAS/cutlass 里矩阵乘 kernel 的名字 |
 | **CUDA core / Tensor core** | 一个 SM 里的两种算术单元。CUDA core（SIMT）是标量 FMA，什么都能算，5090 fp32 峰值 1.05e14 FLOPS；Tensor core 只做小矩阵块乘加，只收 fp16 / bf16 / tf32 / fp8 输入，吞吐高一个量级（5090 bf16 2.1e14，H100 上比 CUDA core 高 15×）。纯 fp32 矩阵乘走不了 Tensor core；**tf32** 是把 fp32 尾数截到 10 位后送进 Tensor core 的后门，`allow_tf32=False` 就是关掉它。nsys 里 kernel 名带 `simt` 的走 CUDA core |
 | **FLOPs / FLOPS** | FLOPs = 浮点运算次数（计数，如 8.6e9）；FLOPS = 每秒浮点运算次数（速率，如 1.05e14）。全文用 10 的幂写，不用 G/T 前缀 |
+| **W / G / A / T** | 显存四项（§2.2）：W = 全部权重的大小；G = 全部参数梯度 `.grad` 的大小，= W；A = 前向结束时为反向存的全部 saved tensors；T = 正在算的这一层反向的临时量，算完即释放 |
+| **L / k / M(k)** | L = 层数；k = 反向已走完的层数（0 → L）；M(k) = 此刻活着的显存 = W + G·k/L + A·(L−k)/L + T |
 | **算术强度 I**（arithmetic intensity） | FLOPs / 读写显存的 bytes。低于硬件的 FLOPS / 带宽（5090 fp32 ≈ 60）的 op 受限于带宽，时间 = bytes / 带宽 |
 
 ### 1.2 模型规格
@@ -235,18 +237,6 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 ---
 
 ### 2.2 显存剖析（Memory Profiling）
-
-本节反复用到的记号：
-
-| 符号 | 含义 |
-|:--|:--|
-| L | 模型层数 |
-| k | 反向已走完的层数，0 → L |
-| M(k) | 此刻活着的显存 |
-| W | 全部权重的大小 |
-| G | 全部参数梯度 `.grad` 的大小，= W（`.grad` 与参数同 dtype）；走完 k 层累加了 k/L 份 |
-| A | 前向结束时为反向存的全部 saved tensors；每走完一层释放一层，剩 (L−k)/L |
-| T | 正在算的这一层反向的临时量：`dy`、`dx`、累加前的 `dW`、softmax / SiLU 反向的中间张量，算完即释放；一层的量（§2.2(e) 里 xl ≈ 0.95 GiB 分配即释放，对峰值贡献 ~0.2） |
 
 先像 §2.1(b) 那样把各规格四种模式的峰值列出来（`batch=4, seq=512`，`max_memory_allocated`，预热后清零，`stages_b4_seq512.md`），单位 GiB：
 
