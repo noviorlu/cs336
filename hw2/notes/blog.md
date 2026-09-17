@@ -308,15 +308,11 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 | 2048 | forward（no_grad） | 21.38 | 25.27 |
 | 2048 | fwd_bwd / full | OOM @ forward（25.96） | OOM @ forward（26.78） |
 
-![图 2.2-2](assets/s2/mem_xl_forward_128_vs_2048.png)
+![图 2.2-2](assets/s2/mem_xl_timelines.png)
 
-**图 2.2-2** xl 纯前向的显存时间线：seq 128（上，平）vs seq 2048（下，32 根尖峰）
+**图 2.2-2** xl 实测显存时间线（图 2.2-1 是模型，这是快照）：上 seq 128 纯前向（平）、中 seq 2048 纯前向（32 根尖峰）、下 seq 128 full step（红线为阶段分界，按分配时的 Python 栈判断：有 `optimizer.py` 是 optimizer，没有 Python 帧是 backward）
 
-![图 2.2-3](assets/s2/mem_xl_seq128_full.png)
-
-**图 2.2-3** xl@128 一步 full step 的显存时间线，红线为阶段分界（按分配时的 Python 栈判断：有 `optimizer.py` 是 optimizer，没有 Python 帧是 backward）
-
-- (a) 三个阶段靠**斜率**认（图 2.2-3）：前向 32 级均匀上坡，每层留 166 MiB，12.8 → 18.1；反向继续爬到 25.5，每层释放 166、新分配 410 MiB 梯度（看着缓是因为横轴是事件数）；optimizer 垂直冲到 ~28.6 OOM。纯前向（图 2.2-2）不留东西：seq 128 平；seq 2048 每层一根尖峰，是 attention 的 2 GiB 分数矩阵链上 ~4 份同时活着（12.8 + 4 × 2 ≈ 21.4），`softmax·V` 一算完全释放。
+- (a) 三个阶段靠**斜率**认（图 2.2-2 下）：前向 32 级均匀上坡，每层留 166 MiB，12.8 → 18.1；反向继续爬到 25.5，每层释放 166、新分配 410 MiB 梯度（看着缓是因为横轴是事件数）；optimizer 垂直冲到 ~28.6 OOM。纯前向（图 2.2-2 上、中）不留东西：seq 128 平；seq 2048 每层一根尖峰，是 attention 的 2 GiB 分数矩阵链上 ~4 份同时活着（12.8 + 4 × 2 ≈ 21.4），`softmax·V` 一算完全释放。
 - (b) xl 的 full 任何 seq 都装不下（optimizer 的 2W）；seq 2048 连 fwd_bwd 都过不了前向：12.8 + 已留下的 saved tensors + 当前层 8 GiB 的尖峰，25.96 撞墙——第二篇 FlashAttention 消的就是这根尖峰。
 
 #### (c)(d)(e) 逐 op：一层里谁最大、谁留到反向
@@ -358,9 +354,9 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 seq 128 时留下的大头是 FFN 的 d_ff 宽中间量而不是 attention，和 (d) 一致。反向这一段（用 `emit_nvtx` 的 `seq` 编号把 block5 的反向算子对回来）分配 1203 MiB、释放 954 MiB（含上面 161 MiB 的 saved tensors），净增 249 MiB；反向新产生 = 249 + 161 = **410 MiB**，对上这一层 104.9M 参数的权重梯度 400 MiB + 传给前一层的输入梯度 5 MiB（误差 1%）。这就是 (a) 里反向「不下坡」的原因。
 
-![图 2.2-4](assets/s2/nsys_block5_memory.png)
+![图 2.2-3](assets/s2/nsys_block5_memory.png)
 
-**图 2.2-4** xl@128 block5 前向的 cudaMalloc/cudaFree 与活到 range 结束的分配（红点）。采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`（不关 caching allocator 只能看到显存池的增长），`--nvtx-ops` 打层 range、`emit_nvtx` 打算子 range；地址被复用，分配和释放按「之后的第一次 free」配对。脚本 `python -m benchmark.memory`。
+**图 2.2-3** xl@128 block5 前向的 cudaMalloc/cudaFree 与活到 range 结束的分配（红点）。采法：`PYTORCH_NO_CUDA_MEMORY_CACHING=1` + `nsys --cuda-memory-usage=true`（不关 caching allocator 只能看到显存池的增长），`--nvtx-ops` 打层 range、`emit_nvtx` 打算子 range；地址被复用，分配和释放按「之后的第一次 free」配对。脚本 `python -m benchmark.memory`。
 
 **三张表怎么对**：表 2.2-3 是一层前向**先后**分配过的量（大部分即造即扔，不能加总），表 2.2-4 是其中**留到反向**的，表 2.2-2 是某一刻**同时活着**的峰值。用前两张凑后一张：
 
