@@ -288,11 +288,11 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 ![图 2.2-1](assets/s2/peak_moment.png)
 
-**图 2.2-1** 一步 fwd_bwd 的显存曲线，按 🟦W / 🟩A / 🟥G / 🟨T 堆叠（fp32），虚线为 bf16 autocast：xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上
+**图 2.2-1** 一步 fwd_bwd 的显存曲线，按 🟦W / 🟩A / 🟥G / 🟨T 堆叠（fp32），虚线为 bf16 autocast
 
-三条读法：(1) 带图前向 − W 就是 A，四个规格里 A 都是 W 的 2.5–7 倍，所以带图前向一开就是峰值，fwd_bwd 只多一点临时量；(2) full 比 fwd_bwd 多的恰好是 2W——AdamW 的 m、v 常驻（`.grad` 每步 `set_to_none` 后重建，不与 A 同时在峰值），xl 的 2W = 25.4 光这一项就把 5090 填满，和 §1.4 一致；(3) xl 连带图前向都 OOM，所以下面 xl 的实验只能降到 seq 128。
+对表 2.2-1：带图前向 − W = A，四档都是 W 的 2.5–7 倍，峰值在前向末尾；full 再多 2W 是 AdamW 的 m、v，xl 光这项 25.4 GiB 就填满 5090；xl 连带图前向都 OOM，下面 xl 的实验降到 seq 128。
 
-后面用 `torch.cuda.memory._record_memory_history` 记显存分配历史（拖进 pytorch.org/memory_viz 看时间线），xl，`batch=4`。五问分两步：先看整步的时间线和峰值（a、b），再放大到一层里面谁最大、谁被留到反向（c、d、e）。
+以下用 `torch.cuda.memory._record_memory_history` 记分配历史（可拖进 pytorch.org/memory_viz），xl，batch 4。
 
 #### (a)(b) 整步：时间线与峰值
 
