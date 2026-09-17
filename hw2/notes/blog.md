@@ -267,9 +267,24 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 | fwd_bwd | W + max(A, G) + T | A ≫ G → 和上一列几乎相同（+0.09 的 T） |
 | full | 3W + A（AdamW 的 m、v 各一份 W 常驻，`.grad` 每步 `set_to_none` 后重建；峰值仍在前向末尾） | 4.74 + 8.9 = 13.6 ✓ |
 
+**峰值在哪一刻**。反向从最后一层往前走，走完 k 层时活着的显存：
+
+<p align="center">$M(k) = W + G \cdot k/L + A \cdot (L-k)/L + T$</p>
+
+T 是常数偏移，M(k) 对 k 是直线、斜率 (G − A)/L，峰值必在两端之一，看 **A 和 G 谁大**：
+
+![一步 fwd_bwd 的显存曲线：前向逐层 +A/L，反向逐层 +G/L − A/L；xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上（bf16 曲线见 §2.3）](assets/s2/peak_moment.png)
+
+| | A > G（saved tensors 比一份权重大） | G > A |
+|:--|:--|:--|
+| 反向曲线 | 下坡 | 上坡 |
+| 峰值时刻 | **前向末尾** | **反向末尾** |
+| 峰值 = | W + A | W + G = 2W |
+| 什么时候 | 正常训练：A ∝ token 数 × 层数，喂够 token 就满足 | token 少、模型大：xl 只喂 512 个 token |
+
 三条读法：(1) 四个规格里 A 都远大于 W——batch 4 × seq 512 的 activation 是权重的 2.5–7 倍，所以带图前向一开就是峰值，反向和 optimizer 只加零头；(2) full 比 fwd_bwd 多的恰好是 2W（Adam 状态），xl 的 2W = 25.4 光这一项就把 5090 填满，和 §1.4 的纸面账一致；(3) xl 连带图前向都 OOM，所以下面 xl 的实验只能降到 seq 128。
 
-后面用 `torch.cuda.memory._record_memory_history` 记显存分配历史（拖进 pytorch.org/memory_viz 看时间线），xl，`batch=4`。五问分两步：先看整步的时间线和峰值（a、b），再放大到一层里面谁最大、谁被留到反向（c、d、e）；bf16 列的解释放在 §2.3(d)(e)。
+后面用 `torch.cuda.memory._record_memory_history` 记显存分配历史（拖进 pytorch.org/memory_viz 看时间线），xl，`batch=4`。五问分两步：先看整步的时间线和峰值（a、b），再放大到一层里面谁最大、谁被留到反向（c、d、e）。
 
 #### (a)(b) 整步：时间线与峰值
 
@@ -360,21 +375,7 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 
 **问题**：(d) bf16 autocast 相对 fp32，各规格前向和反向快多少，显存省多少；(e) xl@128 / 2048 开 bf16 后峰值变化多少，为什么趋势不同。
 
-**先说显存的判据**。训练一步的峰值落在哪一刻，决定了 bf16 能不能省出来。反向从最后一层往前走，走完 k 层时的显存（符号见 §2.2 开头的表）：
-
-<p align="center">$M(k) = W + G \cdot k/L + A \cdot (L-k)/L + T$</p>
-
-T 是常数偏移，M(k) 对 k 是直线、斜率 (G − A)/L，峰值必在两端之一，看 **A 和 G 谁大**：
-
-![一步 fwd_bwd 的显存曲线：前向逐层 +A/L，反向逐层 +G/L − A/L；xl@128 反向上坡、small@512 反向下坡，预测峰值与实测对上](assets/s2/peak_moment.png)
-
-| | A > G（saved tensors 比一份权重大） | G > A |
-|:--|:--|:--|
-| 反向曲线 | 下坡 | 上坡 |
-| 峰值时刻 | **前向末尾** | **反向末尾** |
-| 峰值 = | W + A | W + G = 2W |
-| bf16 的影响 | A 减少（矩阵乘的输入输出成 bf16）、多一份 bf16 权重副本（+参数量 × 2 B，也是 saved tensor）——两项相抵 | 此刻 saved tensors 和副本都已释放，bf16 **不改变峰值** |
-| 什么时候 | 正常训练：A ∝ token 数 × 层数，喂够 token 就满足 | token 少、模型大：xl 只喂 512 个 token |
+bf16 改的是 A（矩阵乘相关的 saved tensors 变 16 位，减）和一份 bf16 权重副本（+参数量 × 2 B，也是 saved tensor，加）；W 和 G 不动。按 §2.2 的判据，这两项只有在峰值落在前向末尾（A > G）时才进峰值，G > A 时峰值 = 2W，bf16 不改变峰值。
 
 **(d) small / medium / large @512**（A = 3.4 / 8.8 / 16.4 GiB ≫ G = 0.5 / 1.6 / 3.6，峰值在前向末尾）：
 
