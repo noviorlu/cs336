@@ -280,7 +280,7 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 <p align="center">$M(j) = W + G \cdot j/L + A \cdot (L-j)/L + T$</p>
 
-🟦 W 常驻；🟩 A 前向逐层堆上、反向逐层放掉；🟥 G 反向逐层堆上——`.grad` 在 step 后释放（PyTorch 2.0 默认 `set_to_none=True`），不是常驻底座；🟨 T 常数。M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A；**G > A** 在反向末尾 = 2W。A 和 G 不会同时全在，所以纸面 16 B/param 多算了一个 W（表 1-4 实测 3W + A）。A ∝ token 数，正常训练 A > G；xl 只喂 512 个 token 才翻过去（A 5.3 < G 12.7）。
+🟦 W 常驻；🟩 A 前向逐层堆上、反向逐层放掉；🟥 G 反向逐层堆上——**为什么梯度不是常驻底座**：`.grad` 是反向算到那个参数时才创建的，optimizer step 用完就被 `zero_grad(set_to_none=True)`（PyTorch 2.0 默认）释放，下一步反向再逐层重建，所以它在前向期间不存在、反向期间从 0 长到 W；🟨 T 常数。M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A；**G > A** 在反向末尾 = 2W。A 和 G 不会同时全在，所以纸面 16 B/param 多算了一个 W（表 1-4 实测 3W + A）。A ∝ token 数，正常训练 A > G；xl 只喂 512 个 token 才翻过去（A 5.3 < G 12.7）。
 
 ![图 2.2-1](assets/s2/peak_moment.png)
 
