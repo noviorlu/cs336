@@ -317,8 +317,13 @@ OOM 行括号里是炸掉前的水位（`memory_xl_peak.md`），受碎片和同
 
 **图 2.2-3** xl@128 一步 full step 的显存时间线，红线为 forward / backward / optimizer 分界
 
-- (a) 三个阶段靠**斜率**认，不靠峰：前向是 32 级均匀上坡（每层留一份 saved tensors，12.8 → 18.1 GiB）；反向继续爬到 25.5（每层释放 166 MiB saved tensors、新分配 410 MiB 梯度，净增 244 MiB/层，比前向的 166 更陡；图上看着缓是因为横轴是事件数、反向每层的分配事件是前向的 4 倍，见 (e)）；optimizer 一开始就垂直冲到 ~28.6 GiB OOM（AdamW 分配 m/v）。纯前向（no_grad）不留东西，seq 128 时几乎是平的（12.8 GiB 基线上多 0.08 GiB）；seq 2048 的图却有 32 根尖峰——每层 attention 算到一半时，`[4, 32, 2048, 2048]` 的 2 GiB 分数矩阵有 ~4 份同时活着（`QKᵀ`、`/√d`、`masked_fill`、softmax 的中间量，链式写法里前一份要等下一份算完才释放），12.8 + 4 × 2 ≈ 21.4 GiB 就是峰；`softmax·V` 一算完全部释放，掉回基线。横轴是分配事件序号不是时间，尖峰看着窄，实际 attention 占前向近一半时间（§2.2）。
-- (b) xl 的 full step 在 31.3 GiB 上**任何 seq 都装不下**：卡的不是 activation，是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（权重 + 梯度 + 状态 = 50.8 GiB，§1.4 的「训练静态」）。seq 2048 连 fwd_bwd 都过不了前向：基线 12.8 + 逐层累积的 saved tensors + 每层 8 GiB 的 attention 尖峰，25.96 GiB 时撞墙——第二篇 FlashAttention 消掉的正是这根尖峰。
+- (a) 三个阶段靠**斜率**认（图 2.2-3）：
+  - 前向：32 级均匀上坡，每层留 166 MiB saved tensors，12.8 → 18.1 GiB
+  - 反向：继续爬到 25.5——每层释放 166 MiB、新分配 410 MiB 梯度，净增 244 MiB/层（横轴是事件数、反向每层事件多 4 倍，所以看着缓）
+  - optimizer：垂直冲到 ~28.6 GiB OOM，AdamW 分配 m、v
+
+  纯前向（图 2.2-2）不留东西：seq 128 平，多 0.08 GiB；seq 2048 有 32 根尖峰——每层 attention 的 `[4, 32, 2048, 2048]` 2 GiB 分数矩阵链上 ~4 份同时活着，12.8 + 4 × 2 ≈ 21.4，`softmax·V` 一算完全释放。尖峰看着窄是横轴是事件数，实际 attention 占前向近一半时间（§2.1）。
+- (b) xl 的 full step 任何 seq 都装不下：卡的是 AdamW 第一次 `step()` 要分配 2 × 12.7 GiB 状态（§1.4 的训练静态 50.8 GiB）。seq 2048 连 fwd_bwd 都过不了前向：12.8 + 逐层累积的 saved tensors + 每层 8 GiB 的 attention 尖峰，25.96 GiB 撞墙——第二篇 FlashAttention 消的就是这根尖峰。
 
 > 图从 `--memory-snapshot` 的 pickle 直接画（与 memory_viz 同一份 alloc/free 事件），红线是阶段分界（反向的分配没有 Python 栈、optimizer 的栈里有 `optimizer.py`）；最大分配清单见 `assets/s2/memory_top_allocs.txt`。
 
