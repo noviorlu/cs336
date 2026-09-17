@@ -214,20 +214,20 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 实际耗时 ≥ 两者取大：算力下限大是 **compute-bound**，带宽下限大是 **memory-bound**（等价于算术强度 I = FLOPs / bytes 是否低于 ridge point ≈ 60）。下表 medium@1024 一层内各 op，前 4 列纸面算、「实测」是 nsys 的 kernel GPU 时间、粗体是瓶颈（S 是 `[4,16,1024,1024]`，4·16·1024² = 6.7e7 个元素 × 4 B = 256 MiB）：
 
-| op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 |
-|:--|--:|--:|--:|--:|--:|--:|
-| 普通 Linear 作参照：y = x·Wᵀ（FFN 的 w1，x `[4096 token, 1024]`，W `[4096, 1024]`，y `[4096, 4096]`） | 2·4096·1024·4096 = 3.4e10 | 读 x 4096·1024·4 B = 16 MiB + W 16 MiB，写 y 4096·4096·4 B = 64 MiB，共 96 MiB | 340 | **0.32 ms** | 0.06 ms | ≈ 0.5 ms |
-| S = QKᵀ（Q、K 各 `[64 个 batch×head, 1024, 64]`，S `[64, 1024, 1024]`） | 64·(2·1024·64·1024) = 8.6e9 | 读 Q + K 2·(64·1024·64·4 B) = 32 MiB，写 S 64·1024²·4 B = 256 MiB，共 288 MiB | 28 | 0.08 ms | **0.17 ms** | 0.61 ms |
-| S / √d（S 原地缩放） | 1 × 6.7e7 个元素 = 6.7e7 | 读 S 256 MiB + 写 S 256 MiB = 512 MiB | 0.13 | ~0 | **0.30 ms** | 0.34 ms |
-| masked_fill（causal mask 填 −inf） | 0 | 读 S 256 MiB + 写 S 256 MiB = 512 MiB | 0 | 0 | **0.30 ms** | 0.35 ms |
-| P = softmax(S)（hw1 版 5 个 kernel：max、减 max、exp、sum、除） | 每元素 1 + 1 + 20 + 1 + 4 = 27 次 × 6.7e7 = 1.8e9（exp 走 SFU、按等价吞吐记 20；除 = 倒数 + 牛顿修正记 4） | 5 个 kernel 各读 1–2 遍、写 1 遍 S 大小的张量，合计 8 × 256 MiB = 2 GiB（末次写出的即 P） | 0.85 | 0.02 ms | **1.2 ms** | 1.35 ms |
-| O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 64·(2·1024·1024·64) = 8.6e9 | 读 P 256 MiB + V 64·1024·64·4 B = 8 MiB，写 O 8 MiB，共 272 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms |
+| op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 | 利用率 = 粗体 / 实测 |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| 普通 Linear 作参照：y = x·Wᵀ（FFN 的 w1，x `[4096 token, 1024]`，W `[4096, 1024]`，y `[4096, 4096]`） | 2·4096·1024·4096 = 3.4e10 | 读 x 4096·1024·4 B = 16 MiB + W 16 MiB，写 y 4096·4096·4 B = 64 MiB，共 96 MiB | 340 | **0.32 ms** | 0.06 ms | ≈ 0.5 ms | MFU 64% |
+| S = QKᵀ（Q、K 各 `[64 个 batch×head, 1024, 64]`，S `[64, 1024, 1024]`） | 64·(2·1024·64·1024) = 8.6e9 | 读 Q + K 2·(64·1024·64·4 B) = 32 MiB，写 S 64·1024²·4 B = 256 MiB，共 288 MiB | 28 | 0.08 ms | **0.17 ms** | 0.61 ms | MBU 28% |
+| S / √d（S 原地缩放） | 1 × 6.7e7 个元素 = 6.7e7 | 读 S 256 MiB + 写 S 256 MiB = 512 MiB | 0.13 | ~0 | **0.30 ms** | 0.34 ms | MBU 88% |
+| masked_fill（causal mask 填 −inf） | 0 | 读 S 256 MiB + 写 S 256 MiB = 512 MiB | 0 | 0 | **0.30 ms** | 0.35 ms | MBU 86% |
+| P = softmax(S)（hw1 版 5 个 kernel：max、减 max、exp、sum、除） | 每元素 1 + 1 + 20 + 1 + 4 = 27 次 × 6.7e7 = 1.8e9（exp 走 SFU、按等价吞吐记 20；除 = 倒数 + 牛顿修正记 4） | 5 个 kernel 各读 1–2 遍、写 1 遍 S 大小的张量，合计 8 × 256 MiB = 2 GiB（末次写出的即 P） | 0.85 | 0.02 ms | **1.2 ms** | 1.35 ms | MBU 89% |
+| O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 64·(2·1024·1024·64) = 8.6e9 | 读 P 256 MiB + V 64·1024·64·4 B = 8 MiB，写 O 8 MiB，共 272 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms | MBU 67% |
 
 **怎么算**：矩阵乘 `[M,K]×[K,N]` 的 FLOPs = 2·M·N·K，逐元素 op = 每元素运算次数 × 元素数（S 有 6.7e7 个；exp、除法按硬件等价吞吐分别记 20、4 次）；bytes = 输入各读一遍 + 输出各写一遍，元素数 × 4 B，原地 op 也算读写各一遍。
 
 **怎么读**：
 - 只有 Linear 是 compute-bound；attention 里每个 op 的 I 都在 60 以下，全是 memory-bound——包括两个矩阵乘：输出远大于输入时 GEMM 的 I ≈ K/2，QKᵀ 的 K = d_head = 64，只有 Linear（K = 1024）的 1/16。这是 attention 的定义决定的：S 要落显存就是带宽受限。
-- 实测贴着粗体下限（`/√d`、mask、softmax、PV）= kernel 已到硬件极限，再快只能改下限：减 bytes（融合）或减 FLOPs。QKᵀ 是例外，比下限慢 3.5×——K 经 einsum 转置后非连续，cuBLAS 选了慢的 `magma_sgemmEx`，换 kernel 就能收回。
+- 最后一列是瓶颈资源的利用率：compute-bound 的叫 MFU（实际 FLOPS / 峰值），memory-bound 的叫 MBU（实际带宽 / 峰值）；对 memory-bound 的 op 算 MFU 没有意义（softmax 的 MFU 只有 1.5%，但它本来就不该用算力衡量）。实测贴着粗体下限、利用率 85–90%（`/√d`、mask、softmax；PV 67% 是 tile 重读 V）= kernel 已到硬件极限，再快只能改下限：减 bytes（融合）或减 FLOPs。QKᵀ 是例外，比下限慢 3.5×——K 经 einsum 转置后非连续，cuBLAS 选了慢的 `magma_sgemmEx`，换 kernel 就能收回。
 - 所以时间由「S 被搬了几遍」决定：softmax 5 个 kernel 搬 8 遍最贵；`/√d` 和 mask 各搬 2 遍，两个零 FLOPs 的 op 抵一次矩阵乘。seq 翻 4 倍，这些 op 的 bytes ∝ seq² 翻 16 倍，Linear 只翻 4 倍——attention 占比 12% → 53% 就是这么来的。
 
 **结论**：GPU 时间看的是「张量被搬了几遍」，不是 FLOPs。解法只有融合，让 S 少落几次显存：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
