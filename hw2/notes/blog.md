@@ -197,38 +197,38 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 - **(f) 矩阵乘之外**是 elementwise + reduce，前向占比从 18%（seq 256）涨到 46%（seq 1024）。它们 FLOPs 极少，占时间是因为每个 kernel 都要把张量完整读一遍写一遍，而 attention 的中间张量随 seq² 涨——第三步量化。
 - **(g) 算上 optimizer**，matmul 占比比前向低 15–17 个百分点，让出的份额被 elementwise 吃掉：反向的梯度累加和 AdamW 的更新全是逐元素。small 同样趋势（forward 1024：matmul 51%）。
 
-**第三步：attention 内部**。把 attention 拆三段打 NVTX——scores（QKᵀ、/√d、mask）、softmax、PV——统计每段内 kernel 的 GPU 时间，24 层合计，占整个 forward 的比例：
+**第三步：attention 内部**。把 attention 拆三段——scores（QKᵀ、/√d、mask）、softmax、PV——按 kernel 名把每段的 GPU 时间加起来（24 层合计），占整个 forward 的比例。不能直接用 NVTX 段过滤：range 是 CPU 侧打的，seq 长时 GPU 还在跑上一段的 kernel，CPU 已进入下一段，nsys 会把投影 GEMM、RoPE 算进 scores 段（seq 1024 时多算了 10 ms）。
 
 | medium forward | seq 256 | seq 512 | seq 1024 |
 |:--|--:|--:|--:|
-| scores | 1.3 ms (6%) | 5.2 (11%) | 35.1 (25%) |
-| softmax | 0.9 (4%) | 4.7 (10%) | 32.4 (23%) |
-| PV | 0.5 (2%) | 1.7 (4%) | 5.8 (4%) |
-| 其余（QKVO 投影、RoPE、FFN、RMSNorm、残差加） | 19.8 (88%) | 33.9 (74%) | 65.4 (47%) |
+| scores（QKᵀ + /√d + mask） | 0.9 ms (4%) | 3.6 (8%) | 25.1 (18%) |
+| softmax | 1.0 (4%) | 5.0 (11%) | 34.3 (24%) |
+| PV | 0.4 (2%) | 1.6 (3%) | 5.5 (4%) |
+| 其余（QKVO 投影、RoPE、FFN、RMSNorm、残差加） | 21.1 (90%) | 37.2 (78%) | 76.8 (54%) |
 
-- **(h) 不相称**。拿 attention 里两个独立的 op 比：PV 矩阵乘 FLOPs 8.6e9（2·b·h·s²·d），softmax 1.8e9（每元素 27 次，含 exp 和除法的硬件代价），前者是后者的 **5 倍**；实测 seq 1024 时 PV 5.8 ms、softmax 32.4 ms，前者反而只有后者的 **1/5.6**。FLOPs 多 5 倍的 op 快 5.6 倍——时间和 FLOPs 完全对不上。scores 段（QKᵀ 矩阵乘 + `/√d` + mask）35.1 ms 也是同一回事：QKᵀ 的 FLOPs 和 PV 一样，多出来的时间全是两个逐元素 op。三段合计从 6+4+2 = 12%（256）涨到 25+23+4 = 52%（1024），PV 那一行几乎没动，增量全在这些几乎不算数的 kernel 上。为什么，第四步逐 op 算账。
+- **(h) 不相称**。拿 attention 里两个独立的 op 比：PV 矩阵乘 FLOPs 8.6e9（2·b·h·s²·d），softmax 1.8e9（每元素 27 次，含 exp 和除法的硬件代价），前者是后者的 **5 倍**；实测 seq 1024 时 PV 5.5 ms、softmax 34.3 ms，前者反而只有后者的 **1/6.2**。FLOPs 多 5 倍的 op 快 6 倍——时间和 FLOPs 完全对不上。scores 段 25.1 ms 也是同一回事：QKᵀ 本身 7.1 ms 和 PV 相当，多出的 18 ms 全是 `/√d` 和 mask 两个逐元素 op。三段合计从 4+4+2 = 10%（256）涨到 18+24+4 = 46%（1024），PV 那一行几乎没动，增量全在这些几乎不算数的 kernel 上。为什么，第四步逐 op 算账。
 
 **第四步：逐 op 的 roofline——为什么**。每个 op 有两个「至少要多久」：
 - 算力下限 = FLOPs / 1.05e14（5090 fp32 峰值）
 - 带宽下限 = bytes / 1.79e12（显存带宽）
 
-实际耗时 ≥ 两者取大：算力下限大是 **compute-bound**，带宽下限大是 **memory-bound**（等价于算术强度 I = FLOPs / bytes 是否低于 ridge point ≈ 60）。下表 medium@1024 一层内各 op，前 4 列纸面算、「实测」是 nsys 的 kernel GPU 时间、粗体是瓶颈（S 是 `[4,16,1024,1024]`，4·16·1024² = 6.7e7 个元素 × 4 B = 256 MiB）：
+实际耗时 ≥ 两者取大：算力下限大是 **compute-bound**，带宽下限大是 **memory-bound**（等价于算术强度 I = FLOPs / bytes 是否低于 ridge point ≈ 60）。下表 medium@1024 一层内各 op，前 4 列纸面算、「实测」是 nsys 里对应 kernel 的 GPU 时间（按 kernel 名归因，24 层平均）、粗体是瓶颈（S 是 `[4,16,1024,1024]`，4·16·1024² = 6.7e7 个元素 × 4 B = 256 MiB）：
 
 | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 | 利用率 = 粗体 / 实测 |
 |:--|--:|--:|--:|--:|--:|--:|--:|
 | 普通 Linear 作参照：y = x·Wᵀ（FFN 的 w1，x `[4096 token, 1024]`，W `[4096, 1024]`，y `[4096, 4096]`） | 2·4096·1024·4096 = 3.4e10 | 读 x 4096·1024·4 B = 16 MiB + W 16 MiB，写 y 4096·4096·4 B = 64 MiB，共 96 MiB | 340 | **0.32 ms** | 0.06 ms | ≈ 0.5 ms | MFU 64% |
-| S = QKᵀ（Q、K 各 `[64 个 batch×head, 1024, 64]`，S `[64, 1024, 1024]`） | 64·(2·1024·64·1024) = 8.6e9 | 读 Q + K 2·(64·1024·64·4 B) = 32 MiB，写 S 64·1024²·4 B = 256 MiB，共 288 MiB | 28 | 0.08 ms | **0.17 ms** | 0.61 ms | MBU 28% |
-| S / √d（逐元素缩放，输出新张量） | 1 × 6.7e7 个元素 = 6.7e7 | 读 S 256 MiB + 写 S 256 MiB = 512 MiB | 0.13 | 0.0006 ms | **0.30 ms** | 0.34 ms | MBU 88% |
-| masked_fill（causal mask 填 −inf） | 0 | 读 S 256 MiB + 写 S 256 MiB = 512 MiB | 0 | 0 | **0.30 ms** | 0.35 ms | MBU 86% |
-| P = softmax(S)（hw1 版 5 个 kernel：max、减 max、exp、sum、除） | 每元素 1 + 1 + 20 + 1 + 4 = 27 次 × 6.7e7 = 1.8e9（exp 走 SFU、按等价吞吐记 20；除 = 倒数 + 牛顿修正记 4） | 5 个 kernel 各读 1–2 遍、写 1 遍 S 大小的张量，合计 8 × 256 MiB = 2 GiB（末次写出的即 P） | 0.85 | 0.02 ms | **1.2 ms** | 1.35 ms | MBU 89% |
-| O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 64·(2·1024·1024·64) = 8.6e9 | 读 P 256 MiB + V 64·1024·64·4 B = 8 MiB，写 O 8 MiB，共 272 MiB | 30 | 0.08 ms | **0.16 ms** | 0.24 ms | MBU 67% |
+| S = QKᵀ（Q、K 各 `[64 个 batch×head, 1024, 64]`，S `[64, 1024, 1024]`） | 64·(2·1024·64·1024) = 8.6e9 | 读 Q + K 2·(64·1024·64·4 B) = 32 MiB，写 S 64·1024²·4 B = 256 MiB，共 288 MiB | 28 | 0.08 ms | **0.17 ms** | 0.30 ms | MBU 57% |
+| S / √d（逐元素缩放，输出新张量） | 1 × 6.7e7 个元素 = 6.7e7 | 读 S 256 MiB + 写 S 256 MiB = 512 MiB | 0.13 | 0.0006 ms | **0.30 ms** | 0.35 ms | MBU 86% |
+| masked_fill（causal mask 填 −inf） | 0 | 读 S 256 MiB + 写 S 256 MiB = 512 MiB | 0 | 0 | **0.30 ms** | 0.40 ms | MBU 75% |
+| P = softmax(S)（hw1 版 5 个 kernel：max、减 max、exp、sum、除） | 每元素 1 + 1 + 20 + 1 + 4 = 27 次 × 6.7e7 = 1.8e9（exp 走 SFU、按等价吞吐记 20；除 = 倒数 + 牛顿修正记 4） | 5 个 kernel 各读 1–2 遍、写 1 遍 S 大小的张量，合计 8 × 256 MiB = 2 GiB（末次写出的即 P） | 0.85 | 0.02 ms | **1.2 ms** | 1.43 ms | MBU 84% |
+| O = PV（P `[64, 1024, 1024]`，V `[64, 1024, 64]`，O `[64, 1024, 64]`） | 64·(2·1024·1024·64) = 8.6e9 | 读 P 256 MiB + V 64·1024·64·4 B = 8 MiB，写 O 8 MiB，共 272 MiB | 30 | 0.08 ms | **0.16 ms** | 0.23 ms | MBU 70% |
 
 **怎么算**：矩阵乘 `[M,K]×[K,N]` 的 FLOPs = 2·M·N·K，逐元素 op = 每元素运算次数 × 元素数（S 有 6.7e7 个；exp、除法按硬件等价吞吐分别记 20、4 次）；bytes = 输入各读一遍 + 输出各写一遍，元素数 × 4 B，原地 op 也算读写各一遍。
 
 **怎么读**：
 - 只有 Linear 是 compute-bound；attention 里每个 op 的 I 都在 60 以下，全是 memory-bound——包括两个矩阵乘：输出远大于输入时 GEMM 的 I ≈ K/2，QKᵀ 的 K = d_head = 64，只有 Linear（K = 1024）的 1/16。这是 attention 的定义决定的：S 要落显存就是带宽受限。
-- 最后一列是瓶颈资源的利用率：compute-bound 的叫 MFU（实际 FLOPS / 峰值），memory-bound 的叫 MBU（实际带宽 / 峰值）；对 memory-bound 的 op 算 MFU 没有意义（softmax 的 MFU 只有 1.5%，但它本来就不该用算力衡量）。实测贴着粗体下限、利用率 85–90%（`/√d`、mask、softmax；PV 67% 是 tile 重读 V）= kernel 已到硬件极限，再快只能改下限：减 bytes（融合）或减 FLOPs。QKᵀ 是例外，比下限慢 3.5×——K 经 einsum 转置后非连续，cuBLAS 选了慢的 `magma_sgemmEx`，换 kernel 就能收回。
-- 所以时间由「S 被搬了几遍」决定：softmax 5 个 kernel 搬 8 遍最贵；`/√d` 和 mask 各搬 2 遍，两个零 FLOPs 的 op 抵一次矩阵乘。seq 翻 4 倍，这些 op 的 bytes ∝ seq² 翻 16 倍，Linear 只翻 4 倍——attention 占比 12% → 53% 就是这么来的。
+- 最后一列是瓶颈资源的利用率：compute-bound 的叫 MFU（实际 FLOPS / 峰值），memory-bound 的叫 MBU（实际带宽 / 峰值）；对 memory-bound 的 op 算 MFU 没有意义（softmax 的 MFU 只有 1.5%，但它本来就不该用算力衡量）。实测都贴着粗体下限、利用率 57–86%（逐元素 op 75–86%；两个矩阵乘 57–70%，batched 小矩阵的 tile 效率低些）= kernel 已到硬件极限，再快只能改下限：减 bytes（融合）或减 FLOPs。
+- 所以时间由「S 被搬了几遍」决定：softmax 5 个 kernel 搬 8 遍最贵；`/√d` 和 mask 各搬 2 遍，两个零 FLOPs 的 op 抵一次矩阵乘。seq 翻 4 倍，这些 op 的 bytes ∝ seq² 翻 16 倍，Linear 只翻 4 倍——attention 占比 10% → 46% 就是这么来的。
 
 **结论**：GPU 时间看的是「张量被搬了几遍」，不是 FLOPs。解法只有融合，让 S 少落几次显存：fused softmax 8 遍 → 2 遍，FlashAttention 0 遍（第二篇）。
 
