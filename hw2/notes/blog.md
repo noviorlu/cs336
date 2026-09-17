@@ -208,7 +208,11 @@ attention 项在 seq=512 下只占 2–4%，`6N` 近似成立。
 
 - **(h) 不相称**。拿 attention 里两个独立的 op 比：PV 矩阵乘 FLOPs 8.6e9（2·b·h·s²·d），softmax 3.4e8（每元素 ~5 次运算），前者是后者的 **25 倍**；实测 seq 1024 时 PV 5.8 ms、softmax 32.4 ms，前者反而只有后者的 **1/5.6**。FLOPs 多 25 倍的 op 快 5.6 倍——时间和 FLOPs 完全对不上。scores 段（QKᵀ 矩阵乘 + `/√d` + mask）35.1 ms 也是同一回事：QKᵀ 的 FLOPs 和 PV 一样，多出来的时间全是两个逐元素 op。三段合计从 6+4+2 = 12%（256）涨到 25+23+4 = 52%（1024），PV 那一行几乎没动，增量全在这些几乎不算数的 kernel 上。为什么，第四步逐 op 算账。
 
-**第四步：逐 op 的 roofline——为什么**。给每个 op 算两个「至少要多久」：**算力下限** = FLOPs / 1.05e14（5090 fp32 峰值算力，数据瞬间到位也得算这么久）和**带宽下限** = bytes / 1.79e12（显存带宽，算得无限快也得搬这么久）。实际耗时不可能低于两者中大的那个：算力下限大叫 compute-bound，带宽下限大叫 memory-bound。两者之比就是算术强度 I = FLOPs / bytes 与 ridge point 1.05e14 / 1.79e12 ≈ 60 的比较——I < 60 即 memory-bound。下表 medium@1024 一层内各 op：前 4 列纸面算，「实测」是 nsys 里对应 kernel 的 GPU 时间，粗体是该 op 的瓶颈（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
+**第四步：逐 op 的 roofline——为什么**。每个 op 有两个「至少要多久」：
+- 算力下限 = FLOPs / 1.05e14（5090 fp32 峰值）
+- 带宽下限 = bytes / 1.79e12（显存带宽）
+
+实际耗时 ≥ 两者取大：算力下限大是 **compute-bound**，带宽下限大是 **memory-bound**（等价于算术强度 I = FLOPs / bytes 是否低于 ridge point ≈ 60）。下表 medium@1024 一层内各 op，前 4 列纸面算、「实测」是 nsys 的 kernel GPU 时间、粗体是瓶颈（S 是 `[4,16,1024,1024]` fp32 = 256 MiB）：
 
 | op（形状，每行 = 一层内一次调用） | FLOPs | 读写 bytes | I | 算力下限 FLOPs/P | 带宽下限 bytes/B | 实测 |
 |:--|--:|--:|--:|--:|--:|--:|
