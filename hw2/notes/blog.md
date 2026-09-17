@@ -414,9 +414,7 @@ M(j) 是直线，峰值在两端之一：**A > G** 峰值在前向末尾 = W + A
 
 ### 3.1 autograd 为反向存了什么（Autograd Residuals）
 
-**问题**：autograd 到底为反向存了哪些张量？先用最小的例子 RMSNorm 看清楚，再看 `torch.compile` 融合后有什么变化。
-
-§2.2(e) 是按 malloc 归因的「粗账」。要看每个 op 到底为反向存了什么，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。以纯 fp32 的 RMSNorm 为例（`x: [4,512,2560]`）：
+**🟩 A 到底由哪些张量组成？** §2.2(e) 按 malloc 归因是粗账；要精确到每个 op，用 `torch.autograd.graph.saved_tensors_hooks` 在 pack/unpack 时打印。先用最小的例子 RMSNorm（纯 fp32，`x: [4,512,2560]`）看清规则，再看 `torch.compile` 融合后有什么变化。
 
 $\mathrm{RMSNorm}(x)_i = w_i \cdot \frac{x_i}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}}$，拆成 5 个 op：
 $\underbrace{r = \big(\underbrace{\tfrac{1}{d}\textstyle\sum_j \underbrace{x_j^2}_{①}}_{②} + \epsilon\big)^{-1/2}}_{③}$，$\underbrace{\hat{x} = x \cdot r}_{④}$，$\underbrace{y = w \odot \hat{x}}_{⑤}$
@@ -427,7 +425,7 @@ x_hat = x * rms                                             # ④ mul
 y = weight * x_hat                                          # ⑤ mul
 ```
 
-`saved_tensors_hooks` 在 pack/unpack 时打印（完整输出 `assets/s3/rmsnorm_saved_tensors.txt`）：
+pack/unpack 打印（完整输出 `assets/s3/rmsnorm_saved_tensors.txt`）：
 
 ```
 Saving  1  [4,512,2560]  grad_fn=None            ptr=…9040
@@ -509,7 +507,7 @@ flowchart LR
 
 #### 算子融合（Operator Fusion）
 
-回看表格：$\partial\hat{x}/\partial x$ 只用到 $r$ 和 $\hat{x}$，而 $\hat{x}=x\cdot r$ 是一次逐元素乘——反向手里有 $x$ 和 $r$ 就能当场算回 $\hat{x}$，不必存那 20 MiB。逐算子写法做不到，因为 ⑤ 的 MulBackward 只知道「我要 $\hat{x}$」，不知道它是 $x\cdot r$ 来的。`torch.compile(RMSNorm(...))` 把 ①–⑤ 追踪成一张图，AOTAutograd 生成一个前向 kernel、一个反向 kernel，并在「存」和「重算」之间选便宜的：
+**`torch.compile` 融合后存的东西有什么变化？** 回看表 3.1-1：$\partial\hat{x}/\partial x$ 只用到 $r$ 和 $\hat{x}$，而 $\hat{x}=x\cdot r$ 是一次逐元素乘——反向手里有 $x$ 和 $r$ 就能当场算回 $\hat{x}$，不必存那 20 MiB。逐算子写法做不到，因为 ⑤ 的 MulBackward 只知道「我要 $\hat{x}$」，不知道它是 $x\cdot r$ 来的。`torch.compile(RMSNorm(...))` 把 ①–⑤ 追踪成一张图，AOTAutograd 生成一个前向 kernel、一个反向 kernel，并在「存」和「重算」之间选便宜的：
 
 ```
 Saving  1  [4,512,2560]  grad_fn=None  ptr=…3c80   # x
@@ -565,17 +563,13 @@ x̂ = x·r 现场重算
     linkStyle 7 stroke:#6a1b9a,stroke-width:2px
 ```
 
-额外显存从 $r+\hat{x}$ ≈ 20 MiB 降到 $r$ ≈ 8 KiB，代价是反向多一次 $x\cdot r$。
-
-原始输出见 `assets/s3/rmsnorm_saved_tensors.txt`。
+额外显存从 $r+\hat{x}$ ≈ 20 MiB 降到 $r$ ≈ 8 KiB，代价是反向多一次 $x\cdot r$——「融合 = 用重算换显存」在单个算子层面就成立，§3.2 的 checkpoint 是把同一件事放大到整层。
 
 ### 3.2 激活检查点（Activation Checkpointing）
 
-**问题**：融合之后一层 Transformer block 还要为反向存多少；`torch.utils.checkpoint` 怎么用时间换显存。作业题 `gradient_checkpointing`：(a) 忽略算力，峰值显存最小的 checkpoint 策略是什么，渐近显存和计算各多少；(b) 只允许重算一次（不嵌套），xl@2048 batch 4 最优的段长是多少，实测验证并比较相邻段长。
+checkpoint 只动 🟩 A，🟦 W、🟥 G 不变。先看融合之后一层还剩多少 A 动不了：
 
-xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，为反向存的仍有 **3655 MiB**（作业文档给的参考值 3651，多 4 MiB 是我们的实现显式传入的 mask）。剩下的全是矩阵乘的输入，融合动不了：
-
-**表 3.2-1** xl 一层 block（compile 后）为反向存的 3655 MiB 构成
+**表 3.2-1** xl 一层 block（`torch.compile(fullgraph=True)` 后）为反向存的 3655 MiB 构成（作业题指定 16 头，S/P 各 1 GiB；§2.2 的完整 xl 是 32 头、各 2 GiB）
 
 | 大小 (MiB) | 张量 | 占比 |
 |--:|:--|--:|
@@ -584,11 +578,7 @@ xl 一层 TransformerBlock 用 `torch.compile(fullgraph=True)` 融到极限，�
 | 80 ×8 | `[b,s,d]` 级：x、ln1(x)、ln2(x)、Q、K、V、attn 输出、x 转置 | 17% |
 | ~7 | mask、RoPE cos/sin、softmax 统计量、rms | 0.2% |
 
-> shape 和总量是 `saved_tensors_hooks` 实测，MiB 按 shape × 4 B 算，「是什么」按 shape 唯一性反推。
-
-32 层 = 114 GiB，xl@2048 fp32 光 saved tensors 就装不下。attention 那 2 GiB 靠 §4 FlashAttention，其余靠 checkpointing。
-
-checkpointing 是用计算换显存。x 轴：反向峰值时活着的 saved tensors；y 轴：一步要算几遍前向（xl@2048 batch 4，L = 32）：
+**融合之后一层还要为反向存多少？** 3655 MiB（作业参考值 3651，多 4 MiB 是我们显式传入的 mask；shape 和总量是 `saved_tensors_hooks` 实测，MiB 按 shape × 4 B 算），全是矩阵乘的输入，融合动不了。32 层 = 114 GiB，xl@2048 fp32 光 🟩 A 就装不下。attention 那 2 GiB 靠第二篇 FlashAttention，其余靠 checkpointing——用计算换显存。x 轴：反向峰值时活着的 saved tensors；y 轴：一步要算几遍前向（xl@2048 batch 4，L = 32）：
 
 ![图 3.2-1](assets/s3/checkpoint_tradeoff.png)
 
@@ -596,11 +586,11 @@ checkpointing 是用计算换显存。x 轴：反向峰值时活着的 saved ten
 
 - **y = 2× 那一排**：平切成 k 段。每层恰好被重算一次，所以总前向恒为 2×；k 只决定同时物化几层，从 k = 1（114 GiB）到 k = L（6.1 GiB）单调下降——entry 太便宜，没有 U 形。(b) 问的就是这一排。
 - **往左上**：嵌套 checkpoint。一层的 saved tensors（3.6 GiB，红虚线）是底线，减的只是 entry，计算从 2× 涨到 6×。(a) 的答案在左上角。
-- 实践停在 k = L，或者用选择性重算（只丢 S、P 这类大而便宜的张量，前向 +5%）。要压底线本身靠 §4 FlashAttention。
+- 实践停在 k = L，或者用选择性重算（只丢 S、P 这类大而便宜的张量，前向 +5%）。要压底线本身靠第二篇 FlashAttention。
 
 #### 重算（Recomputation）
 
-`checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入（entry），反向到这段时重跑一遍前向造出 saved tensors，用完释放。4 层 xl block 实测：
+**`torch.utils.checkpoint` 怎么用时间换显存？** `checkpoint(fn, x)` 是**推迟**不是压缩：前向只留 `fn` 的输入（entry），反向到这段时重跑一遍前向造出 saved tensors，用完释放。4 层 xl block 实测：
 
 **表 3.2-2** 4 层 block 有无 checkpoint 的峰值构成（MiB）
 
@@ -688,7 +678,7 @@ flowchart LR
 
 #### (a) 递归检查点（Recursive Checkpointing）：忽略算力时的最优策略
 
-峰值 = 一层的 saved tensors + 活着的 entry。前者最少 1 层，每层一个 checkpoint 已做到；后者要存 x0…x_{L-1}，O(L)。**entry 也是 activation，也能被 checkpoint 掉**：一段层外面再包一层 `checkpoint`，段内的 entry 就不存，反向到这段时重算。一路对半包到底就是一棵二叉树——节点 = 一次 `checkpoint` 调用、留自己的 entry；叶子 = 层：
+**(a) 忽略算力，峰值显存最小的 checkpoint 策略是什么，渐近显存和计算各多少？** 峰值 = 一层的 saved tensors + 活着的 entry。前者最少 1 层，每层一个 checkpoint 已做到；后者要存 x0…x_{L-1}，O(L)。**entry 也是 activation，也能被 checkpoint 掉**：一段层外面再包一层 `checkpoint`，段内的 entry 就不存，反向到这段时重算。一路对半包到底就是一棵二叉树——节点 = 一次 `checkpoint` 调用、留自己的 entry；叶子 = 层：
 
 ```mermaid
 flowchart TD
@@ -801,7 +791,7 @@ def ckpt(layers, x):
 
 #### (b) 只允许重算一次：最优段长
 
-不嵌套只能平切 k 段，峰值 = k × entry + (L/k) × 一层 saved tensors。xl@2048 是 k × 80 + (32/k) × 3655 MiB，两项相等要 k ≈ 38 > 32——entry 比一层 saved tensors 小 45 倍，所以切到最细（每层一个）最优，没有中间的平衡点。
+**(b) 只允许重算一次（不嵌套），xl@2048 batch 4 最优的段长是多少？实测验证并比较相邻段长。** 不嵌套只能平切 k 段，峰值 = k × entry + (L/k) × 一层 saved tensors。xl@2048 是 k × 80 + (32/k) × 3655 MiB，两项相等要 k ≈ 38 > 32——entry 比一层 saved tensors 小 45 倍，所以切到最细（每层一个）最优，没有中间的平衡点。
 
 (b) 指定的 xl@2048 batch 4 在 5090 上量不了：参数+梯度 25.4 GiB，任何段长都 OOM。用 large（36 层，参数+梯度 7.2 GiB）测：batch 4 / seq 2048 只有每段 ≤ 4 层能跑（15.4 / 18.9 / 22.5 / 26.1 GiB，每多 1 层 +3.6 GiB），要让全部段长含「不 checkpoint」都出数，降到 batch 1 / seq 1024，fwd_bwd：
 
@@ -830,6 +820,4 @@ e 越小第二项越小，但 entry 数 L/e 越多。只要 **全部 entry 加�
 
 **怎么选**：段长永远是 1，真正的旋钮是「包几层」。计算代价 ∝ 包的层数 N，显存节省 ∝ N × 单层 saved，线性可调——按显存缺口取最小的 N，不必全包。顺序：不 checkpoint → FlashAttention / 选择性重算（几乎免费）→ 包 N 层（e = 1）→ 全包（2× 前向）。Megatron 的 `--recompute-method block --recompute-num-layers N` 就是第三步。
 
-> 原始输出 `assets/s3/checkpoint_large_b1_seq1024.md`（含逐步耗时）、`checkpoint_large_b4_seq2048.md`。eager 模式，一层 saved tensors 比 §3.2 开头 compile 后的账多出 RMSNorm、SiLU 的中间量。
-
-> 原始输出 `assets/s3/four_blocks_checkpoint.txt`，实验在 `notes/notes.ipynb` §3.2。
+> 原始输出：`assets/s3/checkpoint_large_b1_seq1024.md`（含逐步耗时）、`checkpoint_large_b4_seq2048.md`、`four_blocks_checkpoint.txt`；实验在 `notes/blog.ipynb` §3.2。扫描是 eager 模式，一层 saved tensors 比表 3.2-1 compile 后的账多出 RMSNorm、SiLU 的中间量。
