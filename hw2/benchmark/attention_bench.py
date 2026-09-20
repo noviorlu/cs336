@@ -6,11 +6,11 @@
 对一个 (d, seq) 点，按作业 (iii)–(vi) 的顺序做：
     1. 造随机 Q/K/V
     2. 预热：完整跑几次 前向+反向
-    3. 计时 100 次前向
+    3. 计时 100 次前向（**建图**，和 (v) 量显存的那次前向同一口径）
     4. 跑一次前向、停在反向前，记 memory_allocated()
     5. 计时 100 次反向（每次先重新前向，只计 backward 那一段）
     每次前向/反向后 torch.cuda.synchronize()
-OOM 不抛出，记在 status 里。
+OOM 不抛出，记在 status 里（OOM@<阶段>）。
 """
 import itertools
 import json
@@ -28,18 +28,20 @@ class AttnResult:
     fwd_ms: float | None = None            # 每次前向平均 ms
     bwd_ms: float | None = None            # 每次反向平均 ms
     mem_before_bwd_gib: float | None = None  # 前向结束、反向开始前的 memory_allocated()
-    status: str = "ok"                     # ok / OOM@forward / OOM@backward
+    status: str = "ok"                     # ok / OOM@{alloc,warmup,forward,mem,backward}
 
 
 def bench_attention(attn, d: int, seq: int, *, batch: int = 8, warmup: int = 5, steps: int = 100,
                     dtype=torch.float32) -> AttnResult:
     res = AttnResult(d, seq)
+    stage = "alloc"          # 出错时用来标 OOM 发生在哪一步
     torch.cuda.empty_cache()
     try:
         # 1. 随机输入，requires_grad 才有反向
         Q = torch.randn(batch, seq, d, device="cuda", dtype=dtype, requires_grad=True)
         K = torch.randn(batch, seq, d, device="cuda", dtype=dtype, requires_grad=True)
         V = torch.randn(batch, seq, d, device="cuda", dtype=dtype, requires_grad=True)
+        stage = "warmup"
 
         # 2. 预热：前向和反向用的是不同的 kernel，两边都要跑到；compile/triton 版的 JIT 也在这里发生
         for _ in range(warmup):
@@ -49,21 +51,26 @@ def bench_attention(attn, d: int, seq: int, *, batch: int = 8, warmup: int = 5, 
         # 不清掉会被算进下面第 4 步的「反向前显存」，手算就对不上了
         Q.grad = K.grad = V.grad = None
 
-        # 3. 前向计时。no_grad：不建图、不存 saved tensors，只量前向 kernel
-        with torch.no_grad():
-            t0 = timeit.default_timer()
-            for _ in range(steps):
-                attn(Q, K, V)
-                torch.cuda.synchronize()
-            res.fwd_ms = (timeit.default_timer() - t0) / steps * 1e3
+        # 3. 前向计时。建图跑——(iv) 的前向就是 (v) 反向前的那一次，
+        #    no_grad 会少写两份 [b,s,s] 的 saved tensors，量出来的不是同一件事。
+        #    每次循环 del O 放掉上一张图，否则显存里同时有两份
+        stage = "forward"
+        t0 = timeit.default_timer()
+        for _ in range(steps):
+            O = attn(Q, K, V)
+            torch.cuda.synchronize()
+            del O
+        res.fwd_ms = (timeit.default_timer() - t0) / steps * 1e3
 
-        # 4. 反向前显存：带图跑一次前向，此时 S/P 等 saved tensors 都在显存里
+        # 4. 反向前显存：带图跑一次前向，此时 saved tensors 都在显存里
+        stage = "mem"
         O = attn(Q, K, V)
         torch.cuda.synchronize()
         res.mem_before_bwd_gib = torch.cuda.memory_allocated() / 1024**3
         del O
 
         # 5. 反向计时。backward 需要一张新图，所以每次都要重新前向；只把 backward 那段计进去
+        stage = "backward"
         total = 0.0
         for _ in range(steps):
             O = attn(Q, K, V)
@@ -74,8 +81,11 @@ def bench_attention(attn, d: int, seq: int, *, batch: int = 8, warmup: int = 5, 
             total += timeit.default_timer() - t0
         res.bwd_ms = total / steps * 1e3
 
-    except torch.cuda.OutOfMemoryError:
-        res.status = "OOM@forward" if res.fwd_ms is None else "OOM@backward"
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        # 有些路径抛的是消息里带 "out of memory" 的普通 RuntimeError，漏了会让整个 sweep 崩掉
+        if not isinstance(e, torch.cuda.OutOfMemoryError) and "out of memory" not in str(e):
+            raise
+        res.status = f"OOM@{stage}"   # 炸在哪一步由 stage 记着，不靠猜
     finally:
         # 释放本点的张量，避免 OOM 后残留影响下一个点
         Q = K = V = O = None

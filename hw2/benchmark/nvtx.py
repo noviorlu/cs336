@@ -96,25 +96,33 @@ class Probes:
 _ACTIVE: Probes | None = None
 
 
-def _annotated_sdpa(q, k, v, mask=None):
-    """与 cs336_basics.model.scaled_dot_product_attention 逐行等价，多三段 phase（§2.2 (e)）。
+def make_annotated_sdpa(phase):
+    """按段包起来的 sdpa：`phase(name)` 给什么上下文就用什么。
 
-    每段结尾带 synchronize —— (e) 问的是各段各占多久，只有同步过的 range 宽度才等于
-    GPU 耗时；代价是把 attention 内部串行化了，所以默认不开。
+    与 cs336_basics.model.scaled_dot_product_attention 逐行等价，只是多三段 range（§2.2 (e)）。
+    §2.2 传 Probes.phase（NVTX range + synchronize）；§4 的微基准可以传自己的计时器，
+    被测函数只有这一份，两边不会各写一遍而悄悄跑偏。
     注意 mask 语义跟着原函数走：masked_fill 屏蔽的是 mask 为 True 的位置。
     """
-    p = _ACTIVE
-    d_k = q.shape[-1]
+    def annotated_sdpa(q, k, v, mask=None):
+        d_k = q.shape[-1]
 
-    with p.phase("attn.scores"):
-        QK = einsum(q, k, "... queries d_k, ... keys d_k -> ... queries keys") / math.sqrt(d_k)
-        if mask is not None:
-            QK = QK.masked_fill(mask, float("-inf"))
+        with phase("attn.scores"):
+            QK = einsum(q, k, "... queries d_k, ... keys d_k -> ... queries keys") / math.sqrt(d_k)
+            if mask is not None:
+                QK = QK.masked_fill(mask, float("-inf"))
 
-    with p.phase("attn.softmax"):
-        softQK = softmax(QK, dim=-1)
+        with phase("attn.softmax"):
+            softQK = softmax(QK, dim=-1)
 
-    with p.phase("attn.matmul"):
-        out = einsum(softQK, v, "... queries keys, ... keys d_v -> ... queries d_v")
+        with phase("attn.matmul"):
+            out = einsum(softQK, v, "... queries keys, ... keys d_v -> ... queries d_v")
 
-    return out
+        return out
+
+    return annotated_sdpa
+
+
+# §2.2 的那一份：每段结尾带 synchronize —— (e) 问的是各段各占多久，只有同步过的 range
+# 宽度才等于 GPU 耗时；代价是把 attention 内部串行化了，所以默认不开。
+_annotated_sdpa = make_annotated_sdpa(lambda name: _ACTIVE.phase(name))
