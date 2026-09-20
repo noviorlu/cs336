@@ -2,6 +2,7 @@
 
     config.py    模型规格、sweep 定义、BenchConfig / BenchResult（纯数据，不 import torch）
     model_bench.py  整模型计时核心：run_model(cfg) → BenchResult
+    attention_bench.py  §4 attention 微基准：bench_attention / attention_sweep
     nvtx.py      NVTX 探针（Probes），只服务 nsys profile；关掉时 model_bench 感知不到它
     memory.py    显存快照（record_snapshot），只服务 §2.5 memory_viz；同上
     sweep.py     批量跑、--isolate 子进程、markdown/json 落盘
@@ -14,7 +15,8 @@
 """
 from .config import MODEL_SIZES, SWEEP_CONFIGS, BenchConfig, BenchResult, parse_sweep_config
 from .model_bench import run_model
+from .attention_bench import D_MODELS, SEQ_LENS, AttnResult, bench_attention, attention_sweep
 from .sweep import run_config, sweep
 from .nsys_run import nsys_profile, nsys_stats, snapshot
 
-__all__ = ["MODEL_SIZES", "SWEEP_CONFIGS", "BenchConfig", "BenchResult", "parse_sweep_config", "run_model", "sweep", "run_config", "nsys_profile", "nsys_stats", "snapshot"]
+__all__ = ["MODEL_SIZES", "SWEEP_CONFIGS", "BenchConfig", "BenchResult", "parse_sweep_config", "run_model", "D_MODELS", "SEQ_LENS", "AttnResult", "bench_attention", "attention_sweep", "sweep", "run_config", "nsys_profile", "nsys_stats", "snapshot"]

@@ -48,6 +48,9 @@ def bench_attention(attn, d: int, seq: int, *, batch: int = 8, warmup: int = 5, 
         for _ in range(warmup):
             attn(Q, K, V).sum().backward()
         torch.cuda.synchronize()
+        # 预热的 backward 在 Q/K/V 上留下了 .grad（3 份和输入同大的张量），
+        # 不清掉会被算进下面第 4 步的「反向前显存」，手算就对不上了
+        Q.grad = K.grad = V.grad = None
 
         # 3. 前向计时。no_grad：不建图、不存 saved tensors，只量前向 kernel
         with torch.no_grad():
