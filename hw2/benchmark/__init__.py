@@ -15,8 +15,8 @@
 """
 from .config import MODEL_SIZES, SWEEP_CONFIGS, BenchConfig, BenchResult, parse_sweep_config
 from .model_bench import run_model
-from .attention_bench import D_MODELS, SEQ_LENS, AttnResult, bench_attention, attention_sweep
+from .attention_bench import AttnResult, bench_attention, attention_sweep
 from .sweep import run_config, sweep
 from .nsys_run import nsys_profile, nsys_stats, snapshot
 
-__all__ = ["MODEL_SIZES", "SWEEP_CONFIGS", "BenchConfig", "BenchResult", "parse_sweep_config", "run_model", "D_MODELS", "SEQ_LENS", "AttnResult", "bench_attention", "attention_sweep", "sweep", "run_config", "nsys_profile", "nsys_stats", "snapshot"]
+__all__ = ["MODEL_SIZES", "SWEEP_CONFIGS", "BenchConfig", "BenchResult", "parse_sweep_config", "run_model", "AttnResult", "bench_attention", "attention_sweep", "sweep", "run_config", "nsys_profile", "nsys_stats", "snapshot"]

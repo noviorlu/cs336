@@ -53,6 +53,8 @@ line-length = 180
 [tool.ruff.lint.extend-per-file-ignores]
 # Also ignore `E402` in all `__init__.py` files.
 "__init__.py" = ["E402", "F401", "F403", "E501"]
+# O 是 attention 的输出，沿用论文记号
+"benchmark/attention_bench.py" = ["E741"]
 
 [tool.ruff.lint]
 extend-select = ["UP"]

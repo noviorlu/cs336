@@ -20,9 +20,6 @@ from dataclasses import asdict, dataclass
 import pandas as pd
 import torch
 
-D_MODELS = [16, 32, 64, 128]
-SEQ_LENS = [256, 1024, 4096, 8192, 16384]
-
 
 @dataclass
 class AttnResult:
@@ -86,8 +83,10 @@ def bench_attention(attn, d: int, seq: int, *, batch: int = 8, warmup: int = 5, 
     return res
 
 
-def attention_sweep(attn, out_path: str | None = None, *, ds=D_MODELS, seqs=SEQ_LENS, **kw) -> pd.DataFrame:
-    """扫 ds × seqs 全部组合，返回 DataFrame；给 out_path（.md）时同时落 .md 和 .json。"""
+def attention_sweep(attn, ds, seqs, out_path: str | None = None, **kw) -> pd.DataFrame:
+    """扫 ds × seqs 全部组合，返回 DataFrame；给 out_path（.md）时同时落 .md 和 .json。
+
+    网格（ds / seqs）由调用方给，不写死在这里——notebook 里看得见的才是实验输入。"""
     grid = list(itertools.product(ds, seqs))
     rows = []
     for i, (d, s) in enumerate(grid, 1):
