@@ -13,7 +13,11 @@ def pivot_tables(df):
     ok = df.status == "ok"
     t = df.assign(cell=[f"{f:.2f} / {b:.2f}" if o else "OOM" for f, b, o in zip(df.fwd_ms, df.bwd_ms, ok)])
     t1 = t.pivot(index="d", columns="seq", values="cell")
-    m = df.assign(cell=[f"{v:.3f}" if o else "OOM" for v, o in zip(df.mem_before_bwd_gib, ok)])
+    # OOM 格给个「本该是多少」：留给反向的 2 份 [8,s,s] + Q/K/V/O + 16 MiB cuBLAS workspace。
+    # 它比 31.3 GiB 小得多——OOM 不是这一刻撞的，是前向途中 4 份同时活着那一刻（表 4.1-3）
+    est = lambda d, s: (2 * 8 * s * s * 4 + 4 * 8 * s * d * 4 + 16 * 2**20) / GiB
+    m = df.assign(cell=[f"{v:.3f}" if o else f"OOM（估 {est(d, s):.2f}）"
+                        for v, o, d, s in zip(df.mem_before_bwd_gib, ok, df.d, df.seq)])
     t2 = m.pivot(index="d", columns="seq", values="cell")
     return t1, t2
 
