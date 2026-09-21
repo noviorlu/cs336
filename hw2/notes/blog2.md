@@ -37,9 +37,9 @@ Roofline 回答「这段代码在这块卡上最快能跑多快」，用来判�
 
 ## 4.1 朴素 attention 的基准（PyTorch Attention Benchmarking）
 
-被测的是 hw1 的 `scaled_dot_product_attention(Q, K, V)`（`S = QKᵀ/√d → softmax → PV`，softmax 是手写的四步版），输入 `[8, seq, d]`——batch 固定 8、**没有 head 维**。每个 (d, seq) 格子：预热 5 步，100 次带图前向计时，带图前向停在反向前读 `memory_allocated()`，再 100 次反向计时（每次重新前向，秒表只夹 `backward()`）；每次前向/反向后 `synchronize()`。脚本 `benchmark/attention_bench.py`，notebook `blog2.ipynb` §4.1。
+被测的是 hw1 的 `scaled_dot_product_attention(Q, K, V)`：`S = QKᵀ/√d → P = softmax(S) → O = PV`。输入 `[8, seq, d]`，batch 固定 8、没有 head 维；fp32；每格预热 5 步，100 次前向、100 次反向各取均值，每次后 `synchronize()`。脚本 `benchmark/attention_bench.py`，notebook `blog2.ipynb` §4.1。
 
-**表 4.1-1** 前向 / 反向每次耗时（ms，fp32，100 次均值；OOM 格为炸在预热那一步）
+**表 4.1-1** 前向 / 反向每次耗时（ms）
 
 |   d | 256         | 1024        | 4096         | 8192          | 16384   |
 |----:|:------------|:------------|:-------------|:--------------|:--------|
@@ -48,36 +48,22 @@ Roofline 回答「这段代码在这块卡上最快能跑多快」，用来判�
 |  64 | 0.07 / 0.20 | 0.17 / 0.51 | 4.69 / 11.80 | 19.24 / 46.64 | OOM     |
 | 128 | 0.07 / 0.23 | 0.26 / 0.68 | 6.00 / 14.03 | 24.08 / 55.08 | OOM     |
 
-**表 4.1-2** d=16 的三条显存线（GiB，`memory_allocated()` / `max_memory_allocated()`；其余 d 只多 Q/K/V/O，≤ 3%。OOM 格括号里按「几份 `[8,s,s]`」估：反向前 2 份、前向峰值 4 份、全程 6 份）
+**主线只有一句：一切随 seq² 走，和 d 无关。** seq 翻倍，时间 ×4；d 翻 8 倍，时间只 ×1.2。seq 16384 四个 d 一起 OOM，连 d=16 都不例外。
 
-|                      |   256 |   1024 |   4096 |   8192 | 16384       |
-|:---------------------|------:|-------:|-------:|-------:|:------------|
-| 反向前 memory_allocated | 0.020 |  0.080 |  1.024 |  4.032 | OOM（估 16.0） |
-| 前向峰值                 | 0.024 |  0.142 |  2.022 |  8.029 | OOM（估 32.0） |
-| 前向+反向峰值              | 0.028 |  0.207 |  3.030 | 12.044 | OOM（估 48.0） |
+原因是中间量 S 和 P 的形状是 `[8, seq, seq]`——里面没有 d。fp32 下一份 = `seq² × 32 B`：seq 8192 是 2 GiB，16384 是 8 GiB。一次前向+反向里同时活着几份，决定了峰值：
 
-两张表一起读：d 从 16 到 128 翻 8 倍，时间只涨 1.2 倍、显存只涨 3%；seq 翻 2 倍，时间和显存都涨 4 倍。**决定一切的是 seq，不是 d**。
+**表 4.1-2** d=16 同时活着的 `[8, seq, seq]` 份数与显存（GiB；seq 8192 实测，16384 按 ×4 外推）
 
-表 4.1-2 三条线扣掉 16 MiB 的 cuBLAS workspace 后，比例是 2 : 4 : 6 份 `[8,s,s]`（seq 256 时一份才 2 MiB，被 workspace 盖住；seq ≥ 4096 后肉眼可见）——「反向前」不是峰值，前向途中会冲到它的 2 倍，反向再冲到 3 倍。seq 16384 反向前本该只有 16 GiB、31.3 GiB 装得下，但前向峰值 32 GiB 先撞墙。这 4 份是什么，下面的表 4.1-3 逐步数：
+| 时刻 | 份数 | 是哪几份 | seq 8192 | seq 16384 |
+|:--|--:|:--|--:|--:|
+| 前向峰值 | 4 | S、`x−max`、`exp`、P（手写 softmax 的局部变量到返回才释放） | 8.03 | **32 > 31.3 → OOM** |
+| 反向前（saved tensors） | 2 | `exp` 的输出、P | 4.03 | 16 |
+| 前向+反向峰值 | 6 | 上面 2 份 + dP、dS 等 | 12.04 | 48 |
 
-最小的 OOM 配置是 **d=16, seq=16384**——连 d 最小的那一列都在同一格挂掉。把这一格的显存逐张量数一遍，同时对照它上一格（seq 8192，能跑）的实测：
-
-**表 4.1-3** d=16 的显存账：一次带图前向里每个 `[8, seq, seq]` fp32 张量什么时候出现（`seq²·32 B`：seq 8192 = 2 GiB / 格，16384 = 8 GiB / 格）
-
-| 前向步骤                 | 新增张量      |   seq 8192 活着的 GiB |   seq 16384 外推 GiB | 归到 |
-|:---------------------|:----------|-------------------:|-------------------:|:--|
-| S = QKᵀ/√d           | S         |              2.008 |              8.032 | 🟨 T（反向只要 Q、K，S 不存） |
-| x − max              | x_shifted |              4.009 |             16.035 | 🟨 T |
-| exp(x_shifted)       | nume      |              6.009 |             24.035 | 🟩 A（`/sum` 的反向要它） |
-| P = nume / sum       | P         |              8.009 |             32.036 | 🟩 A（PV 的反向要它） |
-| 函数返回（释放 S、x_shifted） |           |              4.013 |             16.050 |  |
-
-`[8, seq, d]` 的 Q、K、V、O 在 seq 16384 也只有 8 MiB 一个，不进账；实测比手算多出的恒定 16 MiB 是 cuBLAS 的 workspace（`_cuda_clearCublasWorkspaces()` 后消失）。
-
-- **At what size do you get out-of-memory errors?** seq = 16384，四个 d 一起；seq ≤ 8192 全部能跑。炸在第一次前向的 `P = nume / sum`：那一刻 S、x_shifted、nume 三份 24 GiB 已经在显存里（实测报错时 `memory_allocated()` = 24.0 GiB），第四份 8 GiB 申请失败。
-- **Do the accounting for the memory usage of attention in one of the smallest configurations that runs out of memory.** 表 4.1-3。seq 8192 那一列和实测对上（峰值 8.02 GiB、反向前 4.03 GiB），把每格乘 4 就是 seq 16384：峰值 32 GiB。其中只有 2 份是反向真正需要的，另外 2 份是手写 softmax 的局部变量 `x_shifted`、`nume` 绑到函数返回才释放——同样的 d=16 / seq=16384 换成融合的 `torch.softmax`（只有 S 和 P 两份），前向就过了，峰值 16.04 GiB。
-- **How does the memory saved for backward change with the sequence length?** 留给反向的是 exp 输出和 P 两份 `[8, seq, seq]`，即 `2 × 8 × seq² × 4 B ∝ seq²`：表 4.1-2 每往右一格 ×4（0.080 → 1.024 → 4.032 GiB）。而 FLOPs 也是 `∝ seq² · d`，所以时间和显存同阶增长（表 4.1-1 也是每格 ×4）——显存墙先到，因为它有硬上限。
-- **What would you do to eliminate this memory cost?** 不把 `[seq, seq]` 写回显存：把 Q 按行分块、K/V 按列分块，在片上完成 `QKᵀ → 在线 softmax → PV`，只往显存写 O 和每行的 logsumexp `L`（`[8, seq]`，O(seq)）；反向用 L 重算 P。§4.0 算过这笔账：bytes 从 2 GiB 掉到 32 MiB，attention 从 memory-bound 翻到 compute-bound。这就是 §4.3 要写的 FlashAttention-2。
+- **At what size do you get out-of-memory errors?** seq = 16384，四个 d 一起。炸在前向途中：4 份 `[8,16384,16384]` 要 32 GiB，卡上只有 31.3。
+- **Do the accounting for the memory usage in one of the smallest configurations that runs out of memory.** 表 4.1-2 的 seq 16384 列（d=16）。Q/K/V/O 各 8 MiB，不进账。其中真正要留给反向的只有 2 份 = 16 GiB，装得下；多出来的 2 份是手写 softmax 的临时量——换成融合的 `torch.softmax` 前向就能过（实测峰值 16.04 GiB），但反向再叠 dP、dS 后至少 4 份 = 32 GiB，还是过不去。**这一格在 32 GB 的卡上没有任何朴素实现能跑完。**
+- **How does the memory saved for backward change with the sequence length?** `2 × 8 × seq² × 4 B ∝ seq²`：表 4.1-2 里 8192 → 16384 是 4.03 → 16 GiB。FLOPs 同样 ∝ seq²·d，所以时间和显存同步涨 4 倍——显存墙先到，因为它有硬上限。
+- **What would you do to eliminate this memory cost?** 不让 `[seq, seq]` 落显存：Q 按行分块、K/V 按列分块，片上完成 `QKᵀ → 在线 softmax → PV`，只写回 O 和每行的 logsumexp（`[8, seq]`），反向用它重算 P。§4.0 算过：bytes 从 2 GiB 到 32 MiB。这就是 §4.3 的 FlashAttention-2。
 
 ## 4.2 `torch.compile`（Torch Compile）
 
