@@ -86,9 +86,23 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 - **首步开销多大？** eager 的 378 ms 是第一篇 §2.1(c) 那笔进程级一次性开销（kernel 懒加载、cuBLAS 句柄、显存池）；compile 的 14.5 s 是 dynamo 抓图 + inductor 生成并编译 Triton kernel，**是 eager 首步的 38 倍、稳态步长的 300 倍**。第一篇说「eager 一步就稳、compile 留到 §4.2 看」，看到的就是这个数：预热 1 步够，但那 1 步要 15 秒；有磁盘缓存时第二次启动只要零点几秒。
 
-**表 4.2-4** 三档 × forward / fwd_bwd / full，eager vs compiled（ms，warmup 5 / steps 10）
+**表 4.2-4** 三档 × forward / fwd_bwd / full，eager vs compiled（ms，batch 4 seq 512，warmup 5 / steps 10，isolate 子进程；large full 的 eager 在这次 sweep 里 OOM，是 notebook 进程还占着几 GiB——第一篇表 2.1-1 单独跑是 372.8 ms、峰值 27.5 GiB）
 
-TODO：`blog2.ipynb` §4.2 (b) 那格还没跑（18 个隔离子进程、9 次冷编译，约 10 分钟）。
+|                       | eager → compiled（ms）   | 峰值显存 eager → compiled（GiB）   |
+|:----------------------|:-------------------------|:-----------------------------------|
+| ('small', 'forward')  | 17.9 → 15.2（×1.18）     | 3.98 → 3.26                        |
+| ('small', 'fwd_bwd')  | 53.0 → 43.2（×1.23）     | 4.08 → 3.37                        |
+| ('small', 'full')     | 57.2 → 46.4（×1.23）     | 5.04 → 4.33                        |
+| ('medium', 'forward') | 51.1 → 42.7（×1.20）     | 10.48 → 8.59                       |
+| ('medium', 'fwd_bwd') | 158.8 → 126.8（×1.25）   | 10.58 → 8.69                       |
+| ('medium', 'full')    | 170.6 → 136.3（×1.25）   | 13.74 → 11.85                      |
+| ('large', 'forward')  | 122.8 → 98.1（×1.25）    | 20.18 → 16.65                      |
+| ('large', 'fwd_bwd')  | 360.8 → 276.5（×1.30）   | 20.28 → 16.75                      |
+| ('large', 'full')     | OOM (backward) → 301.2   | 27.51 → 23.97                      |
+
+- **前向变了多少？前向 + 反向 + optimizer 呢？** 前向 1.18–1.25×，fwd_bwd 1.23–1.30×，full 1.23–1.25×（large 按第一篇的 372.8 算是 1.24×）；模型越大加速比越高。把反向减出来（fwd_bwd − forward）：small 35.2 → 28.0、medium 107.7 → 84.1、large 238.1 → 178.5 ms，反向省 20–25%，比前向多——反向的逐元素 kernel（SwiGLU、RMSNorm、softmax 的梯度）更多，融合的余地更大。optimizer 段（full − fwd_bwd）4.2 → 3.3、11.8 → 9.5 ms，也小了一截：`torch.compile(model)` 不碰 AdamW，省的是 `zero_grad` 和梯度落地那几个小 kernel。
+- **为什么整模型只有 1.2×，attention 单独能到 2.9×？** 第一篇表 2.1-5：full step 里矩阵乘占 62%，compile 动不了它们（还是 cuBLAS）；能融合的逐元素 + 归约只有 ~30%，全部消掉也就 1.4× 的上限。§4.2(a) 的 attention 长序列能 2.9× 是因为那里矩阵乘只占一小半、softmax 的读写占大头。seq 512 时 `[b,h,s,s]` 才 32 MiB × 每层 4 份，attention 的融合收益在整模型里被 FFN 的矩阵乘稀释了。
+- **显存**：峰值降 0.7 / 1.9 / 3.5 GiB（forward 列），三档都是 −17%——融合 kernel 不落中间量，和 §4.2(a) 表 4.2-2 同一件事，只是这里被压缩的是 SwiGLU / RMSNorm 的 `[b,s,d_ff]`、`[b,s,d]` 临时量，不是 `[s,s]`。large full 因此从 OOM 边缘（27.5）退到 24.0 GiB。
 
 ## 4.3 FlashAttention-2 前向（flash_forward）
 
