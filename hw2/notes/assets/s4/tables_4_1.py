@@ -13,12 +13,15 @@ def pivot_tables(df):
     ok = df.status == "ok"
     t = df.assign(cell=[f"{f:.2f} / {b:.2f}" if o else "OOM" for f, b, o in zip(df.fwd_ms, df.bwd_ms, ok)])
     t1 = t.pivot(index="d", columns="seq", values="cell")
-    # OOM 格给个「本该是多少」：留给反向的 2 份 [8,s,s] + Q/K/V/O + 16 MiB cuBLAS workspace。
-    # 它比 31.3 GiB 小得多——OOM 不是这一刻撞的，是前向途中 4 份同时活着那一刻（表 4.1-3）
-    est = lambda d, s: (2 * 8 * s * s * 4 + 4 * 8 * s * d * 4 + 16 * 2**20) / GiB
-    m = df.assign(cell=[f"{v:.3f}" if o else f"OOM（估 {est(d, s):.2f}）"
-                        for v, o, d, s in zip(df.mem_before_bwd_gib, ok, df.d, df.seq)])
-    t2 = m.pivot(index="d", columns="seq", values="cell")
+    # 表 4.1-2：d=16 的三条显存线（其余 d 只差 Q/K/V/O，≤3%）。OOM 格按「几份 [8,s,s]」估：
+    # 反向前 2 份、前向峰值 4 份（表 4.1-3）、全程峰值 6 份（反向再加 dP、dS 等），加 Q/K/V/O 和 16 MiB cuBLAS workspace
+    copies = {"mem_before_bwd_gib": 2, "peak_fwd_gib": 4, "peak_gib": 6}
+    names = {"mem_before_bwd_gib": "反向前 memory_allocated", "peak_fwd_gib": "前向峰值", "peak_gib": "前向+反向峰值"}
+    est = lambda n, d, s: (n * 8 * s * s * 4 + 4 * 8 * s * d * 4 + 16 * 2**20) / GiB
+    d16 = df[df.d == 16]
+    t2 = pd.DataFrame({names[c]: [f"{v:.3f}" if o else f"OOM（估 {est(copies[c], 16, s):.1f}）"
+                                  for v, o, s in zip(d16[c], d16.status == "ok", d16.seq)] for c in copies},
+                      index=d16.seq).T
     return t1, t2
 
 
@@ -43,6 +46,6 @@ if __name__ == "__main__":
     steps = forward_steps(8192)
     steps["seq 16384 外推 GiB"] = steps.iloc[:, 2] * 4
     with open(f"{OUT}/tables_4_1.md", "w") as f:
-        for name, t in [("表 4.1-1 fwd / bwd ms", t1), ("表 4.1-2 反向前 GiB", t2), ("表 4.1-3 逐步显存", steps)]:
-            f.write(f"{name}\n\n{t.to_markdown(index=t is not steps, floatfmt='.3f')}\n\n")
+        for name, t in [("表 4.1-1 fwd / bwd ms", t1), ("表 4.1-2 d=16 三条显存线 GiB", t2), ("表 4.1-3 逐步显存", steps)]:
+            f.write(f"{name}\n\n{t.to_markdown(index=t is not steps, floatfmt=".3f")}\n\n")
     print(open(f"{OUT}/tables_4_1.md").read())

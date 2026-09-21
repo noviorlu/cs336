@@ -9,6 +9,7 @@
     3. 计时 100 次前向（**建图**，和 (v) 量显存的那次前向同一口径）
     4. 跑一次前向、停在反向前，记 memory_allocated()
     5. 计时 100 次反向（每次先重新前向，只计 backward 那一段）
+    顺带记两个峰值：前向过程的 max_memory_allocated()（3 结束时读）和前向+反向全程的（5 结束时读）
     每次前向/反向后 torch.cuda.synchronize()
 OOM 不抛出，记在 status 里（OOM@<阶段>）。
 """
@@ -28,6 +29,8 @@ class AttnResult:
     fwd_ms: float | None = None            # 每次前向平均 ms
     bwd_ms: float | None = None            # 每次反向平均 ms
     mem_before_bwd_gib: float | None = None  # 前向结束、反向开始前的 memory_allocated()
+    peak_fwd_gib: float | None = None        # 前向过程中的 max_memory_allocated()（OOM 撞的是这个）
+    peak_gib: float | None = None            # 前向+反向全程的 max_memory_allocated()
     status: str = "ok"                     # ok / OOM@{alloc,warmup,forward,mem,backward}
 
 
@@ -55,12 +58,14 @@ def bench_attention(attn, d: int, seq: int, *, batch: int = 8, warmup: int = 5, 
         #    no_grad 会少写两份 [b,s,s] 的 saved tensors，量出来的不是同一件事。
         #    每次循环 del O 放掉上一张图，否则显存里同时有两份
         stage = "forward"
+        torch.cuda.reset_peak_memory_stats()
         t0 = timeit.default_timer()
         for _ in range(steps):
             O = attn(Q, K, V)
             torch.cuda.synchronize()
             del O
         res.fwd_ms = (timeit.default_timer() - t0) / steps * 1e3
+        res.peak_fwd_gib = torch.cuda.max_memory_allocated() / 1024**3
 
         # 4. 反向前显存：带图跑一次前向，此时 saved tensors 都在显存里
         stage = "mem"
@@ -80,6 +85,7 @@ def bench_attention(attn, d: int, seq: int, *, batch: int = 8, warmup: int = 5, 
             torch.cuda.synchronize()
             total += timeit.default_timer() - t0
         res.bwd_ms = total / steps * 1e3
+        res.peak_gib = torch.cuda.max_memory_allocated() / 1024**3   # 自 forward 那次 reset 起的全程峰值
 
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
         # 有些路径抛的是消息里带 "out of memory" 的普通 RuntimeError，漏了会让整个 sweep 崩掉
