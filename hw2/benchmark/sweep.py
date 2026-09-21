@@ -23,9 +23,15 @@ def _run_isolated(cfg: BenchConfig) -> BenchResult:
     """
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "r.md")
+        env = os.environ.copy()
+        if cfg.compile:
+            # torch.compile 的产物有磁盘缓存（inductor 的 FX graph / triton kernel），换进程也会命中。
+            # 缓存目录指到临时目录，让子进程一定是冷编译——首步开销才是「第一次用 compile 要付的钱」
+            env["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(td, "inductor")
+            env["TRITON_CACHE_DIR"] = os.path.join(td, "triton")
         proc = subprocess.run(
             [sys.executable, "-m", "benchmark", *cfg.to_argv(), "--out", out],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=env,
         )
         jp = out.rsplit(".", 1)[0] + ".json"
         if not os.path.exists(jp):

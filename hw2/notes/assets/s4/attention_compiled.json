@@ -1,0 +1,202 @@
+[
+ {
+  "d": 16,
+  "seq": 256,
+  "fwd_ms": 0.07442263999109855,
+  "bwd_ms": 0.14399364983546548,
+  "mem_before_bwd_gib": 0.020294189453125,
+  "peak_fwd_gib": 0.020294189453125,
+  "peak_gib": 0.024689674377441406,
+  "status": "ok"
+ },
+ {
+  "d": 16,
+  "seq": 1024,
+  "fwd_ms": 0.13190923000365729,
+  "bwd_ms": 0.29235097999844584,
+  "mem_before_bwd_gib": 0.0804443359375,
+  "peak_fwd_gib": 0.0804443359375,
+  "peak_gib": 0.1448984146118164,
+  "status": "ok"
+ },
+ {
+  "d": 16,
+  "seq": 4096,
+  "fwd_ms": 1.667291359990486,
+  "bwd_ms": 4.74751171990647,
+  "mem_before_bwd_gib": 1.024169921875,
+  "peak_fwd_gib": 1.024169921875,
+  "peak_gib": 2.0319833755493164,
+  "status": "ok"
+ },
+ {
+  "d": 16,
+  "seq": 8192,
+  "fwd_ms": 6.762674550009251,
+  "bwd_ms": 18.75036787996578,
+  "mem_before_bwd_gib": 4.032470703125,
+  "peak_fwd_gib": 4.032470703125,
+  "peak_gib": 8.048096656799316,
+  "status": "ok"
+ },
+ {
+  "d": 16,
+  "seq": 16384,
+  "fwd_ms": null,
+  "bwd_ms": null,
+  "mem_before_bwd_gib": null,
+  "peak_fwd_gib": null,
+  "peak_gib": null,
+  "status": "OOM@warmup"
+ },
+ {
+  "d": 32,
+  "seq": 256,
+  "fwd_ms": 0.07555187001344166,
+  "bwd_ms": 0.14379486990947044,
+  "mem_before_bwd_gib": 0.020782470703125,
+  "peak_fwd_gib": 0.020782470703125,
+  "peak_gib": 0.025666236877441406,
+  "status": "ok"
+ },
+ {
+  "d": 32,
+  "seq": 1024,
+  "fwd_ms": 0.13334608000150183,
+  "bwd_ms": 0.32260444004350575,
+  "mem_before_bwd_gib": 0.0823974609375,
+  "peak_fwd_gib": 0.0823974609375,
+  "peak_gib": 0.1488046646118164,
+  "status": "ok"
+ },
+ {
+  "d": 32,
+  "seq": 4096,
+  "fwd_ms": 2.1876767199864844,
+  "bwd_ms": 5.031399910003529,
+  "mem_before_bwd_gib": 1.031982421875,
+  "peak_fwd_gib": 1.031982421875,
+  "peak_gib": 2.0476083755493164,
+  "status": "ok"
+ },
+ {
+  "d": 32,
+  "seq": 8192,
+  "fwd_ms": 9.53736380999544,
+  "bwd_ms": 20.270588850034983,
+  "mem_before_bwd_gib": 4.048095703125,
+  "peak_fwd_gib": 4.048095703125,
+  "peak_gib": 8.079346656799316,
+  "status": "ok"
+ },
+ {
+  "d": 32,
+  "seq": 16384,
+  "fwd_ms": null,
+  "bwd_ms": null,
+  "mem_before_bwd_gib": null,
+  "peak_fwd_gib": null,
+  "peak_gib": null,
+  "status": "OOM@warmup"
+ },
+ {
+  "d": 64,
+  "seq": 256,
+  "fwd_ms": 0.08893156998965424,
+  "bwd_ms": 0.15942586993332952,
+  "mem_before_bwd_gib": 0.021759033203125,
+  "peak_fwd_gib": 0.021759033203125,
+  "peak_gib": 0.027619361877441406,
+  "status": "ok"
+ },
+ {
+  "d": 64,
+  "seq": 1024,
+  "fwd_ms": 0.20840041999690584,
+  "bwd_ms": 0.3887190698333143,
+  "mem_before_bwd_gib": 0.0863037109375,
+  "peak_fwd_gib": 0.0863037109375,
+  "peak_gib": 0.1566171646118164,
+  "status": "ok"
+ },
+ {
+  "d": 64,
+  "seq": 4096,
+  "fwd_ms": 1.8843685599858873,
+  "bwd_ms": 5.3140291300587705,
+  "mem_before_bwd_gib": 1.047607421875,
+  "peak_fwd_gib": 1.047607421875,
+  "peak_gib": 2.0788583755493164,
+  "status": "ok"
+ },
+ {
+  "d": 64,
+  "seq": 8192,
+  "fwd_ms": 7.443767049990129,
+  "bwd_ms": 20.054330270013452,
+  "mem_before_bwd_gib": 4.079345703125,
+  "peak_fwd_gib": 4.079345703125,
+  "peak_gib": 8.141846656799316,
+  "status": "ok"
+ },
+ {
+  "d": 64,
+  "seq": 16384,
+  "fwd_ms": null,
+  "bwd_ms": null,
+  "mem_before_bwd_gib": null,
+  "peak_fwd_gib": null,
+  "peak_gib": null,
+  "status": "OOM@warmup"
+ },
+ {
+  "d": 128,
+  "seq": 256,
+  "fwd_ms": 0.09232782000253792,
+  "bwd_ms": 0.19409516000450822,
+  "mem_before_bwd_gib": 0.023712158203125,
+  "peak_fwd_gib": 0.023712158203125,
+  "peak_gib": 0.031525611877441406,
+  "status": "ok"
+ },
+ {
+  "d": 128,
+  "seq": 1024,
+  "fwd_ms": 0.2835948699976143,
+  "bwd_ms": 0.5066335200172034,
+  "mem_before_bwd_gib": 0.0941162109375,
+  "peak_fwd_gib": 0.0941162109375,
+  "peak_gib": 0.1722421646118164,
+  "status": "ok"
+ },
+ {
+  "d": 128,
+  "seq": 4096,
+  "fwd_ms": 3.0236704100025236,
+  "bwd_ms": 7.146723470086727,
+  "mem_before_bwd_gib": 1.078857421875,
+  "peak_fwd_gib": 1.078857421875,
+  "peak_gib": 2.1413583755493164,
+  "status": "ok"
+ },
+ {
+  "d": 128,
+  "seq": 8192,
+  "fwd_ms": 11.888813839996146,
+  "bwd_ms": 27.30381554001724,
+  "mem_before_bwd_gib": 4.141845703125,
+  "peak_fwd_gib": 4.141845703125,
+  "peak_gib": 8.266846656799316,
+  "status": "ok"
+ },
+ {
+  "d": 128,
+  "seq": 16384,
+  "fwd_ms": null,
+  "bwd_ms": null,
+  "mem_before_bwd_gib": null,
+  "peak_fwd_gib": null,
+  "peak_gib": null,
+  "status": "OOM@warmup"
+ }
+]
