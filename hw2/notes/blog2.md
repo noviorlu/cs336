@@ -41,9 +41,9 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 #### (a) 编译后的 attention
 
-同一份 sdpa 包一层 `torch.compile(sdpa)`，网格、预热、步数和 §4.1 完全一致（编译发生在预热的第一步）。脚本同 §4.1，notebook `blog2.ipynb` §4.2。
+`torch.compile(sdpa)`，其余和 §4.1 一样（编译发生在预热第一步）。
 
-**表 4.2-1a** 前向每次耗时：eager → compiled（ms，括号是加速比）
+**表 4.2-1a** 前向：eager → compiled（ms，括号是加速比）
 
 |   d | 256                 | 1024                | 4096                | 8192                  | 16384   |
 |----:|:--------------------|:--------------------|:--------------------|:----------------------|:--------|
@@ -52,7 +52,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 |  64 | 0.07 → 0.10（×0.8） | 0.19 → 0.20（×0.9） | 4.93 → 1.88（×2.6） | 19.53 → 7.48（×2.6）  | OOM     |
 | 128 | 0.07 → 0.09（×0.8） | 0.26 → 0.28（×0.9） | 6.01 → 3.00（×2.0） | 23.71 → 11.99（×2.0） | OOM     |
 
-**表 4.2-1b** 反向每次耗时：eager → compiled（ms）
+**表 4.2-1b** 反向：eager → compiled（ms）
 
 |   d | 256                 | 1024                | 4096                 | 8192                  | 16384   |
 |----:|:--------------------|:--------------------|:---------------------|:----------------------|:--------|
@@ -61,7 +61,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 |  64 | 0.21 → 0.21（×1.0） | 0.51 → 0.39（×1.3） | 12.00 → 5.28（×2.3） | 46.87 → 20.09（×2.3） | OOM     |
 | 128 | 0.21 → 0.17（×1.3） | 0.67 → 0.48（×1.4） | 14.02 → 7.13（×2.0） | 54.42 → 27.50（×2.0） | OOM     |
 
-**表 4.2-2** d=16 的显存峰值，eager vs compiled（GiB；其余 d 只多 Q/K/V/O）
+**表 4.2-2** d=16 显存峰值（GiB）
 
 |                           |   256 |   1024 |   4096 |   8192 | 16384   |
 |:--------------------------|------:|-------:|-------:|-------:|:--------|
@@ -70,23 +70,21 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | 前向峰值（compiled）      | 0.02  |  0.08  |  1.024 |  4.032 | OOM     |
 | 前向+反向峰值（compiled） | 0.025 |  0.145 |  2.032 |  8.048 | OOM     |
 
-- **编译后的 attention 前向 / 反向快多少？** 长序列（seq ≥ 4096）前向 2.0–2.9×、反向 2.0–2.5×；短序列（seq ≤ 1024）基本不变，前向甚至慢 10–20%。原因在 §4.1 的账里：长序列时时间花在读写 `[8,seq,seq]` 上，eager 的手写 softmax 是 4 个 kernel（max、减、exp、除）各读写一遍 S，compile 把它融成一个 kernel，`[8,seq,seq]` 的读写从 ~8 遍降到 2 遍；两个矩阵乘还是交给 cuBLAS，compile 动不了它们——所以 d=128 时加速比掉到 2.0×，矩阵乘占比越大能省的越少。短序列每个 kernel 只跑几十微秒，瓶颈是 launch 而不是带宽，融合省下的读写抵不过 compile 版多出的 guard 检查。
-- **显存呢？** 表 4.2-2：前向峰值从 4 份 `[8,seq,seq]` 降到 **2 份**（8.03 → 4.03 GiB）——融合 softmax 不再有 `x−max`、`exp` 两个临时量，正是 §4.1 表 4.1-2 里「多出来的那 2 份」；全程峰值 6 → 4 份。seq 16384 还是 OOM，但炸的位置从前向挪到了反向：前向 2 份 16 GiB 装得下，反向再叠 dP、dS 到 4 份 32 GiB 就不行了。**compile 消掉的是实现的浪费，消不掉 `[seq, seq]` 本身。**
+- **快多少？** 长序列 2–2.9×，短序列不变。§4.1 说时间花在读写 `[8,seq,seq]` 上：手写 softmax 4 个 kernel 各读写一遍，compile 融成 1 个，读写从 ~8 遍降到 2 遍；矩阵乘还是 cuBLAS，所以 d 越大加速比越低（d=128 只有 2.0×）。短序列瓶颈是 launch，融合省不到。
+- **显存呢？** 前向峰值 4 份 → 2 份——正是 §4.1 手写 softmax 多出来的那 2 份临时量；全程 6 → 4 份。seq 16384 照样 OOM，只是从前向挪到反向。**compile 消掉的是实现的浪费，消不掉 `[seq, seq]` 本身。**
 
 #### (b) 编译整个模型
 
-整个 Transformer `torch.compile(model)`，走第一篇 §2.1 的整模型 benchmark（`BenchConfig(compile=True)`，batch 4、seq 512）。每个配置起独立子进程，且 inductor / triton 的缓存指到临时目录——不然第二次跑命中缓存，「首步」就不是冷编译了。
+`torch.compile(model)`，走第一篇 §2.1 的整模型 benchmark，每个配置独立子进程、冷编译。
 
-**表 4.2-3** small（0.13B）full step 不预热的首步与之后各步（ms，isolate 子进程，warmup 0 / steps 5）
+**表 4.2-3** small（0.13B）full step 不预热的首步（ms）
 
-| | 第 1 步 | 第 2–5 步均值 |
+| | 第 1 步 | 之后每步 |
 |:--|--:|--:|
 | eager | 378 | 57.9 |
-| `torch.compile` | **14 477** | 46.0 |
+| compiled | **14 477** | 46.0 |
 
-- **首步开销多大？** eager 的 378 ms 是第一篇 §2.1(c) 那笔进程级一次性开销（kernel 懒加载、cuBLAS 句柄、显存池）；compile 的 14.5 s 是 dynamo 抓图 + inductor 生成并编译 Triton kernel，**是 eager 首步的 38 倍、稳态步长的 300 倍**。第一篇说「eager 一步就稳、compile 留到 §4.2 看」，看到的就是这个数：预热 1 步够，但那 1 步要 15 秒；有磁盘缓存时第二次启动只要零点几秒。
-
-**表 4.2-4** 三档 × forward / fwd_bwd / full，eager vs compiled（ms，batch 4 seq 512，warmup 5 / steps 10，isolate 子进程；large full 的 eager 在这次 sweep 里 OOM，是 notebook 进程还占着几 GiB——第一篇表 2.1-1 单独跑是 372.8 ms、峰值 27.5 GiB）
+**表 4.2-4** eager → compiled（ms，batch 4 seq 512，warmup 5 / steps 10；large full 的 eager 这次 OOM 是 notebook 进程还占着显存，第一篇表 2.1-1 单独跑是 372.8 ms）
 
 |                       | eager → compiled（ms）   | 峰值显存 eager → compiled（GiB）   |
 |:----------------------|:-------------------------|:-----------------------------------|
@@ -100,9 +98,9 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | ('large', 'fwd_bwd')  | 360.8 → 276.5（×1.30）   | 20.28 → 16.75                      |
 | ('large', 'full')     | OOM (backward) → 301.2   | 27.51 → 23.97                      |
 
-- **前向变了多少？前向 + 反向 + optimizer 呢？** 前向 1.18–1.25×，fwd_bwd 1.23–1.30×，full 1.23–1.25×（large 按第一篇的 372.8 算是 1.24×）；模型越大加速比越高。把反向减出来（fwd_bwd − forward）：small 35.2 → 28.0、medium 107.7 → 84.1、large 238.1 → 178.5 ms，反向省 20–25%，比前向多——反向的逐元素 kernel（SwiGLU、RMSNorm、softmax 的梯度）更多，融合的余地更大。optimizer 段（full − fwd_bwd）4.2 → 3.3、11.8 → 9.5 ms，也小了一截：`torch.compile(model)` 不碰 AdamW，省的是 `zero_grad` 和梯度落地那几个小 kernel。
-- **为什么整模型只有 1.2×，attention 单独能到 2.9×？** 第一篇表 2.1-5：full step 里矩阵乘占 62%，compile 动不了它们（还是 cuBLAS）；能融合的逐元素 + 归约只有 ~30%，全部消掉也就 1.4× 的上限。§4.2(a) 的 attention 长序列能 2.9× 是因为那里矩阵乘只占一小半、softmax 的读写占大头。seq 512 时 `[b,h,s,s]` 才 32 MiB × 每层 4 份，attention 的融合收益在整模型里被 FFN 的矩阵乘稀释了。
-- **显存**：峰值降 0.7 / 1.9 / 3.5 GiB（forward 列），三档都是 −17%——融合 kernel 不落中间量，和 §4.2(a) 表 4.2-2 同一件事，只是这里被压缩的是 SwiGLU / RMSNorm 的 `[b,s,d_ff]`、`[b,s,d]` 临时量，不是 `[s,s]`。large full 因此从 OOM 边缘（27.5）退到 24.0 GiB。
+- **首步开销？** 编译一次 14.5 s，是稳态步长的 300 倍；之后每步稳定，预热 1 步够。有磁盘缓存时第二次启动只要零点几秒。
+- **前向、fwd_bwd、full 各快多少？** 1.2–1.3×，模型越大越高，反向比前向省得多（逐元素梯度 kernel 更多）。**为什么 attention 能 2.9× 而整模型只有 1.2×**：第一篇表 2.1-5，full step 里矩阵乘占 62%，compile 动不了；能融合的只有 ~30%，上限 1.4×。
+- **显存** −17%，三档一致：融合掉的是 SwiGLU / RMSNorm 的临时量，large full 从 27.5 退到 24.0 GiB。
 
 ## 4.3 FlashAttention-2 前向（flash_forward）
 
