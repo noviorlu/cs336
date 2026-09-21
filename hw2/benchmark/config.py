@@ -117,6 +117,7 @@ class BenchConfig:
     nvtx_ops: bool = False  # 每层 block range + aten 算子级 range（§2.5 (f) 显存归因），需 --nvtx
     memory_snapshot: str | None = None  # §2.5：测量段的显存快照写到这个 .pickle；None 关
     checkpoint_every: int | None = None # §3.2 (b)：每 every 层包一个 torch.utils.checkpoint 段；None 关
+    compile: bool = False   # §4.2 (b)：建完模型 torch.compile(model)；编译发生在第一步，预热要够
 
     def __post_init__(self):
         # 早失败，别等跑到一半才崩（且那个 RuntimeError 不含 "out of memory"，
@@ -141,7 +142,7 @@ class BenchConfig:
             "--batch-size", str(self.batch_size), "--seq-len", str(self.seq_len),
             "--vocab-size", str(self.vocab_size), "--device", self.device,
         ]
-        for flag in ("inference", "autocast", "nvtx", "nvtx_attn", "nvtx_ops"):
+        for flag in ("inference", "autocast", "nvtx", "nvtx_attn", "nvtx_ops", "compile"):
             if getattr(self, flag):
                 argv.append("--" + flag.replace("_", "-"))
         if self.memory_snapshot:
@@ -169,6 +170,7 @@ class BenchResult:
     peak_mem_gib: float
     status: str                                     # OK | OOM (stage) | ERROR (stage)
     checkpoint_every: int | None = None             # §3.2 (b)；旧 json 没有这列，默认 None
+    compile: bool = False                           # §4.2 (b)；同上
     times_ms: list[float] = field(default_factory=list)  # 逐步原始耗时，只进 json 不进表
 
     @classmethod
@@ -176,7 +178,7 @@ class BenchResult:
         return cls(
             model=cfg.model_type, size=cfg.size, seq_len=cfg.seq_len, batch=cfg.batch_size,
             warmup=cfg.warmup, steps=cfg.steps, mode=cfg.mode,
-            inference=cfg.inference, autocast=cfg.autocast, checkpoint_every=cfg.checkpoint_every,
+            inference=cfg.inference, autocast=cfg.autocast, checkpoint_every=cfg.checkpoint_every, compile=cfg.compile,
             avg_ms=float("nan"), std_ms=float("nan"),
             first_ms=float("nan"), rest_avg_ms=float("nan"),
             peak_mem_gib=round(peak_gib, 2),

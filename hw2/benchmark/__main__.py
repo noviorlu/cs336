@@ -17,6 +17,7 @@ def main():
     p.add_argument("--inference", action="store_true", help="前向包 no_grad（只能配 --mode forward）")
     p.add_argument("--autocast", action="store_true",
                    help="前向 + loss 走 bf16 autocast；反向沿用前向的 dtype，最终 .grad 仍为 fp32")
+    p.add_argument("--compile", action="store_true", help="§4.2 (b)：torch.compile(model)")
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=4)
@@ -59,7 +60,7 @@ def main():
             warmup=a.warmup, steps=a.steps, batch_size=a.batch_size, seq_len=a.seq_len,
             vocab_size=a.vocab_size, device=a.device,
             autocast=a.autocast, nvtx=a.nvtx, nvtx_attn=a.nvtx_attn, nvtx_ops=a.nvtx_ops,
-            memory_snapshot=a.memory_snapshot, checkpoint_every=a.checkpoint_every,
+            memory_snapshot=a.memory_snapshot, checkpoint_every=a.checkpoint_every, compile=a.compile,
         )]
     sweep(cfgs, a.out, isolate=a.isolate)
 
