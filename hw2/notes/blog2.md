@@ -75,16 +75,9 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 #### (b) 编译整个模型
 
-`torch.compile(model)`，走第一篇 §2.1 的整模型 benchmark，每个配置独立子进程、冷编译。
+`torch.compile(model)`，走第一篇 §2.1 的整模型 benchmark，每个配置独立子进程；编译在预热第一步（约 15 s），之后每步稳定。
 
-**表 4.2-3** small（0.13B）full step 不预热的首步（ms）
-
-| | 第 1 步 | 之后每步 |
-|:--|--:|--:|
-| eager | 378 | 57.9 |
-| compiled | **14477（14.5 s）** | 46.0 |
-
-**表 4.2-4** eager → compiled（ms，batch 4 seq 512，warmup 5 / steps 10；large full 的 eager 这次 OOM 是 notebook 进程还占着显存，第一篇表 2.1-1 单独跑是 372.8 ms）
+**表 4.2-3** eager → compiled（ms，batch 4 seq 512，warmup 5 / steps 10；large full 的 eager 这次 OOM 是 notebook 进程还占着显存，第一篇表 2.1-1 单独跑是 372.8 ms）
 
 |                       | eager → compiled（ms）   | 峰值显存 eager → compiled（GiB）   |
 |:----------------------|:-------------------------|:-----------------------------------|
@@ -98,7 +91,6 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | ('large', 'fwd_bwd')  | 360.8 → 276.5（×1.30）   | 20.28 → 16.75                      |
 | ('large', 'full')     | OOM (backward) → 301.2   | 27.51 → 23.97                      |
 
-- **首步开销？** 编译一次 14.5 s，是稳态步长的 300 倍；之后每步稳定，预热 1 步够。有磁盘缓存时第二次启动只要零点几秒。
 - **前向、fwd_bwd、full 各快多少？** 1.2–1.3×，模型越大越高，反向比前向省得多（逐元素梯度 kernel 更多）。**为什么 attention 能 2.9× 而整模型只有 1.2×**：第一篇表 2.1-5，full step 里矩阵乘占 62%，compile 动不了；能融合的只有 ~30%，上限 1.4×。
 - **显存** −17%，三档一致：融合掉的是 SwiGLU / RMSNorm 的临时量，large full 从 27.5 退到 24.0 GiB。
 
