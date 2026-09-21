@@ -32,10 +32,10 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | 反向前（saved tensors） | 2 | `exp` 的输出、P | 4.03 | 16 |
 | 前向+反向峰值 | 6 | 上面 2 份 + dP、dS 等 | 12.04 | 48 |
 
-- **At what size do you get out-of-memory errors?** seq = 16384，四个 d 一起。炸在前向途中：4 份 `[8,16384,16384]` 要 32 GiB，卡上只有 31.3。
-- **Do the accounting for the memory usage in one of the smallest configurations that runs out of memory.** 表 4.1-2 的 seq 16384 列（d=16）。Q/K/V/O 各 8 MiB，不进账。其中真正要留给反向的只有 2 份 = 16 GiB，装得下；多出来的 2 份是手写 softmax 的临时量——换成融合的 `torch.softmax` 前向就能过（实测峰值 16.04 GiB），但反向再叠 dP、dS 后至少 4 份 = 32 GiB，还是过不去。**这一格在 32 GB 的卡上没有任何朴素实现能跑完。**
-- **How does the memory saved for backward change with the sequence length?** `2 × 8 × seq² × 4 B ∝ seq²`：表 4.1-2 里 8192 → 16384 是 4.03 → 16 GiB。FLOPs 同样 ∝ seq²·d，所以时间和显存同步涨 4 倍——显存墙先到，因为它有硬上限。
-- **What would you do to eliminate this memory cost?** 不让 `[seq, seq]` 落显存：Q 按行分块、K/V 按列分块，片上完成 `QKᵀ → 在线 softmax → PV`，只写回 O 和每行的 logsumexp（`[8, seq]`），反向用它重算 P。按第一篇 §2.1 的 roofline 算这笔账（seq 4096、d 64）：朴素版三个 kernel 要读写 S、P 共 2 GiB，算术强度 I < 60 的 ridge point，memory-bound，带宽下限 1.2 ms；不落盘后只剩 Q/K/V/O 32 MiB，I ≈ 1000，翻到 compute-bound，下限 0.3 ms——所以能期待的是 3–5× 而不是 bytes 之比的 60×。这就是 §4.3 的 FlashAttention-2。
+- **从哪个规模开始 OOM？** seq = 16384，四个 d 一起。炸在前向途中：4 份 `[8,16384,16384]` 要 32 GiB，卡上只有 31.3。
+- **对最小的 OOM 配置做显存账。** 表 4.1-2 的 seq 16384 列（d=16）。Q/K/V/O 各 8 MiB，不进账。其中真正要留给反向的只有 2 份 = 16 GiB，装得下；多出来的 2 份是手写 softmax 的临时量——换成融合的 `torch.softmax` 前向就能过（实测峰值 16.04 GiB），但反向再叠 dP、dS 后至少 4 份 = 32 GiB，还是过不去。**这一格在 32 GB 的卡上没有任何朴素实现能跑完。**
+- **留给反向的显存随 seq 怎么变？** `2 × 8 × seq² × 4 B ∝ seq²`：表 4.1-2 里 8192 → 16384 是 4.03 → 16 GiB。FLOPs 同样 ∝ seq²·d，所以时间和显存同步涨 4 倍——显存墙先到，因为它有硬上限。
+- **怎么消掉这笔显存？** 不让 `[seq, seq]` 落显存：Q 按行分块、K/V 按列分块，片上完成 `QKᵀ → 在线 softmax → PV`，只写回 O 和每行的 logsumexp（`[8, seq]`），反向用它重算 P。按第一篇 §2.1 的 roofline 算这笔账（seq 4096、d 64）：朴素版三个 kernel 要读写 S、P 共 2 GiB，算术强度 I < 60 的 ridge point，memory-bound，带宽下限 1.2 ms；不落盘后只剩 Q/K/V/O 32 MiB，I ≈ 1000，翻到 compute-bound，下限 0.3 ms——所以能期待的是 3–5× 而不是 bytes 之比的 60×。这就是 §4.3 的 FlashAttention-2。
 
 ## 4.2 `torch.compile`（Torch Compile）
 
