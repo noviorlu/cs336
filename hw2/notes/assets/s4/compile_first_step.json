@@ -1,0 +1,54 @@
+[
+  {
+    "model": "basics",
+    "size": "small",
+    "seq_len": 512,
+    "batch": 4,
+    "warmup": 0,
+    "steps": 5,
+    "mode": "full",
+    "inference": false,
+    "autocast": false,
+    "avg_ms": 121.83,
+    "std_ms": 143.01,
+    "first_ms": 377.65,
+    "rest_avg_ms": 57.87,
+    "peak_mem_gib": 5.04,
+    "status": "OK",
+    "checkpoint_every": null,
+    "compile": false,
+    "times_ms": [
+      377.646,
+      58.087,
+      58.263,
+      57.124,
+      58.006
+    ]
+  },
+  {
+    "model": "basics",
+    "size": "small",
+    "seq_len": 512,
+    "batch": 4,
+    "warmup": 0,
+    "steps": 5,
+    "mode": "full",
+    "inference": false,
+    "autocast": false,
+    "avg_ms": 2932.28,
+    "std_ms": 6453.86,
+    "first_ms": 14477.29,
+    "rest_avg_ms": 46.03,
+    "peak_mem_gib": 4.33,
+    "status": "OK",
+    "checkpoint_every": null,
+    "compile": true,
+    "times_ms": [
+      14477.288,
+      45.664,
+      47.005,
+      45.191,
+      46.243
+    ]
+  }
+]
