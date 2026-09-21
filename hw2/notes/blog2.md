@@ -7,34 +7,6 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 
 ---
 
-## 4.0 预备：Roofline
-
-Roofline 回答「这段代码在这块卡上最快能跑多快」，用来判断后面每个数字合不合理。
-
-- 硬件两个峰值：算力 P、带宽 B
-- 代码一个数：算术强度 $I = \text{FLOPs}/\text{bytes}$（每读写 1 byte 显存能做多少次运算）
-- 下限 $t_{\min} = \max(\text{FLOPs}/P,\ \text{bytes}/B)$；I < P/B 是 **memory-bound**（在等数据），I > P/B 是 **compute-bound**。P/B 叫 ridge point，随精度变：
-
-| | P（FLOPS） | B（B/s） | ridge point P/B |
-|---|---|---|---|
-| 5090 fp32（CUDA core） | 1.05e14 | 1.79e12 | **60** ← §4.1 |
-| 5090 bf16（tensor core） | 2.10e14 | 1.79e12 | 117 ← §4.5 |
-| H100 fp32 | 6.7e13 | 3.35e12 | 20 |
-| H100 bf16 | 9.9e14 | 3.35e12 | 295 |
-
-**朴素 attention 的账**（fp32，batch 8，单头，seq 4096，d 64）。三个 kernel，S、P 各是 `[8, 4096, 4096]` fp32 = 512 MiB，都要落显存：
-
-| kernel | FLOPs | bytes | I |
-|---|---|---|---|
-| S = QKᵀ | 1.7e10 | 写 S 512 MiB | 32 |
-| P = softmax(S) | 6.7e8 | 读 S 写 P 1 GiB | < 1 |
-| O = PV | 1.7e10 | 读 P 512 MiB | 32 |
-
-三个 I 都在 60 以下 → memory-bound；总 bytes 2 GiB / B ≈ **1.2 ms** 是下限，其中一半花在几乎不算数的 softmax 上。
-
-- **比 roofline 慢** = 实测远大于 1.2 ms，差距是实现问题（softmax 拆成多个 kernel 反复读写 S、launch 太多），要开 nsys 才知道是哪条。
-- **FlashAttention** = 不把 S/P 写回显存，bytes 只剩 Q/K/V/O 共 32 MiB，I ≈ 1000，翻到 compute-bound，下限 0.3 ms。所以期望加速 3–5×（被算力封顶），不是 bytes 之比的 60×。反向用 logsumexp 重算 P，多一次 QKᵀ 换掉 P/dS 的读写，在 memory-bound 区间划算。
-
 ## 4.1 朴素 attention 的基准（PyTorch Attention Benchmarking）
 
 被测的是 hw1 的 `scaled_dot_product_attention(Q, K, V)`：`S = QKᵀ/√d → P = softmax(S) → O = PV`。输入 `[8, seq, d]`，batch 固定 8、没有 head 维；fp32；每格预热 5 步，100 次前向、100 次反向各取均值，每次后 `synchronize()`。脚本 `benchmark/attention_bench.py`，notebook `blog2.ipynb` §4.1。
@@ -63,7 +35,7 @@ Roofline 回答「这段代码在这块卡上最快能跑多快」，用来判�
 - **At what size do you get out-of-memory errors?** seq = 16384，四个 d 一起。炸在前向途中：4 份 `[8,16384,16384]` 要 32 GiB，卡上只有 31.3。
 - **Do the accounting for the memory usage in one of the smallest configurations that runs out of memory.** 表 4.1-2 的 seq 16384 列（d=16）。Q/K/V/O 各 8 MiB，不进账。其中真正要留给反向的只有 2 份 = 16 GiB，装得下；多出来的 2 份是手写 softmax 的临时量——换成融合的 `torch.softmax` 前向就能过（实测峰值 16.04 GiB），但反向再叠 dP、dS 后至少 4 份 = 32 GiB，还是过不去。**这一格在 32 GB 的卡上没有任何朴素实现能跑完。**
 - **How does the memory saved for backward change with the sequence length?** `2 × 8 × seq² × 4 B ∝ seq²`：表 4.1-2 里 8192 → 16384 是 4.03 → 16 GiB。FLOPs 同样 ∝ seq²·d，所以时间和显存同步涨 4 倍——显存墙先到，因为它有硬上限。
-- **What would you do to eliminate this memory cost?** 不让 `[seq, seq]` 落显存：Q 按行分块、K/V 按列分块，片上完成 `QKᵀ → 在线 softmax → PV`，只写回 O 和每行的 logsumexp（`[8, seq]`），反向用它重算 P。§4.0 算过：bytes 从 2 GiB 到 32 MiB。这就是 §4.3 的 FlashAttention-2。
+- **What would you do to eliminate this memory cost?** 不让 `[seq, seq]` 落显存：Q 按行分块、K/V 按列分块，片上完成 `QKᵀ → 在线 softmax → PV`，只写回 O 和每行的 logsumexp（`[8, seq]`），反向用它重算 P。按第一篇 §2.1 的 roofline 算这笔账（seq 4096、d 64）：朴素版三个 kernel 要读写 S、P 共 2 GiB，算术强度 I < 60 的 ridge point，memory-bound，带宽下限 1.2 ms；不落盘后只剩 Q/K/V/O 32 MiB，I ≈ 1000，翻到 compute-bound，下限 0.3 ms——所以能期待的是 3–5× 而不是 bytes 之比的 60×。这就是 §4.3 的 FlashAttention-2。
 
 ## 4.2 `torch.compile`（Torch Compile）
 
@@ -94,5 +66,7 @@ TODO
 ## 4.5 FlashAttention-2 基准（flash_benchmarking）
 
 **问题**：`triton.testing.do_bench`，batch 1、causal，seq 2⁷…2¹⁶ × d ∈ {16…128} × {bf16, fp32}，对比 Triton 版和 PyTorch 版的前向 / 反向 / 端到端延迟。作业指定 B200；本机 5090 扫到装得下为止。
+
+bf16 走 tensor core，5090 峰值 2.10e14 FLOPS、ridge point 117（fp32 是 1.05e14 / 60，第一篇 §1.1）：同一个 kernel 在 bf16 下更容易掉回 memory-bound，对比时要分开看。
 
 TODO
