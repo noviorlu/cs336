@@ -82,7 +82,7 @@ Stanford CS336《Language Modeling from Scratch》作业 2「Systems」的实验
 | | 第 1 步 | 之后每步 |
 |:--|--:|--:|
 | eager | 378 | 57.9 |
-| compiled | **14 477** | 46.0 |
+| compiled | **14477（14.5 s）** | 46.0 |
 
 **表 4.2-4** eager → compiled（ms，batch 4 seq 512，warmup 5 / steps 10；large full 的 eager 这次 OOM 是 notebook 进程还占着显存，第一篇表 2.1-1 单独跑是 372.8 ms）
 
